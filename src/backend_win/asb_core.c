@@ -764,6 +764,23 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         if (SUCCEEDED(hr)) {
             hr = hcn_create_endpoint(&args->network_id, &args->endpoint_id, endpoint_guid_str, 64,
                                      vm->nat_ip[0] ? vm->nat_ip : NULL);
+            if (FAILED(hr) && args->network_mode == NET_NAT) {
+                int retry;
+                asb_log(L"Endpoint failed for %S, trying next IP...", vm->nat_ip);
+                for (retry = 0; retry < 10; retry++) {
+                    int a, b, c, d;
+                    if (sscanf_s(vm->nat_ip, "%d.%d.%d.%d", &a, &b, &c, &d) == 4 && d < 254) {
+                        sprintf_s(vm->nat_ip, sizeof(vm->nat_ip), "%d.%d.%d.%d", a, b, c, d + 1);
+                        asb_log(L"Retrying with %S...", vm->nat_ip);
+                        hr = hcn_create_endpoint(&args->network_id, &args->endpoint_id, endpoint_guid_str, 64,
+                                                 vm->nat_ip);
+                        if (SUCCEEDED(hr)) {
+                            save_vm_list();
+                            break;
+                        }
+                    } else break;
+                }
+            }
             if (FAILED(hr)) {
                 asb_log(L"Error: Network endpoint failed (0x%08X).", hr);
                 if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
