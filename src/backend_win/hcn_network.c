@@ -186,7 +186,7 @@ static BOOL hcn_network_exists(const GUID *id)
     return FALSE;
 }
 
-/* Delete all AppSandbox networks by their fixed GUIDs. Fast — no enumeration.
+/* Delete all AppSandbox networks by their fixed GUIDs. Fast - no enumeration.
    Call only at startup to clean up stale networks from a previous run; never
    from per-VM create paths, or you'll rip the network out from under any
    already-running VM that's attached to it. */
@@ -210,6 +210,125 @@ void hcn_cleanup(void)
     }
 }
 
+/* -------------------------------------------------------------------------
+ *  NAT subnet picker
+ *
+ *  Default Switch (built-in on every Windows 11) lives at 172.20.48.0/20.
+ *  Our previous static 172.20.0.0/16 OVERLAPPED that and HCN refused with
+ *  ERROR_DUP_NAME (Microsoft re-uses the error code; the message lies).
+ *
+ *  Strategy: enumerate every IPv4 subnet bound to a host adapter and pick
+ *  the first 192.168.N.0/24 with N>=42 that does not overlap any of them.
+ *  Cached for process lifetime.
+ * ------------------------------------------------------------------------- */
+
+static char g_nat_subnet_prefix[32];   /* "192.168.42.0/24" */
+static char g_nat_gateway[32];         /* "192.168.42.1"    */
+static char g_nat_ip_base[32];         /* "192.168.42."     */
+static int  g_nat_prefix_len;          /* 24                */
+static BOOL g_nat_subnet_picked;
+
+typedef struct {
+    DWORD network;     /* base, host byte order */
+    int   prefix_len;
+} SubnetInfo;
+
+static BOOL ranges_overlap(DWORD a_net, int a_prefix, DWORD b_net, int b_prefix)
+{
+    DWORD a_mask = (a_prefix == 0) ? 0 : (~0u << (32 - a_prefix));
+    DWORD b_mask = (b_prefix == 0) ? 0 : (~0u << (32 - b_prefix));
+    DWORD a_start = a_net & a_mask;
+    DWORD a_end   = a_start | ~a_mask;
+    DWORD b_start = b_net & b_mask;
+    DWORD b_end   = b_start | ~b_mask;
+    return (a_start <= b_end) && (b_start <= a_end);
+}
+
+/* Collect every IPv4 unicast address bound to a host adapter, plus its
+ * on-link prefix. Returns count (clamped to cap). */
+static int collect_inuse_subnets(SubnetInfo *out, int cap)
+{
+    ULONG size = 0;
+    int n = 0;
+    PIP_ADAPTER_ADDRESSES buf = NULL;
+    PIP_ADAPTER_ADDRESSES a;
+
+    GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
+                          NULL, NULL, &size);
+    if (size == 0) return 0;
+    buf = (PIP_ADAPTER_ADDRESSES)malloc(size);
+    if (!buf) return 0;
+    if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
+                              NULL, buf, &size) != NO_ERROR) {
+        free(buf);
+        return 0;
+    }
+
+    for (a = buf; a && n < cap; a = a->Next) {
+        PIP_ADAPTER_UNICAST_ADDRESS u;
+        for (u = a->FirstUnicastAddress; u && n < cap; u = u->Next) {
+            SOCKADDR_IN *sin;
+            if (!u->Address.lpSockaddr) continue;
+            if (u->Address.lpSockaddr->sa_family != AF_INET) continue;
+            sin = (SOCKADDR_IN *)u->Address.lpSockaddr;
+            out[n].network    = ntohl(sin->sin_addr.s_addr);
+            out[n].prefix_len = u->OnLinkPrefixLength;
+            n++;
+        }
+    }
+    free(buf);
+    return n;
+}
+
+static void ensure_nat_subnet_picked(void)
+{
+    SubnetInfo used[128];
+    int n_used;
+    int n;
+
+    if (g_nat_subnet_picked) return;
+
+    n_used = collect_inuse_subnets(used, 128);
+
+    for (n = 42; n <= 255; n++) {
+        DWORD candidate = (192u << 24) | (168u << 16) | ((DWORD)n << 8);
+        BOOL conflict = FALSE;
+        int i;
+        for (i = 0; i < n_used; i++) {
+            if (ranges_overlap(candidate, 24, used[i].network, used[i].prefix_len)) {
+                conflict = TRUE;
+                break;
+            }
+        }
+        if (!conflict) {
+            sprintf_s(g_nat_subnet_prefix, sizeof(g_nat_subnet_prefix), "192.168.%d.0/24", n);
+            sprintf_s(g_nat_gateway,       sizeof(g_nat_gateway),       "192.168.%d.1",    n);
+            sprintf_s(g_nat_ip_base,       sizeof(g_nat_ip_base),       "192.168.%d.",     n);
+            g_nat_prefix_len    = 24;
+            g_nat_subnet_picked = TRUE;
+            ui_log(L"NAT subnet selected: %S (gateway %S)",
+                    g_nat_subnet_prefix, g_nat_gateway);
+            return;
+        }
+    }
+
+    /* All of 192.168.42-255.0/24 conflict somehow. Fall back to the default
+       and let HCN complain in the rare edge case where every /24 in the
+       upper half of 192.168/16 is taken. */
+    sprintf_s(g_nat_subnet_prefix, sizeof(g_nat_subnet_prefix), "192.168.42.0/24");
+    sprintf_s(g_nat_gateway,       sizeof(g_nat_gateway),       "192.168.42.1");
+    sprintf_s(g_nat_ip_base,       sizeof(g_nat_ip_base),       "192.168.42.");
+    g_nat_prefix_len    = 24;
+    g_nat_subnet_picked = TRUE;
+    ui_log(L"NAT subnet: no clean /24 in 192.168.42-255, falling back to %S",
+            g_nat_subnet_prefix);
+}
+
+const char *hcn_nat_subnet_prefix(void) { ensure_nat_subnet_picked(); return g_nat_subnet_prefix; }
+const char *hcn_nat_gateway(void)       { ensure_nat_subnet_picked(); return g_nat_gateway; }
+const char *hcn_nat_ip_base(void)       { ensure_nat_subnet_picked(); return g_nat_ip_base; }
+int         hcn_nat_prefix_len(void)    { ensure_nat_subnet_picked(); return g_nat_prefix_len; }
+
 HRESULT hcn_create_nat_network(GUID *network_id)
 {
     wchar_t settings[1024];
@@ -222,10 +341,12 @@ HRESULT hcn_create_nat_network(GUID *network_id)
 
     *network_id = APPSANDBOX_NAT_GUID;
 
-    /* Reuse the existing AppSandbox NAT network if it's already up —
+    /* Reuse the existing AppSandbox NAT network if it's already up -
        multiple VMs share one network, each with its own endpoint. */
     if (hcn_network_exists(&APPSANDBOX_NAT_GUID))
         return S_OK;
+
+    ensure_nat_subnet_picked();
 
     swprintf_s(settings, 1024,
         L"{"
@@ -235,11 +356,12 @@ HRESULT hcn_create_nat_network(GUID *network_id)
         L"\"Ipams\":[{"
             L"\"Type\":\"Static\","
             L"\"Subnets\":[{"
-                L"\"IpAddressPrefix\":\"172.20.0.0/16\","
-                L"\"Routes\":[{\"NextHop\":\"172.20.0.1\",\"DestinationPrefix\":\"0.0.0.0/0\"}]"
+                L"\"IpAddressPrefix\":\"%S\","
+                L"\"Routes\":[{\"NextHop\":\"%S\",\"DestinationPrefix\":\"0.0.0.0/0\"}]"
             L"}]"
         L"}]"
-        L"}");
+        L"}",
+        g_nat_subnet_prefix, g_nat_gateway);
 
     hr = pfnCreateNet(network_id, settings, &network, &error_record);
 
@@ -356,23 +478,28 @@ HRESULT hcn_create_endpoint(const GUID *network_id, GUID *endpoint_id,
     guid_to_string(network_id, net_guid_str, 64);
     guid_to_string(endpoint_id, ep_guid_str, 64);
 
-    /* Static IP for NAT; DHCP for Internal (ICS) and External (Transparent) */
+    /* Static IP for NAT; DHCP for Internal (ICS) and External (Transparent).
+       Prefix length matches the picked subnet (see hcn_nat_prefix_len). */
     if (IsEqualGUID(network_id, &APPSANDBOX_NAT_GUID) && nat_ip && nat_ip[0]) {
+        ensure_nat_subnet_picked();
         swprintf_s(settings, 1024,
             L"{"
             L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
             L"\"HostComputeNetwork\":\"%s\","
-            L"\"IpConfigurations\":[{\"IpAddress\":\"%S\",\"PrefixLength\":16}]"
-            L"}", net_guid_str, nat_ip);
+            L"\"IpConfigurations\":[{\"IpAddress\":\"%S\",\"PrefixLength\":%d}]"
+            L"}", net_guid_str, nat_ip, g_nat_prefix_len);
     } else if (IsEqualGUID(network_id, &APPSANDBOX_NAT_GUID)) {
+        char default_ip[32];
+        ensure_nat_subnet_picked();
+        sprintf_s(default_ip, sizeof(default_ip), "%s2", g_nat_ip_base);
         swprintf_s(settings, 1024,
             L"{"
             L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
             L"\"HostComputeNetwork\":\"%s\","
-            L"\"IpConfigurations\":[{\"IpAddress\":\"172.20.0.2\",\"PrefixLength\":16}]"
-            L"}", net_guid_str);
+            L"\"IpConfigurations\":[{\"IpAddress\":\"%S\",\"PrefixLength\":%d}]"
+            L"}", net_guid_str, default_ip, g_nat_prefix_len);
     } else {
-        /* Internal (ICS DHCP) or External (LAN DHCP) — no static IP */
+        /* Internal (ICS DHCP) or External (LAN DHCP) - no static IP */
         swprintf_s(settings, 1024,
             L"{"
             L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
