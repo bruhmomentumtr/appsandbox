@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|ARM64">
@@ -101,9 +101,9 @@
       <AdditionalDependencies>appsandbox_core.lib;comdlg32.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources\"
-xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web\"
-xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)"
+      <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
+xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
+xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)."
 </Command>
       <Message>Copying resources, web UI, and WebView2Loader to output directory...</Message>
     </PostBuildEvent>
@@ -127,9 +127,9 @@ xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)"
       <AdditionalDependencies>appsandbox_core.lib;comdlg32.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources\"
-xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web\"
-xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)"
+      <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
+xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
+xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)."
 </Command>
       <Message>Copying resources, web UI, and WebView2Loader to output directory...</Message>
     </PostBuildEvent>
@@ -157,9 +157,9 @@ xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)"
       <AdditionalDependencies>appsandbox_core.lib;comdlg32.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources\"
-xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web\"
-xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)"
+      <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
+xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
+xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)."
 </Command>
       <Message>Copying resources, web UI, and WebView2Loader to output directory...</Message>
     </PostBuildEvent>
@@ -187,9 +187,9 @@ xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)"
       <AdditionalDependencies>appsandbox_core.lib;comdlg32.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources\"
-xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web\"
-xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)"
+      <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
+xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
+xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)."
 </Command>
       <Message>Copying resources, web UI, and WebView2Loader to output directory...</Message>
     </PostBuildEvent>

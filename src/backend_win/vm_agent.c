@@ -1,6 +1,8 @@
 #include <winsock2.h>
 #include "vm_agent.h"
 #include "vm_ssh_proxy.h"
+#include "asb_core.h"
+#include "hcn_network.h"
 #include "ui.h"
 #include <stdio.h>
 
@@ -38,7 +40,9 @@ void vm_agent_set_hwnd(HWND hwnd)
 /* ---- Per-VM connection state ---- */
 
 typedef struct AgentConn {
-    VmInstance    *vm;
+    /* Stable VM identifier; survives g_vms[] compaction. The actual
+       VmInstance* is resolved via asb_find_vm_by_id() at each use. */
+    UINT64         vm_id;
     HANDLE         thread;
     SOCKET         sock;
     volatile BOOL  stop;
@@ -57,8 +61,9 @@ static BOOL      g_wsa_init = FALSE;
 static AgentConn *find_conn(VmInstance *vm)
 {
     int i;
+    if (!vm || vm->unique_id == 0) return NULL;
     for (i = 0; i < MAX_AGENTS; i++)
-        if (g_conns[i].vm == vm)
+        if (g_conns[i].vm_id == vm->unique_id)
             return &g_conns[i];
     return NULL;
 }
@@ -66,10 +71,11 @@ static AgentConn *find_conn(VmInstance *vm)
 static AgentConn *alloc_conn(VmInstance *vm)
 {
     int i;
+    if (!vm || vm->unique_id == 0) return NULL;
     for (i = 0; i < MAX_AGENTS; i++) {
-        if (g_conns[i].vm == NULL) {
+        if (g_conns[i].vm_id == 0) {
             memset(&g_conns[i], 0, sizeof(AgentConn));
-            g_conns[i].vm = vm;
+            g_conns[i].vm_id = vm->unique_id;
             g_conns[i].sock = INVALID_SOCKET;
             g_conns[i].cmd_done = CreateEventW(NULL, FALSE, FALSE, NULL);
             return &g_conns[i];
@@ -199,7 +205,7 @@ static void notify_agent_status(VmInstance *vm)
 /* Process an untagged (async) message from the agent.
    Returns: 0 = handled, 1 = os_shutdown (caller should break),
             2 = service_stopping (caller should break and let the reconnect
-                loop retry — SCM restarts the service on failure, so we must
+                loop retry - SCM restarts the service on failure, so we must
                 keep trying to reconnect). */
 static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
 {
@@ -299,7 +305,7 @@ static int send_tagged_cmd(SOCKET s, VmInstance *vm, unsigned int *seq,
         if (n <= 0) return n;
 
         if (strncmp(rsp, prefix, pfx_len) == 0) {
-            /* Tagged response — strip prefix */
+            /* Tagged response - strip prefix */
             memmove(rsp, rsp + pfx_len, strlen(rsp + pfx_len) + 1);
             return (int)strlen(rsp);
         }
@@ -314,9 +320,13 @@ static int send_tagged_cmd(SOCKET s, VmInstance *vm, unsigned int *seq,
 static DWORD WINAPI agent_thread_proc(LPVOID param)
 {
     AgentConn *conn = (AgentConn *)param;
-    VmInstance *vm = conn->vm;
+    VmInstance *vm;
 
-    while (!conn->stop) {
+    /* Resolve VM by stable ID each iteration. If asb_find_vm_by_id
+       returns NULL the VM has been deleted (slot reclaimed) -- exit
+       cleanly. Pointer freshness is now guaranteed for the body of
+       each iteration; we never stash a stale &g_vms[idx]. */
+    while (!conn->stop && (vm = asb_find_vm_by_id(conn->vm_id)) != NULL) {
         char buf[256];
         int n;
         SOCKET s;
@@ -353,17 +363,19 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             ui_log(L"Install complete for \"%s\".", vm->name);
         }
 
-        /* Send NAT IP to agent (only for NAT mode) */
+        /* Send NAT IP to agent (only for NAT mode). Gateway is the chosen
+           subnet's .1; prefix length is always /24 for our NAT. */
         if (vm->network_mode == NET_NAT && vm->nat_ip[0] != '\0') {
             char ip_cmd[64];
-            sprintf_s(ip_cmd, sizeof(ip_cmd), "set_ip:%s/16:172.20.0.1", vm->nat_ip);
+            sprintf_s(ip_cmd, sizeof(ip_cmd), "set_ip:%s/24:%s.1",
+                       vm->nat_ip, hcn_nat_subnet_base());
             n = send_tagged_cmd(s, vm, &conn->cmd_seq, ip_cmd, buf, sizeof(buf));
             if (n <= 0) goto disconnected;
             ui_log(L"NAT IP config for \"%s\": %S", vm->name, buf);
         }
 
         /* Send GPU share info to agent (if GPU-PV is assigned).
-           Fire-and-forget — no response expected, so no tagging needed. */
+           Fire-and-forget - no response expected, so no tagging needed. */
         if (vm->gpu_mode != 0 && vm->gpu_shares.count > 0) {
             char header[64];
             int gi;
@@ -409,10 +421,10 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             }
         }
 
-        /* Notify UI — agent online + SSH state are all set now */
+        /* Notify UI - agent online + SSH state are all set now */
         notify_agent_status(vm);
 
-        /* Connected — read loop */
+        /* Connected - read loop */
         while (!conn->stop) {
             fd_set rfds;
             struct timeval tv;
@@ -440,7 +452,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                         sprintf_s(prefix, sizeof(prefix), "%u:", conn->cmd_seq);
                         pfx_len = (int)strlen(prefix);
                         if (strncmp(conn->rsp, prefix, pfx_len) == 0) {
-                            /* Tagged response — strip prefix */
+                            /* Tagged response - strip prefix */
                             memmove(conn->rsp, conn->rsp + pfx_len, strlen(conn->rsp + pfx_len) + 1);
                             break;
                         }
@@ -461,13 +473,13 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
 
             ret = select(0, &rfds, NULL, NULL, &tv);
             if (ret < 0) break;
-            if (ret == 0) continue; /* timeout — loop back to check cmd_pending/stop */
+            if (ret == 0) continue; /* timeout - loop back to check cmd_pending/stop */
 
             n = recv_line(s, buf, sizeof(buf));
             if (n <= 0) break; /* connection lost */
 
             { int rc = process_async_message(vm, s, buf);
-              if (rc == 1 || rc == 2) break;   /* os_shutdown or service_stopping — reconnect loop will retry */
+              if (rc == 1 || rc == 2) break;   /* os_shutdown or service_stopping - reconnect loop will retry */
             }
         }
 

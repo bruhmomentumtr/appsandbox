@@ -155,9 +155,13 @@ function updateHostInfo(info) {
 
 /* ---- Adapters ---- */
 
+var currentAdapters = [];
+var currentDefaultAdapter = '';
+
 function populateAdapters(adapters, defaultIdx) {
     var sel = document.getElementById('net-adapter');
     sel.innerHTML = '<option value="">(Auto)</option>';
+    currentAdapters = adapters || [];
     if (adapters) {
         adapters.forEach(function(a) {
             var opt = document.createElement('option');
@@ -166,8 +170,12 @@ function populateAdapters(adapters, defaultIdx) {
             sel.appendChild(opt);
         });
     }
-    if (typeof defaultIdx === 'number' && defaultIdx >= 0 && defaultIdx < sel.options.length)
+    if (typeof defaultIdx === 'number' && defaultIdx >= 0 && defaultIdx < sel.options.length) {
         sel.selectedIndex = defaultIdx;
+        currentDefaultAdapter = sel.value;
+    } else if (adapters && adapters.length > 0) {
+        currentDefaultAdapter = adapters[0];
+    }
 }
 
 /* ---- Templates ---- */
@@ -830,6 +838,9 @@ function commitInlineEdit() {
 
     if (field) {
         sendCmd('editVm', { vmIndex: row, field: field, value: value });
+        if (field === 'networkMode' && value === '2' && currentDefaultAdapter) {
+            sendCmd('editVm', { vmIndex: row, field: 'netAdapter', value: currentDefaultAdapter });
+        }
     }
 }
 

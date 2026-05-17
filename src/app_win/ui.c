@@ -1,5 +1,5 @@
 /*
- * ui.c — Main window + WebView2 UI bridge.
+ * ui.c - Main window + WebView2 UI bridge.
  *
  * Thin UI shell: WebView2 hosting, JSON message dispatch, display windows,
  * tray icon. All VM orchestration is in asb_core.c (the core library).
@@ -1076,7 +1076,7 @@ static void CALLBACK ui_state_callback(AsbVm vm, BOOL running, void *user_data)
 static void CALLBACK ui_progress_callback(AsbVm vm, int pct, BOOL staging, void *user_data)
 {
     (void)pct; (void)staging; (void)user_data;
-    /* Progress is already set in the VmInstance by the library — just refresh */
+    /* Progress is already set in the VmInstance by the library - just refresh */
     if (g_hwnd_main)
         PostMessageW(g_hwnd_main, WM_VM_STATE_CHANGED, (WPARAM)0, (LPARAM)vm);
 }
@@ -1192,7 +1192,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_VM_STATE_CHANGED:
     {
-        /* Library already handled cleanup — just refresh UI and manage displays */
+        /* Library already handled cleanup - just refresh UI and manage displays */
         AsbVm vm = (AsbVm)lp;
         BOOL running = (BOOL)wp;
         int idx = asb_vm_index(vm);
@@ -1208,7 +1208,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_VM_REMOVED:
     {
-        /* Library removed a VM at this index — compact display arrays */
+        /* Library removed a VM at this index - compact display arrays */
         int idx = (int)wp;
         int count = asb_vm_count();
         int j;
@@ -1248,7 +1248,10 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_VM_IDD_READY:
     {
-        VmInstance *inst = (VmInstance *)lp;
+        /* lp is a stable per-VM id (UINT64), not a VmInstance*. Resolve
+           fresh; returns NULL if the VM was deleted between PostMessage
+           and our processing. */
+        VmInstance *inst = asb_find_vm_by_id((UINT64)lp);
         if (inst && inst->running && !inst->install_complete && !inst->shutdown_requested) {
             int i, count = asb_vm_count();
             for (i = 0; i < count; i++) {
@@ -1384,7 +1387,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         BOOL ok = (BOOL)wp;
         BOOL reboot_required = (BOOL)lp;
         if (ok && !reboot_required) {
-            /* Feature enabled, no reboot needed — initialize now */
+            /* Feature enabled, no reboot needed - initialize now */
             g_prereq_ok = TRUE;
             webview2_post(L"{\"type\":\"prereqResult\",\"ok\":true,\"reboot\":false}");
             asb_init();

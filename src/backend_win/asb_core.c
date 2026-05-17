@@ -48,6 +48,11 @@ static GpuList g_gpu_list;
 static VmInstance g_vms[ASB_MAX_VMS];
 static int g_vm_count = 0;
 
+/* Monotonically-increasing per-VM ID. Never reused; 0 is reserved as
+   "unassigned." Used by long-lived threads (agent, IDD probe) so they
+   keep working across compactions of g_vms[]. */
+static UINT64 g_next_vm_id = 1;
+
 static SnapshotTree g_snap_trees[ASB_MAX_VMS];
 
 typedef struct {
@@ -154,16 +159,23 @@ ASB_API void asb_idd_probe_set_hwnd(HWND hwnd)
 
 static DWORD WINAPI idd_probe_thread_proc(LPVOID param)
 {
-    VmInstance *vm = (VmInstance *)param;
+    UINT64 vm_id = (UINT64)(ULONG_PTR)param;
+    VmInstance *vm;
     SOCKET s;
     SOCKADDR_HV_PROBE addr;
     u_long nonblock;
     fd_set wfds, efds;
     struct timeval tv;
 
+    vm = asb_find_vm_by_id(vm_id);
+    if (!vm) return 0;
     asb_log(L"IDD probe: starting for \"%s\"", vm->name);
 
-    while (!vm->idd_probe_stop && vm->running && !vm->install_complete) {
+    /* Resolve VM by stable id each iteration. Returns NULL if the VM
+       has been deleted, so a single shift+compaction of g_vms[] can no
+       longer leave us holding a stale pointer. */
+    while ((vm = asb_find_vm_by_id(vm_id)) != NULL &&
+           !vm->idd_probe_stop && vm->running && !vm->install_complete) {
         /* Try to connect to VDD frame service */
         static const GUID zero_guid = {0};
         GUID runtime_id = vm->runtime_id;
@@ -206,22 +218,29 @@ static DWORD WINAPI idd_probe_thread_proc(LPVOID param)
 
             if (select(0, NULL, &wfds, &efds, &tv) <= 0 || FD_ISSET(s, &efds)) {
                 closesocket(s);
-                continue;  /* timeout or error — VDD not ready yet */
+                continue;  /* timeout or error - VDD not ready yet */
             }
         }
 
-        /* Connection succeeded — VDD is accepting frames */
+        /* Connection succeeded - VDD is accepting frames.
+           Re-resolve vm one last time inside this branch; vm could
+           have been shifted/deleted between the loop test and now. */
         closesocket(s);
 
-        if (!vm->idd_probe_stop && vm->running && !vm->install_complete) {
+        vm = asb_find_vm_by_id(vm_id);
+        if (vm && !vm->idd_probe_stop && vm->running && !vm->install_complete) {
             asb_log(L"IDD probe: VDD ready for \"%s\", opening display", vm->name);
+            /* Pass the stable ID, not a VmInstance*: the UI thread looks
+               it up freshly with asb_find_vm_by_id before acting. */
             if (g_idd_probe_hwnd)
-                PostMessageW(g_idd_probe_hwnd, WM_VM_IDD_READY, 0, (LPARAM)vm);
+                PostMessageW(g_idd_probe_hwnd, WM_VM_IDD_READY, 0, (LPARAM)vm_id);
         }
         break;
     }
 
-    asb_log(L"IDD probe: exiting for \"%s\"", vm->name);
+    /* vm may have been deleted; re-resolve before logging the exit. */
+    vm = asb_find_vm_by_id(vm_id);
+    asb_log(L"IDD probe: exiting for \"%s\"", vm ? vm->name : L"(deleted)");
     return 0;
 }
 
@@ -232,7 +251,10 @@ static void idd_probe_start(VmInstance *vm)
     if (vm->is_template) return;
 
     vm->idd_probe_stop = FALSE;
-    vm->idd_probe_thread = CreateThread(NULL, 0, idd_probe_thread_proc, vm, 0, NULL);
+    /* Pass stable ID, not pointer -- the thread is long-lived and must
+       survive g_vms[] compaction. */
+    vm->idd_probe_thread = CreateThread(NULL, 0, idd_probe_thread_proc,
+                                         (LPVOID)(ULONG_PTR)vm->unique_id, 0, NULL);
 }
 
 static void idd_probe_stop(VmInstance *vm)
@@ -252,6 +274,16 @@ static int vm_index_of(AsbVm vm)
     if (!vm) return -1;
     idx = (int)(vm_inst(vm) - g_vms);
     return (idx >= 0 && idx < g_vm_count) ? idx : -1;
+}
+
+ASB_API VmInstance *asb_find_vm_by_id(UINT64 id)
+{
+    int i;
+    if (id == 0) return NULL;
+    for (i = 0; i < g_vm_count; i++) {
+        if (g_vms[i].unique_id == id) return &g_vms[i];
+    }
+    return NULL;
 }
 
 /* ---- Per-VM state JSON (beside disk.vhdx) ---- */
@@ -389,6 +421,7 @@ static void load_vm_list(void)
             if (g_vm_count >= ASB_MAX_VMS) break;
             vm = &g_vms[g_vm_count];
             ZeroMemory(vm, sizeof(VmInstance));
+            vm->unique_id = g_next_vm_id++;
             g_vm_count++;
             continue;
         }
@@ -422,7 +455,7 @@ static void load_vm_list(void)
         else if (wcsncmp(line, L"GpuName=", 8) == 0)
             wcscpy_s(vm->gpu_name, 256, line + 8);
         else if (wcsncmp(line, L"GpuDevicePath=", 14) == 0)
-            { /* ignored — backwards compat */ }
+            { /* ignored - backwards compat */ }
         else if (wcsncmp(line, L"NetworkMode=", 12) == 0)
             vm->network_mode = _wtoi(line + 12);
         else if (wcsncmp(line, L"NetAdapter=", 11) == 0)
@@ -644,7 +677,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
 
                 scan_templates();
 
-                /* Fire the removed callback last — WM_VM_REMOVED is async, so
+                /* Fire the removed callback last - WM_VM_REMOVED is async, so
                    both g_vms[] and g_templates[] must be fully updated before
                    the UI thread can pull the message and re-query them. */
                 if (g_removed_cb) g_removed_cb(i, g_removed_ud);
@@ -697,32 +730,69 @@ ASB_API void asb_vm_cleanup_network(VmInstance *vm)
 
 /* ---- NAT IP allocation ---- */
 
-/* Allocate the next free IP in the 172.20.0.0/16 range.
-   Scans g_vms[] for IPs already in use.  Returns FALSE if pool exhausted. */
+/* Allocate the next free IP in the chosen NAT /24 (see hcn_nat_subnet_base).
+   Scans g_vms[] for IPs already in use. Returns FALSE if pool exhausted. */
 static BOOL allocate_nat_ip(VmInstance *vm)
 {
-    BOOL used[256] = { 0 };  /* Track .0.2 through .0.254 */
+    BOOL used[256] = { 0 };
+    const char *base = hcn_nat_subnet_base();   /* e.g. "192.168.42" */
+    int ba, bb, bc;
     int i, octet;
 
+    if (sscanf_s(base, "%d.%d.%d", &ba, &bb, &bc) != 3) return FALSE;
+
     for (i = 0; i < g_vm_count; i++) {
+        int a, b, c, d;
         if (&g_vms[i] == vm) continue;
         if (g_vms[i].nat_ip[0] == '\0') continue;
-        /* Parse last octet from "172.20.0.X" */
-        {
-            int a, b, c, d;
-            if (sscanf_s(g_vms[i].nat_ip, "%d.%d.%d.%d", &a, &b, &c, &d) == 4 &&
-                a == 172 && b == 20 && c == 0 && d >= 2 && d <= 254)
-                used[d] = TRUE;
-        }
+        /* Only consider entries that share our current /24. Stale entries
+           from a prior run with a different subnet are ignored - their
+           endpoints died with the previous NAT network. */
+        if (sscanf_s(g_vms[i].nat_ip, "%d.%d.%d.%d", &a, &b, &c, &d) == 4 &&
+            a == ba && b == bb && c == bc && d >= 2 && d <= 254)
+            used[d] = TRUE;
     }
 
     for (octet = 2; octet <= 254; octet++) {
         if (!used[octet]) {
-            sprintf_s(vm->nat_ip, sizeof(vm->nat_ip), "172.20.0.%d", octet);
+            sprintf_s(vm->nat_ip, sizeof(vm->nat_ip), "%s.%d", base, octet);
             return TRUE;
         }
     }
     return FALSE;
+}
+
+/* Try hcn_create_endpoint, retrying on NAT failure by bumping the last
+   octet of nat_ip up to 10 times. The buffer pointed to by nat_ip is
+   mutated in place on a successful retry; the caller is responsible for
+   save_vm_list() if it cares about persistence.
+
+   Defends against HCN_E_ADDR_INVALID_OR_RESERVED (0x803B002F), which
+   HNS returns when an endpoint at the chosen IP was orphaned by a
+   previous run -- the IP is in our allocator's free list but HNS still
+   has a phantom reservation. Bumping past it usually wins. */
+static HRESULT try_endpoint_with_retry(const GUID *net_id, GUID *ep_id,
+                                       wchar_t *ep_guid_str, size_t str_len,
+                                       char *nat_ip, size_t nat_ip_size,
+                                       BOOL is_nat)
+{
+    HRESULT hr;
+    int retry;
+
+    hr = hcn_create_endpoint(net_id, ep_id, ep_guid_str, str_len,
+                              (nat_ip && nat_ip[0]) ? nat_ip : NULL);
+    if (SUCCEEDED(hr) || !is_nat || !nat_ip || !nat_ip[0]) return hr;
+
+    asb_log(L"Endpoint failed for %S, trying next IP...", nat_ip);
+    for (retry = 0; retry < 10; retry++) {
+        int a, b, c, d;
+        if (sscanf_s(nat_ip, "%d.%d.%d.%d", &a, &b, &c, &d) != 4 || d >= 254) break;
+        sprintf_s(nat_ip, nat_ip_size, "%d.%d.%d.%d", a, b, c, d + 1);
+        asb_log(L"Retrying with %S...", nat_ip);
+        hr = hcn_create_endpoint(net_id, ep_id, ep_guid_str, str_len, nat_ip);
+        if (SUCCEEDED(hr)) return hr;
+    }
+    return hr;
 }
 
 /* ---- Background VM start thread ---- */
@@ -762,8 +832,11 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         default:           hr = E_INVALIDARG; break;
         }
         if (SUCCEEDED(hr)) {
-            hr = hcn_create_endpoint(&args->network_id, &args->endpoint_id, endpoint_guid_str, 64,
-                                     vm->nat_ip[0] ? vm->nat_ip : NULL);
+            hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
+                                          endpoint_guid_str, 64,
+                                          vm->nat_ip, sizeof(vm->nat_ip),
+                                          args->network_mode == NET_NAT);
+            if (SUCCEEDED(hr) && args->network_mode == NET_NAT) save_vm_list();
             if (FAILED(hr)) {
                 asb_log(L"Error: Network endpoint failed (0x%08X).", hr);
                 if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
@@ -788,6 +861,13 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
     if (FAILED(hr)) {
         asb_log(L"Error: Failed to create compute system (0x%08X)", hr);
         asb_alert(L"Failed to start VM, check its configuration.");
+        /* HCS rejected the VM after we already created the HCN endpoint.
+           Free the endpoint so its IP reservation doesn't leak into the
+           next attempt as a phantom HCN_E_ADDR_INVALID_OR_RESERVED. */
+        if (endpoint_guid_str[0] != L'\0') {
+            hcn_delete_endpoint(&args->endpoint_id);
+            endpoint_guid_str[0] = L'\0';
+        }
         if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
         free(args); return 1;
     }
@@ -1030,11 +1110,17 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
         default:           hr = E_INVALIDARG; break;
         }
         if (SUCCEEDED(hr)) {
-            hr = hcn_create_endpoint(&args->network_id, &args->endpoint_id, args->endpoint_guid, 64,
-                                     (nat_ip && nat_ip[0]) ? nat_ip : NULL);
-            if (SUCCEEDED(hr))
+            BOOL is_nat = (args->config.network_mode == NET_NAT);
+            size_t ip_size = (args->vm_index >= 0 && args->vm_index < g_vm_count)
+                              ? sizeof(g_vms[args->vm_index].nat_ip) : 0;
+            hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
+                                          args->endpoint_guid, 64,
+                                          nat_ip, ip_size, is_nat);
+            if (SUCCEEDED(hr)) {
                 args->has_network = TRUE;
-            /* If endpoint create fails, leave the network alone — it may be
+                if (is_nat) save_vm_list();
+            }
+            /* If endpoint create fails, leave the network alone - it may be
                shared with other VMs. Orphan networks are cleaned up at next
                launch by hcn_cleanup_stale_networks(). */
         }
@@ -1056,6 +1142,14 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
         if (FAILED(hr)) {
             args->result = hr;
             swprintf_s(args->error_msg, 512, L"Failed to create HCS VM (0x%08X)", hr);
+            /* HCS rejected the VM after we already created the HCN endpoint.
+               Free the endpoint so its IP reservation doesn't leak into the
+               next attempt as a phantom HCN_E_ADDR_INVALID_OR_RESERVED. */
+            if (args->has_network) {
+                hcn_delete_endpoint(&args->endpoint_id);
+                args->has_network = FALSE;
+                args->endpoint_guid[0] = L'\0';
+            }
             goto done;
         }
 
@@ -1064,6 +1158,13 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
             args->result = hr;
             swprintf_s(args->error_msg, 512, L"Failed to start VM (0x%08X)", hr);
             hcs_close_vm(&temp_inst);
+            /* VM created but failed to start. Free the endpoint so its
+               IP reservation doesn't leak into the next attempt. */
+            if (args->has_network) {
+                hcn_delete_endpoint(&args->endpoint_id);
+                args->has_network = FALSE;
+                args->endpoint_guid[0] = L'\0';
+            }
             goto done;
         }
 
@@ -1134,7 +1235,7 @@ done:
                     asb_alert(L"Failed to start VM, check its configuration.");
                 save_vm_list();
             } else {
-                /* VHDX never created — remove VM from list and clean up files */
+                /* VHDX never created - remove VM from list and clean up files */
                 int j;
                 asb_log(L"Error creating VM \"%s\": %s", inst->name, args->error_msg);
                 if (g_removed_cb) g_removed_cb(idx, g_removed_ud);
@@ -1265,11 +1366,11 @@ ASB_API void asb_detach(void)
 
     /* Cleanly release HCS resources WITHOUT terminating running VMs.
        Used by short-lived consumers that start a VM
-       and exit — the VM keeps running after the process is gone.
+       and exit - the VM keeps running after the process is gone.
 
        Unlike asb_cleanup(), this does NOT call hcs_terminate_vm().
        We unregister callbacks and stop threads, but do NOT close the HCS
-       handle — HcsCloseComputeSystem terminates the VM when it's the last
+       handle - HcsCloseComputeSystem terminates the VM when it's the last
        handle.  Instead, let the OS close it during process teardown after
        the callback is already gone. */
     for (i = 0; i < g_vm_count; i++) {
@@ -1278,7 +1379,7 @@ ASB_API void asb_detach(void)
         vm_agent_stop(&g_vms[i]);
         idd_probe_stop(&g_vms[i]);
         hcs_unregister_vm_callback(&g_vms[i]);
-        g_vms[i].handle = NULL;  /* abandon handle — OS will close it */
+        g_vms[i].handle = NULL;  /* abandon handle - OS will close it */
     }
 
     g_initialized = FALSE;
@@ -1378,6 +1479,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 
     inst = &g_vms[g_vm_count];
     ZeroMemory(inst, sizeof(VmInstance));
+    inst->unique_id = g_next_vm_id++;
 
     /* Net adapter */
     if (config->net_adapter && config->net_adapter[0] != L'\0' &&
@@ -1558,11 +1660,14 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             asb_log(L"Warning: Network failed (0x%08X). Continuing without.", hr);
             cfg.network_mode = NET_NONE;
         } else {
-            hr = hcn_create_endpoint(&inst->network_id, &inst->endpoint_id, endpoint_guid_str, 64,
-                                     inst->nat_ip[0] ? inst->nat_ip : NULL);
+            hr = try_endpoint_with_retry(&inst->network_id, &inst->endpoint_id,
+                                          endpoint_guid_str, 64,
+                                          inst->nat_ip, sizeof(inst->nat_ip),
+                                          cfg.network_mode == NET_NAT);
+            if (SUCCEEDED(hr) && cfg.network_mode == NET_NAT) save_vm_list();
             if (FAILED(hr)) {
                 asb_log(L"Warning: Endpoint failed (0x%08X).", hr);
-                /* Leave the shared network alone — other VMs may be using it. */
+                /* Leave the shared network alone - other VMs may be using it. */
                 cfg.network_mode = NET_NONE;
             }
         }
@@ -1576,6 +1681,12 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     if (FAILED(hr)) {
         asb_log(L"Error: Failed to create compute system (0x%08X)", hr);
         asb_alert(L"Failed to start VM, check its configuration.");
+        /* HCS rejected the VM after we already created the HCN endpoint.
+           Free the endpoint so its IP reservation doesn't leak. */
+        if (endpoint_guid_str[0] != L'\0') {
+            hcn_delete_endpoint(&inst->endpoint_id);
+            endpoint_guid_str[0] = L'\0';
+        }
         return hr;
     }
 
@@ -1654,7 +1765,7 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
     }
 
     if (!inst->handle) {
-        /* Need to re-create HCS system — do it in a background thread */
+        /* Need to re-create HCS system - do it in a background thread */
         StartVmArgs *args = (StartVmArgs *)calloc(1, sizeof(StartVmArgs));
         if (!args) return E_OUTOFMEMORY;
         args->vm = inst;
@@ -2252,7 +2363,7 @@ ASB_API void asb_reconnect_running(void)
             /* HCS open failed (stale handle from dead process) but enumeration
                confirms the VM is running.  Mark it so queries return the right
                state.  We don't have a handle so we can't register callbacks
-               or monitor — the start path will destroy the stale system and
+               or monitor - the start path will destroy the stale system and
                recreate it when needed. */
             g_vms[i].running = TRUE;
             asb_log(L"Reconnect: \"%s\" is running (via enumeration, no handle).",

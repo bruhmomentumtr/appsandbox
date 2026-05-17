@@ -84,7 +84,7 @@ typedef struct {
 typedef void (*AsbLogCallback)(const wchar_t *message, void *user_data);
 
 /* VM state change callback. Called when a VM starts, stops, or exits.
-   Called from a worker thread — the consumer must marshal to its own thread. */
+   Called from a worker thread - the consumer must marshal to its own thread. */
 typedef void (*AsbStateCallback)(AsbVm vm, BOOL running, void *user_data);
 
 /* VHDX creation progress callback.  pct: 0-100, staging: TRUE during file staging phase. */
@@ -95,7 +95,7 @@ typedef void (*AsbAlertCallback)(const wchar_t *message, void *user_data);
 
 /* VM removed callback.  Fired when a VM is removed from the internal array
    (e.g. template finalization, failed VHDX creation).  index is the position
-   BEFORE compaction — the consumer should compact its parallel arrays.
+   BEFORE compaction - the consumer should compact its parallel arrays.
    Called from a worker thread. */
 typedef void (*AsbVmRemovedCallback)(int index, void *user_data);
 
@@ -243,6 +243,12 @@ ASB_API void asb_idd_probe_set_hwnd(HWND hwnd);
 #include "gpu_enum.h"
 
 ASB_API VmInstance   *asb_vm_instance(AsbVm vm);
+
+/* Look up a VmInstance by its stable unique_id. Returns NULL if no VM
+   with that id exists (e.g. the VM was deleted). Long-lived background
+   threads cache the id rather than a VmInstance* so they survive
+   compaction of the g_vms[] array. */
+ASB_API VmInstance   *asb_find_vm_by_id(UINT64 id);
 ASB_API SnapshotTree *asb_vm_snap_tree(AsbVm vm);
 ASB_API GpuList      *asb_gpu_list(void);
 ASB_API int           asb_vm_index(AsbVm vm);

@@ -50,6 +50,13 @@ typedef struct {
 
 /* Runtime state of a VM */
 typedef struct {
+    /* Monotonically-increasing per-VM ID, assigned on creation, never
+       reused. Long-lived background threads (agent, IDD probe) cache
+       this instead of a VmInstance* so they survive compaction of the
+       g_vms[] array (e.g. when a template at a lower index is removed,
+       higher-index entries shift down -- their old slots get zeroed but
+       the new locations are findable by ID). 0 means "not assigned". */
+    UINT64      unique_id;
     HCS_SYSTEM  handle;
     wchar_t     name[256];
     wchar_t     os_type[32];
@@ -97,7 +104,7 @@ typedef struct {
     volatile int ssh_state;              /* 0=pending, 1=installing, 2=ready, 3=failed */
 } VmInstance;
 
-/* Initialize HCS — loads computecore.dll dynamically.
+/* Initialize HCS - loads computecore.dll dynamically.
    Returns TRUE if HCS is available. */
 BOOL hcs_init(void);
 
