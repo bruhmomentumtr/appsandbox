@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|ARM64">
@@ -124,7 +124,7 @@
       <AdditionalDependencies>ws2_32.lib;ole32.lib;wtsapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources\"</Command>
+      <Command>xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources"</Command>
       <Message>Copying appsandbox-audio.exe to release\resources\</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
@@ -148,7 +148,7 @@
       <AdditionalDependencies>ws2_32.lib;ole32.lib;wtsapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources\"</Command>
+      <Command>xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources"</Command>
       <Message>Copying appsandbox-audio.exe to release\resources\</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
