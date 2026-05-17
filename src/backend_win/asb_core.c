@@ -48,6 +48,11 @@ static GpuList g_gpu_list;
 static VmInstance g_vms[ASB_MAX_VMS];
 static int g_vm_count = 0;
 
+/* Monotonically-increasing per-VM ID. Never reused; 0 is reserved as
+   "unassigned." Used by long-lived threads (agent, IDD probe) so they
+   keep working across compactions of g_vms[]. */
+static UINT64 g_next_vm_id = 1;
+
 static SnapshotTree g_snap_trees[ASB_MAX_VMS];
 
 typedef struct {
@@ -154,22 +159,23 @@ ASB_API void asb_idd_probe_set_hwnd(HWND hwnd)
 
 static DWORD WINAPI idd_probe_thread_proc(LPVOID param)
 {
-    VmInstance *vm = (VmInstance *)param;
+    UINT64 vm_id = (UINT64)(ULONG_PTR)param;
+    VmInstance *vm;
     SOCKET s;
     SOCKADDR_HV_PROBE addr;
     u_long nonblock;
     fd_set wfds, efds;
     struct timeval tv;
 
+    vm = asb_find_vm_by_id(vm_id);
+    if (!vm) return 0;
     asb_log(L"IDD probe: starting for \"%s\"", vm->name);
 
-    /* `vm` points into g_vms[] by index. If a lower-index entry is removed
-       (e.g. a template finishes sysprep), our slot's contents shift away
-       and our pointer's memory gets zeroed. The vm->running check usually
-       catches that (zeroed slot has running=FALSE), but if the slot got
-       overwritten with another VM's data instead of zeroed, the name
-       check ensures we don't silently start probing the wrong VM. */
-    while (!vm->idd_probe_stop && vm->running && !vm->install_complete && vm->name[0] != L'\0') {
+    /* Resolve VM by stable id each iteration. Returns NULL if the VM
+       has been deleted, so a single shift+compaction of g_vms[] can no
+       longer leave us holding a stale pointer. */
+    while ((vm = asb_find_vm_by_id(vm_id)) != NULL &&
+           !vm->idd_probe_stop && vm->running && !vm->install_complete) {
         /* Try to connect to VDD frame service */
         static const GUID zero_guid = {0};
         GUID runtime_id = vm->runtime_id;
@@ -216,18 +222,25 @@ static DWORD WINAPI idd_probe_thread_proc(LPVOID param)
             }
         }
 
-        /* Connection succeeded - VDD is accepting frames */
+        /* Connection succeeded - VDD is accepting frames.
+           Re-resolve vm one last time inside this branch; vm could
+           have been shifted/deleted between the loop test and now. */
         closesocket(s);
 
-        if (!vm->idd_probe_stop && vm->running && !vm->install_complete && vm->name[0] != L'\0') {
+        vm = asb_find_vm_by_id(vm_id);
+        if (vm && !vm->idd_probe_stop && vm->running && !vm->install_complete) {
             asb_log(L"IDD probe: VDD ready for \"%s\", opening display", vm->name);
+            /* Pass the stable ID, not a VmInstance*: the UI thread looks
+               it up freshly with asb_find_vm_by_id before acting. */
             if (g_idd_probe_hwnd)
-                PostMessageW(g_idd_probe_hwnd, WM_VM_IDD_READY, 0, (LPARAM)vm);
+                PostMessageW(g_idd_probe_hwnd, WM_VM_IDD_READY, 0, (LPARAM)vm_id);
         }
         break;
     }
 
-    asb_log(L"IDD probe: exiting for \"%s\"", vm->name);
+    /* vm may have been deleted; re-resolve before logging the exit. */
+    vm = asb_find_vm_by_id(vm_id);
+    asb_log(L"IDD probe: exiting for \"%s\"", vm ? vm->name : L"(deleted)");
     return 0;
 }
 
@@ -238,7 +251,10 @@ static void idd_probe_start(VmInstance *vm)
     if (vm->is_template) return;
 
     vm->idd_probe_stop = FALSE;
-    vm->idd_probe_thread = CreateThread(NULL, 0, idd_probe_thread_proc, vm, 0, NULL);
+    /* Pass stable ID, not pointer -- the thread is long-lived and must
+       survive g_vms[] compaction. */
+    vm->idd_probe_thread = CreateThread(NULL, 0, idd_probe_thread_proc,
+                                         (LPVOID)(ULONG_PTR)vm->unique_id, 0, NULL);
 }
 
 static void idd_probe_stop(VmInstance *vm)
@@ -258,6 +274,16 @@ static int vm_index_of(AsbVm vm)
     if (!vm) return -1;
     idx = (int)(vm_inst(vm) - g_vms);
     return (idx >= 0 && idx < g_vm_count) ? idx : -1;
+}
+
+ASB_API VmInstance *asb_find_vm_by_id(UINT64 id)
+{
+    int i;
+    if (id == 0) return NULL;
+    for (i = 0; i < g_vm_count; i++) {
+        if (g_vms[i].unique_id == id) return &g_vms[i];
+    }
+    return NULL;
 }
 
 /* ---- Per-VM state JSON (beside disk.vhdx) ---- */
@@ -395,6 +421,7 @@ static void load_vm_list(void)
             if (g_vm_count >= ASB_MAX_VMS) break;
             vm = &g_vms[g_vm_count];
             ZeroMemory(vm, sizeof(VmInstance));
+            vm->unique_id = g_next_vm_id++;
             g_vm_count++;
             continue;
         }
@@ -1405,6 +1432,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 
     inst = &g_vms[g_vm_count];
     ZeroMemory(inst, sizeof(VmInstance));
+    inst->unique_id = g_next_vm_id++;
 
     /* Net adapter */
     if (config->net_adapter && config->net_adapter[0] != L'\0' &&

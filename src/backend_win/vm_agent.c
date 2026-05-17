@@ -1,6 +1,7 @@
 #include <winsock2.h>
 #include "vm_agent.h"
 #include "vm_ssh_proxy.h"
+#include "asb_core.h"
 #include "hcn_network.h"
 #include "ui.h"
 #include <stdio.h>
@@ -39,7 +40,9 @@ void vm_agent_set_hwnd(HWND hwnd)
 /* ---- Per-VM connection state ---- */
 
 typedef struct AgentConn {
-    VmInstance    *vm;
+    /* Stable VM identifier; survives g_vms[] compaction. The actual
+       VmInstance* is resolved via asb_find_vm_by_id() at each use. */
+    UINT64         vm_id;
     HANDLE         thread;
     SOCKET         sock;
     volatile BOOL  stop;
@@ -58,8 +61,9 @@ static BOOL      g_wsa_init = FALSE;
 static AgentConn *find_conn(VmInstance *vm)
 {
     int i;
+    if (!vm || vm->unique_id == 0) return NULL;
     for (i = 0; i < MAX_AGENTS; i++)
-        if (g_conns[i].vm == vm)
+        if (g_conns[i].vm_id == vm->unique_id)
             return &g_conns[i];
     return NULL;
 }
@@ -67,10 +71,11 @@ static AgentConn *find_conn(VmInstance *vm)
 static AgentConn *alloc_conn(VmInstance *vm)
 {
     int i;
+    if (!vm || vm->unique_id == 0) return NULL;
     for (i = 0; i < MAX_AGENTS; i++) {
-        if (g_conns[i].vm == NULL) {
+        if (g_conns[i].vm_id == 0) {
             memset(&g_conns[i], 0, sizeof(AgentConn));
-            g_conns[i].vm = vm;
+            g_conns[i].vm_id = vm->unique_id;
             g_conns[i].sock = INVALID_SOCKET;
             g_conns[i].cmd_done = CreateEventW(NULL, FALSE, FALSE, NULL);
             return &g_conns[i];
@@ -315,14 +320,13 @@ static int send_tagged_cmd(SOCKET s, VmInstance *vm, unsigned int *seq,
 static DWORD WINAPI agent_thread_proc(LPVOID param)
 {
     AgentConn *conn = (AgentConn *)param;
-    VmInstance *vm = conn->vm;
+    VmInstance *vm;
 
-    /* `vm` points into g_vms[] by index. The array is compacted (shifted
-       down + last slot zeroed) when a VM/template at a lower index is
-       removed - which means our slot's contents can be silently zeroed
-       under us. Detect that via the now-empty name and bail out cleanly,
-       otherwise we loop forever calling hcs_find_runtime_id(""). */
-    while (!conn->stop && vm->name[0] != L'\0') {
+    /* Resolve VM by stable ID each iteration. If asb_find_vm_by_id
+       returns NULL the VM has been deleted (slot reclaimed) -- exit
+       cleanly. Pointer freshness is now guaranteed for the body of
+       each iteration; we never stash a stale &g_vms[idx]. */
+    while (!conn->stop && (vm = asb_find_vm_by_id(conn->vm_id)) != NULL) {
         char buf[256];
         int n;
         SOCKET s;
