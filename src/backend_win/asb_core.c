@@ -163,7 +163,13 @@ static DWORD WINAPI idd_probe_thread_proc(LPVOID param)
 
     asb_log(L"IDD probe: starting for \"%s\"", vm->name);
 
-    while (!vm->idd_probe_stop && vm->running && !vm->install_complete) {
+    /* `vm` points into g_vms[] by index. If a lower-index entry is removed
+       (e.g. a template finishes sysprep), our slot's contents shift away
+       and our pointer's memory gets zeroed. The vm->running check usually
+       catches that (zeroed slot has running=FALSE), but if the slot got
+       overwritten with another VM's data instead of zeroed, the name
+       check ensures we don't silently start probing the wrong VM. */
+    while (!vm->idd_probe_stop && vm->running && !vm->install_complete && vm->name[0] != L'\0') {
         /* Try to connect to VDD frame service */
         static const GUID zero_guid = {0};
         GUID runtime_id = vm->runtime_id;
@@ -213,7 +219,7 @@ static DWORD WINAPI idd_probe_thread_proc(LPVOID param)
         /* Connection succeeded - VDD is accepting frames */
         closesocket(s);
 
-        if (!vm->idd_probe_stop && vm->running && !vm->install_complete) {
+        if (!vm->idd_probe_stop && vm->running && !vm->install_complete && vm->name[0] != L'\0') {
             asb_log(L"IDD probe: VDD ready for \"%s\", opening display", vm->name);
             if (g_idd_probe_hwnd)
                 PostMessageW(g_idd_probe_hwnd, WM_VM_IDD_READY, 0, (LPARAM)vm);

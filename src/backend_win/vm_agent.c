@@ -317,7 +317,12 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
     AgentConn *conn = (AgentConn *)param;
     VmInstance *vm = conn->vm;
 
-    while (!conn->stop) {
+    /* `vm` points into g_vms[] by index. The array is compacted (shifted
+       down + last slot zeroed) when a VM/template at a lower index is
+       removed - which means our slot's contents can be silently zeroed
+       under us. Detect that via the now-empty name and bail out cleanly,
+       otherwise we loop forever calling hcs_find_runtime_id(""). */
+    while (!conn->stop && vm->name[0] != L'\0') {
         char buf[256];
         int n;
         SOCKET s;
