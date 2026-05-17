@@ -410,3 +410,11 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Vendored WebView2 binaries — explicit un-ignore (the x64/ and arm64/
+# rules above otherwise catch them since they match any directory of that
+# name anywhere in the tree).
+!/vendor/webview2/x64
+!/vendor/webview2/x64/**
+!/vendor/webview2/arm64
+!/vendor/webview2/arm64/**
