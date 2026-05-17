@@ -762,6 +762,39 @@ static BOOL allocate_nat_ip(VmInstance *vm)
     return FALSE;
 }
 
+/* Try hcn_create_endpoint, retrying on NAT failure by bumping the last
+   octet of nat_ip up to 10 times. The buffer pointed to by nat_ip is
+   mutated in place on a successful retry; the caller is responsible for
+   save_vm_list() if it cares about persistence.
+
+   Defends against HCN_E_ADDR_INVALID_OR_RESERVED (0x803B002F), which
+   HNS returns when an endpoint at the chosen IP was orphaned by a
+   previous run -- the IP is in our allocator's free list but HNS still
+   has a phantom reservation. Bumping past it usually wins. */
+static HRESULT try_endpoint_with_retry(const GUID *net_id, GUID *ep_id,
+                                       wchar_t *ep_guid_str, size_t str_len,
+                                       char *nat_ip, size_t nat_ip_size,
+                                       BOOL is_nat)
+{
+    HRESULT hr;
+    int retry;
+
+    hr = hcn_create_endpoint(net_id, ep_id, ep_guid_str, str_len,
+                              (nat_ip && nat_ip[0]) ? nat_ip : NULL);
+    if (SUCCEEDED(hr) || !is_nat || !nat_ip || !nat_ip[0]) return hr;
+
+    asb_log(L"Endpoint failed for %S, trying next IP...", nat_ip);
+    for (retry = 0; retry < 10; retry++) {
+        int a, b, c, d;
+        if (sscanf_s(nat_ip, "%d.%d.%d.%d", &a, &b, &c, &d) != 4 || d >= 254) break;
+        sprintf_s(nat_ip, nat_ip_size, "%d.%d.%d.%d", a, b, c, d + 1);
+        asb_log(L"Retrying with %S...", nat_ip);
+        hr = hcn_create_endpoint(net_id, ep_id, ep_guid_str, str_len, nat_ip);
+        if (SUCCEEDED(hr)) return hr;
+    }
+    return hr;
+}
+
 /* ---- Background VM start thread ---- */
 
 typedef struct {
@@ -799,25 +832,11 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         default:           hr = E_INVALIDARG; break;
         }
         if (SUCCEEDED(hr)) {
-            hr = hcn_create_endpoint(&args->network_id, &args->endpoint_id, endpoint_guid_str, 64,
-                                     vm->nat_ip[0] ? vm->nat_ip : NULL);
-            if (FAILED(hr) && args->network_mode == NET_NAT) {
-                int retry;
-                asb_log(L"Endpoint failed for %S, trying next IP...", vm->nat_ip);
-                for (retry = 0; retry < 10; retry++) {
-                    int a, b, c, d;
-                    if (sscanf_s(vm->nat_ip, "%d.%d.%d.%d", &a, &b, &c, &d) == 4 && d < 254) {
-                        sprintf_s(vm->nat_ip, sizeof(vm->nat_ip), "%d.%d.%d.%d", a, b, c, d + 1);
-                        asb_log(L"Retrying with %S...", vm->nat_ip);
-                        hr = hcn_create_endpoint(&args->network_id, &args->endpoint_id, endpoint_guid_str, 64,
-                                                 vm->nat_ip);
-                        if (SUCCEEDED(hr)) {
-                            save_vm_list();
-                            break;
-                        }
-                    } else break;
-                }
-            }
+            hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
+                                          endpoint_guid_str, 64,
+                                          vm->nat_ip, sizeof(vm->nat_ip),
+                                          args->network_mode == NET_NAT);
+            if (SUCCEEDED(hr) && args->network_mode == NET_NAT) save_vm_list();
             if (FAILED(hr)) {
                 asb_log(L"Error: Network endpoint failed (0x%08X).", hr);
                 if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
@@ -842,6 +861,13 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
     if (FAILED(hr)) {
         asb_log(L"Error: Failed to create compute system (0x%08X)", hr);
         asb_alert(L"Failed to start VM, check its configuration.");
+        /* HCS rejected the VM after we already created the HCN endpoint.
+           Free the endpoint so its IP reservation doesn't leak into the
+           next attempt as a phantom HCN_E_ADDR_INVALID_OR_RESERVED. */
+        if (endpoint_guid_str[0] != L'\0') {
+            hcn_delete_endpoint(&args->endpoint_id);
+            endpoint_guid_str[0] = L'\0';
+        }
         if (g_state_cb) g_state_cb(vm_handle(vm), FALSE, g_state_ud);
         free(args); return 1;
     }
@@ -1084,10 +1110,16 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
         default:           hr = E_INVALIDARG; break;
         }
         if (SUCCEEDED(hr)) {
-            hr = hcn_create_endpoint(&args->network_id, &args->endpoint_id, args->endpoint_guid, 64,
-                                     (nat_ip && nat_ip[0]) ? nat_ip : NULL);
-            if (SUCCEEDED(hr))
+            BOOL is_nat = (args->config.network_mode == NET_NAT);
+            size_t ip_size = (args->vm_index >= 0 && args->vm_index < g_vm_count)
+                              ? sizeof(g_vms[args->vm_index].nat_ip) : 0;
+            hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
+                                          args->endpoint_guid, 64,
+                                          nat_ip, ip_size, is_nat);
+            if (SUCCEEDED(hr)) {
                 args->has_network = TRUE;
+                if (is_nat) save_vm_list();
+            }
             /* If endpoint create fails, leave the network alone - it may be
                shared with other VMs. Orphan networks are cleaned up at next
                launch by hcn_cleanup_stale_networks(). */
@@ -1110,6 +1142,14 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
         if (FAILED(hr)) {
             args->result = hr;
             swprintf_s(args->error_msg, 512, L"Failed to create HCS VM (0x%08X)", hr);
+            /* HCS rejected the VM after we already created the HCN endpoint.
+               Free the endpoint so its IP reservation doesn't leak into the
+               next attempt as a phantom HCN_E_ADDR_INVALID_OR_RESERVED. */
+            if (args->has_network) {
+                hcn_delete_endpoint(&args->endpoint_id);
+                args->has_network = FALSE;
+                args->endpoint_guid[0] = L'\0';
+            }
             goto done;
         }
 
@@ -1118,6 +1158,13 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
             args->result = hr;
             swprintf_s(args->error_msg, 512, L"Failed to start VM (0x%08X)", hr);
             hcs_close_vm(&temp_inst);
+            /* VM created but failed to start. Free the endpoint so its
+               IP reservation doesn't leak into the next attempt. */
+            if (args->has_network) {
+                hcn_delete_endpoint(&args->endpoint_id);
+                args->has_network = FALSE;
+                args->endpoint_guid[0] = L'\0';
+            }
             goto done;
         }
 
@@ -1613,8 +1660,11 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             asb_log(L"Warning: Network failed (0x%08X). Continuing without.", hr);
             cfg.network_mode = NET_NONE;
         } else {
-            hr = hcn_create_endpoint(&inst->network_id, &inst->endpoint_id, endpoint_guid_str, 64,
-                                     inst->nat_ip[0] ? inst->nat_ip : NULL);
+            hr = try_endpoint_with_retry(&inst->network_id, &inst->endpoint_id,
+                                          endpoint_guid_str, 64,
+                                          inst->nat_ip, sizeof(inst->nat_ip),
+                                          cfg.network_mode == NET_NAT);
+            if (SUCCEEDED(hr) && cfg.network_mode == NET_NAT) save_vm_list();
             if (FAILED(hr)) {
                 asb_log(L"Warning: Endpoint failed (0x%08X).", hr);
                 /* Leave the shared network alone - other VMs may be using it. */
@@ -1631,6 +1681,12 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     if (FAILED(hr)) {
         asb_log(L"Error: Failed to create compute system (0x%08X)", hr);
         asb_alert(L"Failed to start VM, check its configuration.");
+        /* HCS rejected the VM after we already created the HCN endpoint.
+           Free the endpoint so its IP reservation doesn't leak. */
+        if (endpoint_guid_str[0] != L'\0') {
+            hcn_delete_endpoint(&inst->endpoint_id);
+            endpoint_guid_str[0] = L'\0';
+        }
         return hr;
     }
 
