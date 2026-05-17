@@ -1,7 +1,6 @@
 #include <winsock2.h>
 #include "vm_agent.h"
 #include "vm_ssh_proxy.h"
-#include "hcn_network.h"
 #include "ui.h"
 #include <stdio.h>
 
@@ -200,7 +199,7 @@ static void notify_agent_status(VmInstance *vm)
 /* Process an untagged (async) message from the agent.
    Returns: 0 = handled, 1 = os_shutdown (caller should break),
             2 = service_stopping (caller should break and let the reconnect
-                loop retry - SCM restarts the service on failure, so we must
+                loop retry — SCM restarts the service on failure, so we must
                 keep trying to reconnect). */
 static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
 {
@@ -300,7 +299,7 @@ static int send_tagged_cmd(SOCKET s, VmInstance *vm, unsigned int *seq,
         if (n <= 0) return n;
 
         if (strncmp(rsp, prefix, pfx_len) == 0) {
-            /* Tagged response - strip prefix */
+            /* Tagged response — strip prefix */
             memmove(rsp, rsp + pfx_len, strlen(rsp + pfx_len) + 1);
             return (int)strlen(rsp);
         }
@@ -359,19 +358,17 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             ui_log(L"Install complete for \"%s\".", vm->name);
         }
 
-        /* Send NAT IP to agent (only for NAT mode). Prefix length and
-           gateway come from the dynamically-picked subnet (hcn_network.c). */
+        /* Send NAT IP to agent (only for NAT mode) */
         if (vm->network_mode == NET_NAT && vm->nat_ip[0] != '\0') {
             char ip_cmd[64];
-            sprintf_s(ip_cmd, sizeof(ip_cmd), "set_ip:%s/%d:%s",
-                       vm->nat_ip, hcn_nat_prefix_len(), hcn_nat_gateway());
+            sprintf_s(ip_cmd, sizeof(ip_cmd), "set_ip:%s/16:172.20.0.1", vm->nat_ip);
             n = send_tagged_cmd(s, vm, &conn->cmd_seq, ip_cmd, buf, sizeof(buf));
             if (n <= 0) goto disconnected;
             ui_log(L"NAT IP config for \"%s\": %S", vm->name, buf);
         }
 
         /* Send GPU share info to agent (if GPU-PV is assigned).
-           Fire-and-forget - no response expected, so no tagging needed. */
+           Fire-and-forget — no response expected, so no tagging needed. */
         if (vm->gpu_mode != 0 && vm->gpu_shares.count > 0) {
             char header[64];
             int gi;
@@ -417,10 +414,10 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             }
         }
 
-        /* Notify UI - agent online + SSH state are all set now */
+        /* Notify UI — agent online + SSH state are all set now */
         notify_agent_status(vm);
 
-        /* Connected - read loop */
+        /* Connected — read loop */
         while (!conn->stop) {
             fd_set rfds;
             struct timeval tv;
@@ -448,7 +445,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                         sprintf_s(prefix, sizeof(prefix), "%u:", conn->cmd_seq);
                         pfx_len = (int)strlen(prefix);
                         if (strncmp(conn->rsp, prefix, pfx_len) == 0) {
-                            /* Tagged response - strip prefix */
+                            /* Tagged response — strip prefix */
                             memmove(conn->rsp, conn->rsp + pfx_len, strlen(conn->rsp + pfx_len) + 1);
                             break;
                         }
@@ -469,13 +466,13 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
 
             ret = select(0, &rfds, NULL, NULL, &tv);
             if (ret < 0) break;
-            if (ret == 0) continue; /* timeout - loop back to check cmd_pending/stop */
+            if (ret == 0) continue; /* timeout — loop back to check cmd_pending/stop */
 
             n = recv_line(s, buf, sizeof(buf));
             if (n <= 0) break; /* connection lost */
 
             { int rc = process_async_message(vm, s, buf);
-              if (rc == 1 || rc == 2) break;   /* os_shutdown or service_stopping - reconnect loop will retry */
+              if (rc == 1 || rc == 2) break;   /* os_shutdown or service_stopping — reconnect loop will retry */
             }
         }
 

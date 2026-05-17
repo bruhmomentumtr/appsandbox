@@ -16,7 +16,7 @@
 typedef void *HCN_NETWORK;
 typedef void *HCN_ENDPOINT;
 
-/* Initialize HCN - loads computenetwork.dll dynamically.
+/* Initialize HCN — loads computenetwork.dll dynamically.
    Returns TRUE if HCN is available. */
 BOOL hcn_init(void);
 
@@ -28,21 +28,8 @@ void hcn_cleanup(void);
 void hcn_cleanup_stale_networks(void);
 
 /* Create a NAT network. Returns S_OK on success.
-   network_id: output GUID for the created network.
-
-   The NAT subnet is picked dynamically on first call: starts at 192.168.42.0/24
-   and walks upward through 192.168.{43,44,...}.0/24 until it finds a /24 that
-   does not overlap any IPv4 subnet currently bound to a host adapter
-   (physical NICs, vEthernet adapters, Default Switch, etc.). The picked
-   subnet is stable for the lifetime of the process. */
+   network_id: output GUID for the created network. */
 HRESULT hcn_create_nat_network(GUID *network_id);
-
-/* Selected NAT subnet accessors. All trigger the pick on first call.
-   Stable for process lifetime. */
-const char *hcn_nat_subnet_prefix(void);  /* e.g. "192.168.42.0/24" */
-const char *hcn_nat_gateway(void);        /* e.g. "192.168.42.1"    */
-const char *hcn_nat_ip_base(void);        /* e.g. "192.168.42."     */
-int         hcn_nat_prefix_len(void);     /* e.g. 24                */
 
 /* Create an internal (host-only) network. Returns S_OK on success. */
 HRESULT hcn_create_internal_network(GUID *network_id);
@@ -56,9 +43,9 @@ HRESULT hcn_create_external_network(GUID *network_id, const wchar_t *adapter_nam
    network_id: the network to attach to.
    endpoint_id: output GUID for the created endpoint.
    endpoint_guid_str: output string representation of endpoint GUID (for HCS JSON).
-   nat_ip: for NAT networks, the static IP to assign (e.g. "192.168.42.2"); if
-           NULL/empty, NAT endpoints default to the picked-subnet base + ".2".
-           Ignored for Internal and External networks (which always use DHCP). */
+   nat_ip: for NAT networks, the static IP to assign (e.g. "172.20.0.2"); if
+           NULL/empty, NAT endpoints default to "172.20.0.2". Ignored for
+           Internal and External networks (which always use DHCP). */
 HRESULT hcn_create_endpoint(const GUID *network_id, GUID *endpoint_id,
                             wchar_t *endpoint_guid_str, size_t str_len,
                             const char *nat_ip);
