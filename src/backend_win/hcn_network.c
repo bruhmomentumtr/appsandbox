@@ -23,18 +23,27 @@ typedef HRESULT (WINAPI *PFN_HcnCloseNetwork)(void *network);
 typedef HRESULT (WINAPI *PFN_HcnCloseEndpoint)(void *endpoint);
 typedef HRESULT (WINAPI *PFN_HcnOpenNetwork)(
     REFGUID id, void **network, PWSTR *errorRecord);
+typedef HRESULT (WINAPI *PFN_HcnOpenEndpoint)(
+    REFGUID id, void **endpoint, PWSTR *errorRecord);
+typedef HRESULT (WINAPI *PFN_HcnEnumerateEndpoints)(
+    PCWSTR query, PWSTR *endpoints, PWSTR *errorRecord);
+typedef HRESULT (WINAPI *PFN_HcnQueryEndpointProperties)(
+    void *endpoint, PCWSTR query, PWSTR *properties, PWSTR *errorRecord);
 
 /* ---- Loaded function pointers ---- */
 
 static HMODULE g_hcn_dll = NULL;
 
-static PFN_HcnCreateNetwork    pfnCreateNet;
-static PFN_HcnCreateEndpoint   pfnCreateEp;
-static PFN_HcnDeleteNetwork    pfnDeleteNet;
-static PFN_HcnDeleteEndpoint   pfnDeleteEp;
-static PFN_HcnCloseNetwork     pfnCloseNet;
-static PFN_HcnCloseEndpoint    pfnCloseEp;
-static PFN_HcnOpenNetwork      pfnOpenNet;
+static PFN_HcnCreateNetwork           pfnCreateNet;
+static PFN_HcnCreateEndpoint          pfnCreateEp;
+static PFN_HcnDeleteNetwork           pfnDeleteNet;
+static PFN_HcnDeleteEndpoint          pfnDeleteEp;
+static PFN_HcnCloseNetwork            pfnCloseNet;
+static PFN_HcnCloseEndpoint           pfnCloseEp;
+static PFN_HcnOpenNetwork             pfnOpenNet;
+static PFN_HcnOpenEndpoint            pfnOpenEp;
+static PFN_HcnEnumerateEndpoints      pfnEnumEp;
+static PFN_HcnQueryEndpointProperties pfnQueryEpProps;
 
 /* ---- Helpers ---- */
 
@@ -68,6 +77,9 @@ BOOL hcn_init(void)
     pfnCloseEp    = (PFN_HcnCloseEndpoint)GetProcAddress(g_hcn_dll, "HcnCloseEndpoint");
     pfnOpenNet    = (PFN_HcnOpenNetwork)GetProcAddress(g_hcn_dll, "HcnOpenNetwork");
     pfnEnumNet    = (PFN_HcnEnumerateNetworks)GetProcAddress(g_hcn_dll, "HcnEnumerateNetworks");
+    pfnOpenEp     = (PFN_HcnOpenEndpoint)GetProcAddress(g_hcn_dll, "HcnOpenEndpoint");
+    pfnEnumEp     = (PFN_HcnEnumerateEndpoints)GetProcAddress(g_hcn_dll, "HcnEnumerateEndpoints");
+    pfnQueryEpProps = (PFN_HcnQueryEndpointProperties)GetProcAddress(g_hcn_dll, "HcnQueryEndpointProperties");
 
     if (!pfnCreateNet || !pfnCreateEp || !pfnCloseNet || !pfnCloseEp) {
         FreeLibrary(g_hcn_dll);
@@ -186,20 +198,113 @@ static BOOL hcn_network_exists(const GUID *id)
     return FALSE;
 }
 
-/* Delete all AppSandbox networks by their fixed GUIDs. Fast - no enumeration.
-   Call only at startup to clean up stale networks from a previous run; never
-   from per-VM create paths, or you'll rip the network out from under any
-   already-running VM that's attached to it. */
-void hcn_cleanup_stale_networks(void)
+/* Parse "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" into a GUID. */
+static BOOL parse_guid_w(const wchar_t *s, GUID *out)
 {
+    unsigned int d1;
+    unsigned int d2, d3;
+    unsigned int b[8];
+    if (swscanf_s(s, L"%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                  &d1, &d2, &d3,
+                  &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7]) != 11)
+        return FALSE;
+    out->Data1 = d1;
+    out->Data2 = (USHORT)d2;
+    out->Data3 = (USHORT)d3;
+    {
+        int i;
+        for (i = 0; i < 8; i++) out->Data4[i] = (BYTE)b[i];
+    }
+    return TRUE;
+}
+
+/* Returns TRUE if the endpoint at `ep_id` is attached to any of our three
+   networks (NAT / INTERNAL / EXTERNAL). Verified server-side via
+   HcnQueryEndpointProperties so we never delete somebody else's endpoint. */
+static BOOL endpoint_in_our_networks(const GUID *ep_id)
+{
+    void *ep = NULL;
+    PWSTR props = NULL;
     PWSTR er = NULL;
-    if (!pfnDeleteNet) return;
-    pfnDeleteNet(&APPSANDBOX_NAT_GUID, &er);
+    BOOL match = FALSE;
+    wchar_t nat_g[64], int_g[64], ext_g[64];
+
+    if (!pfnOpenEp || !pfnQueryEpProps || !pfnCloseEp) return FALSE;
+
+    if (FAILED(pfnOpenEp(ep_id, &ep, &er)) || !ep) {
+        if (er) LocalFree(er);
+        return FALSE;
+    }
     if (er) { LocalFree(er); er = NULL; }
-    pfnDeleteNet(&APPSANDBOX_INTERNAL_GUID, &er);
+
+    if (SUCCEEDED(pfnQueryEpProps(ep, L"{\"SchemaVersion\":{\"Major\":2,\"Minor\":0}}", &props, &er)) && props) {
+        guid_to_string(&APPSANDBOX_NAT_GUID,      nat_g, 64);
+        guid_to_string(&APPSANDBOX_INTERNAL_GUID, int_g, 64);
+        guid_to_string(&APPSANDBOX_EXTERNAL_GUID, ext_g, 64);
+        if (wcsstr(props, nat_g) != NULL ||
+            wcsstr(props, int_g) != NULL ||
+            wcsstr(props, ext_g) != NULL)
+            match = TRUE;
+    }
+    if (props) LocalFree(props);
+    if (er) LocalFree(er);
+    pfnCloseEp(ep);
+    return match;
+}
+
+/* Sweep every HCN endpoint whose HostComputeNetwork is one of ours, and
+   delete it. Leaves the AppSandbox networks themselves intact so the
+   existing vEthernet adapter + subnet are reused across runs.
+
+   Safe at startup: HCS auto-terminates every compute system whose last
+   handle is closed (we set ShouldTerminateOnLastHandleClosed=true), so
+   by the time we run this no VM is alive to be holding a real endpoint. */
+void hcn_cleanup_stale_endpoints(void)
+{
+    PWSTR all_eps = NULL;
+    PWSTR er = NULL;
+    int deleted = 0;
+
+    if (!pfnEnumEp || !pfnDeleteEp) return;
+
+    if (FAILED(pfnEnumEp(L"{\"SchemaVersion\":{\"Major\":2,\"Minor\":0}}",
+                          &all_eps, &er)) || !all_eps) {
+        if (er) LocalFree(er);
+        return;
+    }
     if (er) { LocalFree(er); er = NULL; }
-    pfnDeleteNet(&APPSANDBOX_EXTERNAL_GUID, &er);
-    if (er) { LocalFree(er); er = NULL; }
+
+    /* Walk the returned JSON array of GUID strings. Format is roughly
+       ["xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", ...]. We extract each
+       36-char run inside double-quotes and try to parse it as a GUID. */
+    {
+        wchar_t *p = all_eps;
+        while (*p) {
+            if (*p == L'"') {
+                wchar_t buf[40];
+                int n = 0;
+                p++;
+                while (*p && *p != L'"' && n < 39) buf[n++] = *p++;
+                buf[n] = L'\0';
+                if (n == 36) {
+                    GUID ep_id;
+                    if (parse_guid_w(buf, &ep_id) &&
+                        endpoint_in_our_networks(&ep_id)) {
+                        pfnDeleteEp(&ep_id, &er);
+                        if (er) { LocalFree(er); er = NULL; }
+                        deleted++;
+                    }
+                }
+                if (*p == L'"') p++;
+            } else {
+                p++;
+            }
+        }
+    }
+
+    LocalFree(all_eps);
+    if (deleted > 0)
+        ui_log(L"HCN: cleared %d stale endpoint(s) from prior run.", deleted);
 }
 
 void hcn_cleanup(void)
@@ -227,6 +332,27 @@ static char g_nat_gateway[32];         /* "192.168.42.1"    */
 static char g_nat_ip_base[32];         /* "192.168.42."     */
 static int  g_nat_prefix_len;          /* 24                */
 static BOOL g_nat_subnet_picked;
+
+/* Set the four globals above from an A.B.C.D-style IP, treating it as a
+   /24 (since that is the only prefix we hand out today). Idempotent --
+   only the first non-empty seed wins.
+
+   Called from asb_init after load_vm_list with the first saved VM's IP,
+   so the existing network's subnet is always adopted across restarts. */
+void hcn_seed_nat_subnet_from_ip(const char *vm_nat_ip)
+{
+    int a, b, c, d;
+    if (g_nat_subnet_picked) return;
+    if (!vm_nat_ip || vm_nat_ip[0] == '\0') return;
+    if (sscanf_s(vm_nat_ip, "%d.%d.%d.%d", &a, &b, &c, &d) != 4) return;
+    sprintf_s(g_nat_subnet_prefix, sizeof(g_nat_subnet_prefix), "%d.%d.%d.0/24", a, b, c);
+    sprintf_s(g_nat_gateway,       sizeof(g_nat_gateway),       "%d.%d.%d.1",    a, b, c);
+    sprintf_s(g_nat_ip_base,       sizeof(g_nat_ip_base),       "%d.%d.%d.",     a, b, c);
+    g_nat_prefix_len    = 24;
+    g_nat_subnet_picked = TRUE;
+    ui_log(L"NAT subnet adopted from saved VM IP %S: %S",
+            vm_nat_ip, g_nat_subnet_prefix);
+}
 
 typedef struct {
     DWORD network;     /* base, host byte order */
