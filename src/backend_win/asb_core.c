@@ -212,11 +212,11 @@ static DWORD WINAPI idd_probe_thread_proc(LPVOID param)
 
             if (select(0, NULL, &wfds, &efds, &tv) <= 0 || FD_ISSET(s, &efds)) {
                 closesocket(s);
-                continue;  /* timeout or error — VDD not ready yet */
+                continue;  /* timeout or error - VDD not ready yet */
             }
         }
 
-        /* Connection succeeded — VDD is accepting frames */
+        /* Connection succeeded - VDD is accepting frames */
         closesocket(s);
 
         if (!vm->idd_probe_stop && vm->running && !vm->install_complete && vm->name[0] != L'\0') {
@@ -428,7 +428,7 @@ static void load_vm_list(void)
         else if (wcsncmp(line, L"GpuName=", 8) == 0)
             wcscpy_s(vm->gpu_name, 256, line + 8);
         else if (wcsncmp(line, L"GpuDevicePath=", 14) == 0)
-            { /* ignored — backwards compat */ }
+            { /* ignored - backwards compat */ }
         else if (wcsncmp(line, L"NetworkMode=", 12) == 0)
             vm->network_mode = _wtoi(line + 12);
         else if (wcsncmp(line, L"NetAdapter=", 11) == 0)
@@ -650,7 +650,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
 
                 scan_templates();
 
-                /* Fire the removed callback last — WM_VM_REMOVED is async, so
+                /* Fire the removed callback last - WM_VM_REMOVED is async, so
                    both g_vms[] and g_templates[] must be fully updated before
                    the UI thread can pull the message and re-query them. */
                 if (g_removed_cb) g_removed_cb(i, g_removed_ud);
@@ -703,28 +703,32 @@ ASB_API void asb_vm_cleanup_network(VmInstance *vm)
 
 /* ---- NAT IP allocation ---- */
 
-/* Allocate the next free IP in the 172.20.0.0/16 range.
-   Scans g_vms[] for IPs already in use.  Returns FALSE if pool exhausted. */
+/* Allocate the next free IP in the chosen NAT /24 (see hcn_nat_subnet_base).
+   Scans g_vms[] for IPs already in use. Returns FALSE if pool exhausted. */
 static BOOL allocate_nat_ip(VmInstance *vm)
 {
-    BOOL used[256] = { 0 };  /* Track .0.2 through .0.254 */
+    BOOL used[256] = { 0 };
+    const char *base = hcn_nat_subnet_base();   /* e.g. "192.168.42" */
+    int ba, bb, bc;
     int i, octet;
 
+    if (sscanf_s(base, "%d.%d.%d", &ba, &bb, &bc) != 3) return FALSE;
+
     for (i = 0; i < g_vm_count; i++) {
+        int a, b, c, d;
         if (&g_vms[i] == vm) continue;
         if (g_vms[i].nat_ip[0] == '\0') continue;
-        /* Parse last octet from "172.20.0.X" */
-        {
-            int a, b, c, d;
-            if (sscanf_s(g_vms[i].nat_ip, "%d.%d.%d.%d", &a, &b, &c, &d) == 4 &&
-                a == 172 && b == 20 && c == 0 && d >= 2 && d <= 254)
-                used[d] = TRUE;
-        }
+        /* Only consider entries that share our current /24. Stale entries
+           from a prior run with a different subnet are ignored - their
+           endpoints died with the previous NAT network. */
+        if (sscanf_s(g_vms[i].nat_ip, "%d.%d.%d.%d", &a, &b, &c, &d) == 4 &&
+            a == ba && b == bb && c == bc && d >= 2 && d <= 254)
+            used[d] = TRUE;
     }
 
     for (octet = 2; octet <= 254; octet++) {
         if (!used[octet]) {
-            sprintf_s(vm->nat_ip, sizeof(vm->nat_ip), "172.20.0.%d", octet);
+            sprintf_s(vm->nat_ip, sizeof(vm->nat_ip), "%s.%d", base, octet);
             return TRUE;
         }
     }
@@ -1057,7 +1061,7 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
                                      (nat_ip && nat_ip[0]) ? nat_ip : NULL);
             if (SUCCEEDED(hr))
                 args->has_network = TRUE;
-            /* If endpoint create fails, leave the network alone — it may be
+            /* If endpoint create fails, leave the network alone - it may be
                shared with other VMs. Orphan networks are cleaned up at next
                launch by hcn_cleanup_stale_networks(). */
         }
@@ -1157,7 +1161,7 @@ done:
                     asb_alert(L"Failed to start VM, check its configuration.");
                 save_vm_list();
             } else {
-                /* VHDX never created — remove VM from list and clean up files */
+                /* VHDX never created - remove VM from list and clean up files */
                 int j;
                 asb_log(L"Error creating VM \"%s\": %s", inst->name, args->error_msg);
                 if (g_removed_cb) g_removed_cb(idx, g_removed_ud);
@@ -1288,11 +1292,11 @@ ASB_API void asb_detach(void)
 
     /* Cleanly release HCS resources WITHOUT terminating running VMs.
        Used by short-lived consumers that start a VM
-       and exit — the VM keeps running after the process is gone.
+       and exit - the VM keeps running after the process is gone.
 
        Unlike asb_cleanup(), this does NOT call hcs_terminate_vm().
        We unregister callbacks and stop threads, but do NOT close the HCS
-       handle — HcsCloseComputeSystem terminates the VM when it's the last
+       handle - HcsCloseComputeSystem terminates the VM when it's the last
        handle.  Instead, let the OS close it during process teardown after
        the callback is already gone. */
     for (i = 0; i < g_vm_count; i++) {
@@ -1301,7 +1305,7 @@ ASB_API void asb_detach(void)
         vm_agent_stop(&g_vms[i]);
         idd_probe_stop(&g_vms[i]);
         hcs_unregister_vm_callback(&g_vms[i]);
-        g_vms[i].handle = NULL;  /* abandon handle — OS will close it */
+        g_vms[i].handle = NULL;  /* abandon handle - OS will close it */
     }
 
     g_initialized = FALSE;
@@ -1585,7 +1589,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
                                      inst->nat_ip[0] ? inst->nat_ip : NULL);
             if (FAILED(hr)) {
                 asb_log(L"Warning: Endpoint failed (0x%08X).", hr);
-                /* Leave the shared network alone — other VMs may be using it. */
+                /* Leave the shared network alone - other VMs may be using it. */
                 cfg.network_mode = NET_NONE;
             }
         }
@@ -1677,7 +1681,7 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
     }
 
     if (!inst->handle) {
-        /* Need to re-create HCS system — do it in a background thread */
+        /* Need to re-create HCS system - do it in a background thread */
         StartVmArgs *args = (StartVmArgs *)calloc(1, sizeof(StartVmArgs));
         if (!args) return E_OUTOFMEMORY;
         args->vm = inst;
@@ -2275,7 +2279,7 @@ ASB_API void asb_reconnect_running(void)
             /* HCS open failed (stale handle from dead process) but enumeration
                confirms the VM is running.  Mark it so queries return the right
                state.  We don't have a handle so we can't register callbacks
-               or monitor — the start path will destroy the stale system and
+               or monitor - the start path will destroy the stale system and
                recreate it when needed. */
             g_vms[i].running = TRUE;
             asb_log(L"Reconnect: \"%s\" is running (via enumeration, no handle).",
