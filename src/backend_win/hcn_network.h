@@ -23,22 +23,9 @@ BOOL hcn_init(void);
 /* Clean up HCN module. */
 void hcn_cleanup(void);
 
-/* Delete any stale endpoints attached to AppSandbox networks left over
-   from a previous run. Leaves the networks themselves intact so the
-   existing vEthernet adapter + subnet are reused.
-
-   At startup no VMs are running yet (HCS terminates all compute systems
-   when their last handle closes, which happens when the previous app
-   process exited), so every endpoint in our networks is by definition
-   an orphan and safe to delete. Freeing the endpoints releases their
-   IPAM reservations so newly-launched VMs can claim the same IPs. */
-void hcn_cleanup_stale_endpoints(void);
-
-/* Hint the NAT subnet picker with a previously-allocated VM IP (e.g.
-   "192.168.42.7"). Idempotent: only the first non-empty call takes
-   effect. Used by asb_init after load_vm_list so the picker always
-   matches the live network when saved VMs exist. */
-void hcn_seed_nat_subnet_from_ip(const char *vm_nat_ip);
+/* Delete any stale AppSandbox networks left over from a previous run.
+   Call once at startup, before any VMs are started. */
+void hcn_cleanup_stale_networks(void);
 
 /* Create a NAT network. Returns S_OK on success.
    network_id: output GUID for the created network.
