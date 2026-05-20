@@ -144,7 +144,9 @@ typedef struct _SOCKADDR_HV_PROBE {
     GUID ServiceId;
 } SOCKADDR_HV_PROBE;
 
-/* Frame channel: {A5B0CAFE-0002-4000-8000-000000000001} */
+/* Frame channel: {A5B0CAFE-0002-4000-8000-000000000001} for Windows guests.
+   Linux guests resolve to the AF_VSOCK template GUID instead — see
+   hcs_service_guid(os_type, 2, ...). */
 static const GUID IDD_FRAME_SERVICE_GUID =
     { 0xa5b0cafe, 0x0002, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
 
@@ -200,7 +202,7 @@ static DWORD WINAPI idd_probe_thread_proc(LPVOID param)
         memset(&addr, 0, sizeof(addr));
         addr.Family = AF_HYPERV;
         addr.VmId = runtime_id;
-        addr.ServiceId = IDD_FRAME_SERVICE_GUID;
+        hcs_service_guid(vm->os_type, 2, &addr.ServiceId);
 
         if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
             if (WSAGetLastError() != WSAEWOULDBLOCK) {
@@ -851,8 +853,14 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         }
     }
 
-    if (args->config.gpu_mode == GPU_DEFAULT || args->config.gpu_mode == GPU_MIRROR)
+    if (args->config.gpu_mode == GPU_DEFAULT || args->config.gpu_mode == GPU_MIRROR) {
         gpu_get_driver_shares(&g_gpu_list, &args->config.gpu_shares);
+        /* For Linux guests, also expose the host's lxss\lib so the
+         * Linux agent mounts it at /usr/lib/wsl/lib alongside the
+         * per-GPU driver shares. Windows guests have no use for it. */
+        if (_wcsicmp(args->config.os_type, L"Linux") == 0)
+            gpu_append_lxsslib_share(&args->config.gpu_shares);
+    }
 
     asb_log(L"Re-creating HCS compute system for \"%s\"...", vm->name);
     hr = (endpoint_guid_str[0] != L'\0')
@@ -880,6 +888,9 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
             asb_alert(L"The host doesn't have enough resources to start this VM.");
     } else {
         asb_log(L"VM \"%s\" started.", vm->name);
+        /* Agent + IDD probe run for any OS: hcs_service_guid() resolves
+           per-OS to the correct HV-socket service GUID, and the in-VM
+           agent listens on AF_HYPERV (Windows) or AF_VSOCK (Linux). */
         vm_agent_start(vm);
         idd_probe_start(vm);
         hcs_start_monitor(vm);
@@ -1260,6 +1271,254 @@ done:
     return 0;
 }
 
+/* ---- Background Linux create thread (cloud-image based) ----
+ *
+ * Parallel to vhdx_create_thread but skips iso-patch.exe entirely. Linux
+ * VMs boot a differencing VHDX off a cached Ubuntu Server cloud image,
+ * with first-boot config delivered via a cidata cloud-init ISO. The slow
+ * step here is `ensure_ubuntu_cloud_image_cached` (one-time 770 MB
+ * download from cloud-images.ubuntu.com on first use; near-instant
+ * thereafter). After that the work is fast.
+ *
+ * The post-prep network/HCS/completion code is a direct copy of
+ * vhdx_create_thread's tail (lines 1102 onward) — same shape, same
+ * critical section, same callbacks. Kept inline rather than refactored
+ * to a helper because the two threads can diverge independently later.
+ */
+typedef struct {
+    VmConfig    config;
+    int         vm_index;
+    wchar_t     vhdx_dir[MAX_PATH];
+    wchar_t     endpoint_guid[64];
+    GUID        network_id;
+    GUID        endpoint_id;
+    BOOL        has_network;
+    wchar_t     net_adapter[256];
+    HRESULT     result;
+    wchar_t     error_msg[512];
+    VmInstance *vm_inst;
+    BOOL        vhdx_created;
+} LinuxCreateArgs;
+
+static DWORD WINAPI linux_create_thread(LPVOID param)
+{
+    LinuxCreateArgs *args = (LinuxCreateArgs *)param;
+    wchar_t exe_dir[MAX_PATH], res_dir[MAX_PATH];
+    wchar_t res_iso[MAX_PATH];
+    wchar_t *slash;
+    HRESULT hr;
+
+    /* Linux ISO + autoinstall mode:
+       - cfg.image_path = user-picked Ubuntu Desktop ISO (SCSI slot 1, boot)
+       - cfg.vhdx_path  = empty disk at cfg.hdd_gb (install target)
+       - resources.iso  = cidata with autoinstall config (SCSI slot 2);
+                          subiquity reads NoCloud datasource (vol label
+                          "cidata"), runs unattended install, reboots into
+                          the installed system where cloud-init user-data
+                          applies our bootcmd / agent setup.
+
+       The older cloud-image differencing flow is preserved in #if 0 below
+       in case we need to revive it. */
+
+#if 0  /* ===== Cloud-image / differencing flow (disabled) =====
+    wchar_t base_vhdx[MAX_PATH];
+
+    asb_log(L"Ensuring Ubuntu 26.04 cloud image is cached...");
+    hr = ensure_ubuntu_cloud_image_cached(L"ubuntu-26.04", base_vhdx, MAX_PATH);
+    if (FAILED(hr)) {
+        args->result = hr;
+        swprintf_s(args->error_msg, 512, L"Failed to cache Ubuntu cloud image (0x%08X)", hr);
+        goto done;
+    }
+    DeleteFileW(args->config.vhdx_path);
+    hr = vhdx_create_differencing_resized(args->config.vhdx_path, base_vhdx,
+                                           (ULONGLONG)args->config.hdd_gb);
+    ===== end cloud-image flow ===== */
+#endif
+
+    /* ---- 1. Empty VHDX at user's requested size — autoinstall partitions
+       and formats it. ---- */
+    asb_log(L"Creating empty Linux VHDX (%lu GB), boot ISO: %s",
+            args->config.hdd_gb, args->config.image_path);
+    DeleteFileW(args->config.vhdx_path);
+    hr = vhdx_create(args->config.vhdx_path, (ULONGLONG)args->config.hdd_gb);
+    if (FAILED(hr)) {
+        args->result = hr;
+        swprintf_s(args->error_msg, 512,
+                   L"Failed to create empty Linux VHDX at %lu GB (0x%08X)",
+                   args->config.hdd_gb, hr);
+        goto done;
+    }
+    args->vhdx_created = TRUE;
+
+    /* ---- 2. NAT IP allocation (BEFORE cidata so autoinstall can bake
+       the static address into the installed system's netplan). ---- */
+    if (args->config.network_mode == NET_NAT && args->vm_index >= 0 && args->vm_index < g_vm_count) {
+        if (allocate_nat_ip(&g_vms[args->vm_index])) {
+            asb_log(L"Allocated NAT IP %S for new VM.", g_vms[args->vm_index].nat_ip);
+            save_vm_list();
+        }
+    }
+
+    /* ---- 3. cidata.iso (autoinstall config + post-install user-data +
+       extras tree). hcs_vm.c attaches it at SCSI slot 2 (image_path is
+       at slot 1 as the bootable Ubuntu Desktop ISO). ---- */
+    swprintf_s(res_iso, MAX_PATH, L"%s\\resources.iso", args->vhdx_dir);
+    GetModuleFileNameW(g_dll_module, exe_dir, MAX_PATH);
+    slash = wcsrchr(exe_dir, L'\\'); if (slash) *slash = L'\0';
+    swprintf_s(res_dir, MAX_PATH, L"%s\\resources", exe_dir);
+    if (GetFileAttributesW(res_dir) == INVALID_FILE_ATTRIBUTES)
+        wcscpy_s(res_dir, MAX_PATH, exe_dir);
+
+    {
+        const char *cidata_nat_ip = (args->config.network_mode == NET_NAT
+                                      && args->vm_index >= 0
+                                      && args->vm_index < g_vm_count
+                                      && g_vms[args->vm_index].nat_ip[0] != '\0')
+                                    ? g_vms[args->vm_index].nat_ip : NULL;
+        hr = iso_create_resources_ubuntu(res_iso, args->config.name,
+                                          args->config.admin_user, args->config.admin_pass,
+                                          res_dir, args->config.ssh_enabled,
+                                          cidata_nat_ip);
+    }
+    /* iso_create_resources_ubuntu wipes admin_pass internally on success;
+       defensively wipe again in case it bailed early. */
+    SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
+    if (SUCCEEDED(hr))
+        wcscpy_s(args->config.resources_iso_path, MAX_PATH, res_iso);
+    else
+        asb_log(L"Warning: Failed to create Ubuntu cidata ISO (0x%08X).", hr);
+
+    /* ---- 5. Network + endpoint (same as vhdx_create_thread:1114). ---- */
+    if (args->config.network_mode != NET_NONE) {
+        char *nat_ip = (args->vm_index >= 0 && args->vm_index < g_vm_count)
+                        ? g_vms[args->vm_index].nat_ip : NULL;
+        switch (args->config.network_mode) {
+        case NET_NAT:      hr = hcn_create_nat_network(&args->network_id); break;
+        case NET_INTERNAL: hr = hcn_create_internal_network(&args->network_id); break;
+        case NET_EXTERNAL: hr = hcn_create_external_network(&args->network_id, args->net_adapter); break;
+        default:           hr = E_INVALIDARG; break;
+        }
+        if (SUCCEEDED(hr)) {
+            BOOL is_nat = (args->config.network_mode == NET_NAT);
+            size_t ip_size = (args->vm_index >= 0 && args->vm_index < g_vm_count)
+                              ? sizeof(g_vms[args->vm_index].nat_ip) : 0;
+            hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
+                                          args->endpoint_guid, 64,
+                                          nat_ip, ip_size, is_nat);
+            if (SUCCEEDED(hr)) {
+                args->has_network = TRUE;
+                if (is_nat) save_vm_list();
+            }
+        }
+        if (FAILED(hr))
+            args->config.network_mode = NET_NONE;
+    }
+
+    /* ---- 6. HCS create + start (same as vhdx_create_thread:1145). ---- */
+    {
+        VmInstance temp_inst;
+        ZeroMemory(&temp_inst, sizeof(temp_inst));
+
+        hr = (args->endpoint_guid[0] != L'\0')
+            ? hcs_create_vm_with_endpoint(&args->config, args->endpoint_guid, &temp_inst)
+            : hcs_create_vm(&args->config, &temp_inst);
+        if (FAILED(hr)) {
+            args->result = hr;
+            swprintf_s(args->error_msg, 512, L"Failed to create HCS VM (0x%08X)", hr);
+            if (args->has_network) {
+                hcn_delete_endpoint(&args->endpoint_id);
+                args->has_network = FALSE;
+                args->endpoint_guid[0] = L'\0';
+            }
+            goto done;
+        }
+
+        hr = hcs_start_vm(&temp_inst);
+        if (FAILED(hr)) {
+            args->result = hr;
+            swprintf_s(args->error_msg, 512, L"Failed to start VM (0x%08X)", hr);
+            hcs_close_vm(&temp_inst);
+            if (args->has_network) {
+                hcn_delete_endpoint(&args->endpoint_id);
+                args->has_network = FALSE;
+                args->endpoint_guid[0] = L'\0';
+            }
+            goto done;
+        }
+
+        {
+            VmInstance *heap_inst = (VmInstance *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(VmInstance));
+            if (heap_inst) memcpy(heap_inst, &temp_inst, sizeof(VmInstance));
+            args->vm_inst = heap_inst;
+        }
+
+        args->result = S_OK;
+    }
+
+done:
+    /* ---- Completion (same as vhdx_create_thread:1206). ---- */
+    {
+        int idx = args->vm_index;
+        if (idx >= 0 && idx < g_vm_count) {
+            VmInstance *inst = &g_vms[idx];
+
+            EnterCriticalSection(&g_cs);
+            inst->building_vhdx = FALSE;
+
+            if (SUCCEEDED(args->result)) {
+                VmInstance *heap_inst = args->vm_inst;
+                if (heap_inst) {
+                    hcs_unregister_vm_callback(heap_inst);
+                    inst->handle = heap_inst->handle;
+                    inst->runtime_id = heap_inst->runtime_id;
+                    inst->running = TRUE;
+                    inst->network_mode = heap_inst->network_mode;
+                    inst->network_id = args->network_id;
+                    inst->endpoint_id = args->endpoint_id;
+                    HeapFree(GetProcessHeap(), 0, heap_inst);
+                    hcs_register_vm_callback(inst);
+                }
+                LeaveCriticalSection(&g_cs);
+
+                hcs_start_monitor(inst);
+                vm_agent_start(inst);
+                idd_probe_start(inst);
+                asb_log(L"VM \"%s\" created and started.", inst->name);
+                save_vm_list();
+            } else if (args->vhdx_created) {
+                LeaveCriticalSection(&g_cs);
+                asb_log(L"VM \"%s\" created but failed to start: %s", inst->name, args->error_msg);
+                asb_log(L"You can adjust settings and start it manually.");
+                if (args->result == (HRESULT)0x800705AF)
+                    asb_alert(L"The host doesn't have enough resources to start this VM.");
+                else
+                    asb_alert(L"Failed to start VM, check its configuration.");
+                save_vm_list();
+            } else {
+                int j;
+                asb_log(L"Error creating VM \"%s\": %s", inst->name, args->error_msg);
+                if (g_removed_cb) g_removed_cb(idx, g_removed_ud);
+                for (j = idx; j < g_vm_count - 1; j++) {
+                    g_vms[j] = g_vms[j + 1];
+                    g_snap_trees[j] = g_snap_trees[j + 1];
+                }
+                ZeroMemory(&g_vms[g_vm_count - 1], sizeof(VmInstance));
+                g_vm_count--;
+                LeaveCriticalSection(&g_cs);
+                remove_dir_recursive(args->vhdx_dir);
+                save_vm_list();
+            }
+
+            if (g_state_cb)
+                g_state_cb(vm_handle(inst), inst->running, g_state_ud);
+        }
+    }
+
+    HeapFree(GetProcessHeap(), 0, args);
+    return 0;
+}
+
 /* ================================================================
  * Public API Implementation
  * ================================================================ */
@@ -1427,6 +1686,14 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     if (cfg.ram_mb == 0) cfg.ram_mb = 4096;
     if (cfg.cpu_cores == 0) cfg.cpu_cores = 4;
 
+    /* Linux defaults: respect the UI's gpu_mode (GPU-PV now works via
+       autoinstall-built dxgkrnl + asb_drm). Force test_mode=TRUE so the
+       unsigned out-of-tree .ko's load — Secure Boot would otherwise
+       reject them, and we don't ship a MOK enrollment flow. */
+    if (_wcsicmp(cfg.os_type, L"Linux") == 0) {
+        cfg.test_mode = TRUE;
+    }
+
     /* Resolve template */
     if (config->template_name && config->template_name[0] != L'\0') {
         int i;
@@ -1443,6 +1710,22 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     if (is_template_create && from_template) {
         asb_log(L"Error: Cannot create a template from another template.");
         return E_INVALIDARG;
+    }
+
+    /* Linux v1: require an ISO. Templates aren't supported for Linux yet. */
+    if (_wcsicmp(cfg.os_type, L"Linux") == 0) {
+        if (is_template_create) {
+            asb_log(L"Error: Linux templates are not supported.");
+            return E_INVALIDARG;
+        }
+        if (from_template) {
+            asb_log(L"Error: Linux cannot be created from a template.");
+            return E_INVALIDARG;
+        }
+        if (cfg.image_path[0] == L'\0') {
+            asb_log(L"Error: Linux requires an ISO path.");
+            return E_INVALIDARG;
+        }
     }
 
     if (cfg.image_path[0] != L'\0')
@@ -1515,8 +1798,14 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     swprintf_s(cfg.vhdx_path, MAX_PATH, L"%s\\disk.vhdx", vhdx_dir);
 
     /* GPU driver shares */
-    if ((cfg.gpu_mode == GPU_DEFAULT || cfg.gpu_mode == GPU_MIRROR) && !is_template_create)
+    if ((cfg.gpu_mode == GPU_DEFAULT || cfg.gpu_mode == GPU_MIRROR) && !is_template_create) {
         gpu_get_driver_shares(&g_gpu_list, &cfg.gpu_shares);
+        /* Linux guests additionally consume %SystemRoot%\System32\lxss\lib
+         * (NVIDIA's WSL-staged Linux userspace .so files), mounted at
+         * /usr/lib/wsl/lib by the agent on first connect. */
+        if (_wcsicmp(cfg.os_type, L"Linux") == 0)
+            gpu_append_lxsslib_share(&cfg.gpu_shares);
+    }
 
     /* ---- VHDX-first path (Windows, from ISO) ---- */
     {
@@ -1575,12 +1864,84 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         }
     }
 
+    /* ---- Linux cloud-image path (parallel to use_vhdx_first) ----
+     *
+     * Linux VMs differencing-clone off a cached Ubuntu Server cloud image
+     * and use cidata.iso for first-boot config. The cloud-image fetch
+     * (770 MB on first use) is slow, so the whole flow runs on a worker
+     * thread; the UI thread returns immediately. */
+    {
+        /* Linux VM creation: ISO-based manual install. image_path is the
+           Ubuntu Desktop (or other Linux) installer ISO the user picked.
+           admin_pass is no longer required at create-time — the user
+           supplies it interactively to the installer. */
+        BOOL use_linux_cloud = (!from_template && !is_template_create &&
+                                _wcsicmp(cfg.os_type, L"Linux") == 0 &&
+                                cfg.image_path[0] != L'\0');
+
+        if (use_linux_cloud) {
+            LinuxCreateArgs *args;
+
+            wcscpy_s(inst->name, 256, cfg.name);
+            wcscpy_s(inst->os_type, 32, cfg.os_type);
+            wcscpy_s(inst->vhdx_path, MAX_PATH, cfg.vhdx_path);
+            /* image_path isn't used by Linux but copy it through anyway so
+               vms.cfg round-trips cleanly (UI sends it as the version tag). */
+            wcscpy_s(inst->image_path, MAX_PATH, cfg.image_path);
+            inst->ram_mb = cfg.ram_mb;
+            inst->hdd_gb = cfg.hdd_gb;
+            inst->cpu_cores = cfg.cpu_cores;
+            inst->gpu_mode = cfg.gpu_mode;
+            wcscpy_s(inst->gpu_name, 256, cfg.gpu_mode == GPU_MIRROR ? L"Try all" :
+                                          cfg.gpu_mode == GPU_DEFAULT ? L"Default GPU" : L"None");
+            inst->network_mode = cfg.network_mode;
+            inst->is_template = FALSE;
+            inst->test_mode = cfg.test_mode;
+            wcscpy_s(inst->admin_user, 128, cfg.admin_user);
+            inst->ssh_enabled = cfg.ssh_enabled;
+            inst->building_vhdx = TRUE;
+            inst->vhdx_progress = 0;
+            memcpy(&inst->gpu_shares, &cfg.gpu_shares, sizeof(GpuDriverShareList));
+
+            { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
+              snapshot_init(&g_snap_trees[g_vm_count], sd); }
+            g_vm_count++;
+
+            vm_save_state_json(cfg.vhdx_path, FALSE);
+            save_vm_list();
+
+            args = (LinuxCreateArgs *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(LinuxCreateArgs));
+            if (!args) {
+                asb_log(L"Error: Out of memory for Linux create args.");
+                g_vm_count--;
+                return E_OUTOFMEMORY;
+            }
+            memcpy(&args->config, &cfg, sizeof(VmConfig));
+            args->vm_index = g_vm_count - 1;
+            wcscpy_s(args->vhdx_dir, MAX_PATH, vhdx_dir);
+            wcscpy_s(args->net_adapter, 256, inst->net_adapter);
+
+            asb_log(L"Building Linux VM \"%s\" (cloud image download may take several minutes on first use)...", cfg.name);
+            CloseHandle(CreateThread(NULL, 0, linux_create_thread, args, 0, NULL));
+
+            /* Wipe the plaintext password from cfg; the heap copy in args
+               keeps a copy for the worker thread's iso_create_resources_ubuntu
+               call (which also wipes after use). */
+            SecureZeroMemory(cfg.admin_pass, sizeof(cfg.admin_pass));
+
+            if (g_state_cb) g_state_cb(vm_handle(inst), FALSE, g_state_ud);
+            return S_OK;
+        }
+    }
+
     /* ---- Synchronous path (from-template, non-Windows, etc.) ---- */
 
     /* Populate name early so log lines (e.g. NAT IP allocation) identify the VM. */
     wcscpy_s(inst->name, 256, cfg.name);
 
-    /* Create disk */
+    /* Create disk (synchronous path: from-template only — Linux cloud-image
+       creates go through use_linux_cloud above; Windows ISO installs go
+       through use_vhdx_first above). */
     if (from_template) {
         asb_log(L"Creating differencing VHDX from template \"%s\"...", g_templates[template_idx].name);
         DeleteFileW(cfg.vhdx_path);
@@ -1632,6 +1993,9 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
                 if (SUCCEEDED(hr)) wcscpy_s(cfg.resources_iso_path, MAX_PATH, res_iso);
                 else asb_log(L"Warning: Failed to create resources ISO (0x%08X).", hr);
             }
+            /* Linux: handled entirely in linux_create_thread via the
+               use_linux_cloud branch above. No synchronous Linux cidata
+               path here. */
         }
     }
     SecureZeroMemory(cfg.admin_pass, sizeof(cfg.admin_pass));

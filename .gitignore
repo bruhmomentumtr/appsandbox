@@ -418,3 +418,6 @@ FodyWeavers.xsd
 !/vendor/webview2/x64/**
 !/vendor/webview2/arm64
 !/vendor/webview2/arm64/**
+
+# Local-only planning and notes — kept on disk for context, not pushed.
+/docs/

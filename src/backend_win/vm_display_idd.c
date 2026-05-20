@@ -33,6 +33,7 @@
 #include "vm_display_idd.h"
 #include "vm_clipboard.h"
 #include "vm_agent.h"
+#include "hcs_vm.h"
 #include "ui.h"
 #include "resource.h"
 
@@ -60,6 +61,9 @@ typedef struct _SOCKADDR_HV {
     GUID ServiceId;
 } SOCKADDR_HV;
 
+/* These three are superseded by hcs_service_guid(os_type, port, ...) — kept
+   for grep. Windows VMs reach byte-identical GUIDs via the helper; Linux
+   VMs reach vsock-template GUIDs. */
 static const GUID FRAME_SERVICE_GUID =
     { 0xa5b0cafe, 0x0002, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
 
@@ -199,6 +203,7 @@ struct VmDisplayIdd {
     VmInstance  *vm;
     wchar_t      vm_name[256];     /* copy of vm->name for safe logging after VM teardown */
     GUID         runtime_id;       /* copy of vm->runtime_id for safe HvSocket after teardown */
+    wchar_t      os_type[32];      /* copy of vm->os_type for picking the service GUID variant */
     HINSTANCE    hInstance;
     HWND         main_hwnd;
     HWND         hwnd;
@@ -653,7 +658,8 @@ static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
 
     /* Outer retry loop — keep trying to connect to the guest capture helper */
     while (!d->stop) {
-        SOCKET s = connect_to_hv_service(&d->runtime_id, &AUDIO_SERVICE_GUID, 1000);
+        GUID svc; hcs_service_guid(d->os_type, 4, &svc);
+        SOCKET s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
         if (s == INVALID_SOCKET) {
             int wait;
             for (wait = 0; wait < 2000 && !d->stop; wait += 200)
@@ -1190,19 +1196,46 @@ static HCURSOR create_cursor_from_bitmap(UINT width, UINT height,
 
     } else {
         /* ALPHA (type 2): 32bpp BGRA with premultiplied alpha.
-           Height is the real cursor height. */
+           Height is the real cursor height.
+
+           The 32-bpp DIB section with BI_RGB doesn't tell Windows that
+           the top byte is alpha — Windows treats it as 24-bit RGB +
+           padding and, with an all-zero AND mask, renders EVERY pixel
+           opaque. For cursors whose transparent regions are stored as
+           (0,0,0,0) (e.g. ours from Linux), that paints a black square
+           around the cursor. Windows-VDD cursors happen not to trigger
+           this because their transparent regions have non-zero RGB.
+
+           Fix: build the AND mask from the alpha channel — bit set
+           (1) = transparent, bit cleared (0) = opaque. Threshold low
+           (any alpha > 0 = opaque) preserves anti-aliased edges, the
+           alpha channel then handles smooth blending of those edges.
+
+           Use BITMAPV4HEADER with explicit alpha mask instead of
+           BITMAPINFOHEADER+BI_RGB. The latter is ambiguous at 32-bpp:
+           some Windows paths treat it as XRGB (alpha ignored, RGB
+           rendered at full opacity → cursor body looks too bright).
+           V4 with bV4AlphaMask = 0xFF000000 settles it. */
         void *color_bits = NULL;
-        UINT row, dst_pitch;
+        UINT row, col, dst_pitch;
+        UINT mask_row_bytes, mask_pitch;
+        BYTE *mask_buf;
+        BITMAPV4HEADER bv4;
 
-        ZeroMemory(&bmi, sizeof(bmi));
-        bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth       = (LONG)width;
-        bmi.bmiHeader.biHeight      = -(LONG)height;
-        bmi.bmiHeader.biPlanes      = 1;
-        bmi.bmiHeader.biBitCount    = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
+        ZeroMemory(&bv4, sizeof(bv4));
+        bv4.bV4Size          = sizeof(BITMAPV4HEADER);
+        bv4.bV4Width         = (LONG)width;
+        bv4.bV4Height        = -(LONG)height;
+        bv4.bV4Planes        = 1;
+        bv4.bV4BitCount      = 32;
+        bv4.bV4V4Compression = BI_BITFIELDS;
+        bv4.bV4RedMask       = 0x00FF0000;
+        bv4.bV4GreenMask     = 0x0000FF00;
+        bv4.bV4BlueMask      = 0x000000FF;
+        bv4.bV4AlphaMask     = 0xFF000000;
 
-        hColor = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &color_bits, NULL, 0);
+        hColor = CreateDIBSection(hdc, (BITMAPINFO *)&bv4,
+                                  DIB_RGB_COLORS, &color_bits, NULL, 0);
         if (!hColor || !color_bits) {
             ReleaseDC(NULL, hdc);
             return NULL;
@@ -1215,14 +1248,26 @@ static HCURSOR create_cursor_from_bitmap(UINT width, UINT height,
                    dst_pitch);
         }
 
-        /* All-zero mask = fully controlled by color bitmap alpha channel.
-           CreateBitmap with NULL bits is uninitialized — allocate zeroed. */
-        {
-            UINT mbytes = (((width + 7) / 8 + 3) & ~3u) * height;
-            BYTE *zbuf = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, mbytes);
-            hMask = CreateBitmap((int)width, (int)height, 1, 1, zbuf);
-            if (zbuf) HeapFree(GetProcessHeap(), 0, zbuf);
+        /* AND mask, 1bpp, DWORD-aligned rows. Bit set = transparent. */
+        mask_row_bytes = (width + 7) / 8;
+        mask_pitch     = (mask_row_bytes + 3) & ~3u;
+        mask_buf = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                      (size_t)mask_pitch * height);
+        if (!mask_buf) {
+            DeleteObject(hColor);
+            ReleaseDC(NULL, hdc);
+            return NULL;
         }
+        for (row = 0; row < height; row++) {
+            const BYTE *src_row = shape_data + row * pitch;
+            BYTE *dst_row = mask_buf + row * mask_pitch;
+            for (col = 0; col < width; col++) {
+                if (src_row[col * 4 + 3] == 0)
+                    dst_row[col / 8] |= (0x80 >> (col & 7));
+            }
+        }
+        hMask = CreateBitmap((int)width, (int)height, 1, 1, mask_buf);
+        HeapFree(GetProcessHeap(), 0, mask_buf);
 
         ReleaseDC(NULL, hdc);
 
@@ -1289,7 +1334,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
         /* Ensure input channel is connected (independent of frame channel) */
         if (input_s == INVALID_SOCKET) {
-            input_s = connect_to_hv_service(&d->runtime_id, &INPUT_SERVICE_GUID, 1000);
+            GUID svc; hcs_service_guid(d->os_type, 3, &svc);
+            input_s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
             if (input_s != INVALID_SOCKET) {
                 UINT32 ready_magic = 0;
                 if (recv_exact(input_s, &ready_magic, sizeof(ready_magic)) &&
@@ -1311,8 +1357,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
         /* Clipboard module (handles :0005 + :0006 internally) */
         if (!d->clipboard) {
-            d->clipboard = vm_clipboard_create(&d->runtime_id, d->hwnd,
-                                               clip_log_callback, d);
+            d->clipboard = vm_clipboard_create(&d->runtime_id, d->os_type,
+                                               d->hwnd, clip_log_callback, d);
             if (d->clipboard)
                 idd_log(d, L"Clipboard module created.");
         }
@@ -1326,7 +1372,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
         /* Try to connect frame channel (VDD driver, GUID :0002) */
         idd_log(d, L"Connecting to frame service...");
-        s = connect_to_hv_service(&d->runtime_id, &FRAME_SERVICE_GUID, 3000);
+        {
+            GUID svc; hcs_service_guid(d->os_type, 2, &svc);
+            s = connect_to_hv_service(&d->runtime_id, &svc, 3000);
+        }
         if (s == INVALID_SOCKET) {
             int wait;
             idd_log(d, L"Connection failed, retrying in 3s.");
@@ -1530,7 +1579,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 idd_log(d, L"Input socket closed, will reconnect...");
             }
             if (input_s == INVALID_SOCKET) {
-                SOCKET new_s = connect_to_hv_service(&d->runtime_id, &INPUT_SERVICE_GUID, 1000);
+                GUID svc; hcs_service_guid(d->os_type, 3, &svc);
+                SOCKET new_s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
                 if (new_s != INVALID_SOCKET) {
                     UINT32 ready_magic = 0;
                     if (recv_exact(new_s, &ready_magic, sizeof(ready_magic)) &&
@@ -2018,6 +2068,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->vm           = vm;
     wcscpy_s(d->vm_name, 256, vm->name);
     d->runtime_id   = vm->runtime_id;
+    wcscpy_s(d->os_type, 32, vm->os_type);
     d->hInstance    = hInstance;
     d->main_hwnd   = main_hwnd;
     d->open         = TRUE;

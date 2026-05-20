@@ -12,6 +12,7 @@
  */
 
 #include "vm_clipboard.h"
+#include "hcs_vm.h"
 #include <shlobj.h>
 #include <stdio.h>
 #include <string.h>
@@ -37,6 +38,8 @@ typedef struct {
 } SOCKADDR_HV;
 #pragma pack(pop)
 
+/* Both superseded by hcs_service_guid(os_type, 5|6, ...) — kept for grep.
+   Windows VMs reach byte-identical GUIDs via the helper. */
 static const GUID CLIPBOARD_SERVICE_GUID =
     { 0xa5b0cafe, 0x0005, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
 
@@ -87,6 +90,7 @@ typedef struct {
 
 struct VmClipboardData {
     GUID             runtime_id;
+    wchar_t          os_type[32];  /* for picking the HV-socket service GUID variant */
     HWND             hwnd;
     volatile BOOL    stop;
     volatile BOOL    sync_enabled;
@@ -648,7 +652,8 @@ static DWORD WINAPI clip_writer_thread_proc(LPVOID param)
                 Sleep(500);
             if (clip->stop) break;
 
-            ws = clip_connect_hv(&clip->runtime_id, &CLIPBOARD_SERVICE_GUID, 2000);
+            { GUID svc; hcs_service_guid(clip->os_type, 5, &svc);
+              ws = clip_connect_hv(&clip->runtime_id, &svc, 2000); }
             if (ws != INVALID_SOCKET) {
                 UINT32 ready_magic = 0;
                 if (clip_recv_exact(ws, &ready_magic, sizeof(ready_magic)) &&
@@ -912,7 +917,8 @@ static DWORD WINAPI clip_reader_thread_proc(LPVOID param)
 
             if (clip->reader_socket != INVALID_SOCKET) break;
 
-            rs = clip_connect_hv(&clip->runtime_id, &CLIPBOARD_READER_SERVICE_GUID, 2000);
+            { GUID svc; hcs_service_guid(clip->os_type, 6, &svc);
+              rs = clip_connect_hv(&clip->runtime_id, &svc, 2000); }
             if (rs != INVALID_SOCKET) {
                 UINT32 ready_magic = 0;
                 if (clip_recv_exact(rs, &ready_magic, sizeof(ready_magic)) &&
@@ -953,17 +959,21 @@ static DWORD WINAPI clip_reader_thread_proc(LPVOID param)
 
 /* ---- Public API ---- */
 
-ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id, HWND hwnd,
+ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id,
+                                        const wchar_t *os_type,
+                                        HWND hwnd,
                                         VmClipboardLogFn log_fn, void *log_ud)
 {
     VmClipboard clip;
     wchar_t tmp[MAX_PATH];
     SOCKET writer_s;
+    GUID svc;
 
     clip = (VmClipboard)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*clip));
     if (!clip) return NULL;
 
     clip->runtime_id = *runtime_id;
+    if (os_type) wcscpy_s(clip->os_type, 32, os_type);
     clip->hwnd = hwnd;
     clip->log_fn = log_fn;
     clip->log_ud = log_ud;
@@ -982,7 +992,8 @@ ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id, HWND hwnd,
     CreateDirectoryW(clip->temp_dir, NULL);
 
     /* Initial writer connection */
-    writer_s = clip_connect_hv(runtime_id, &CLIPBOARD_SERVICE_GUID, 2000);
+    hcs_service_guid(clip->os_type, 5, &svc);
+    writer_s = clip_connect_hv(runtime_id, &svc, 2000);
     if (writer_s != INVALID_SOCKET) {
         UINT32 ready_magic = 0;
         if (clip_recv_exact(writer_s, &ready_magic, sizeof(ready_magic)) &&

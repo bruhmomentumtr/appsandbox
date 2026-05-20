@@ -183,6 +183,21 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
 BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                        wchar_t *json_out, size_t json_out_chars);
 
+/* Compute the AppSandbox service GUID for a guest OS and port.
+     Windows guests get a5b0cafe-<port>-4000-8000-000000000001.
+     Non-Windows guests (Linux) get <port>-FACB-11E6-BD58-64006A7986D3
+       (the vsock-template GUID — Linux AF_VSOCK clients on port N reach
+        the host service registered with that GUID).
+   Both forms are listed in the HCS ServiceTable for the appropriate
+   guest; the host's socket code picks the right one via this helper. */
+ASB_API void hcs_service_guid(const wchar_t *os_type, unsigned port, GUID *out);
+
+/* Same as hcs_service_guid, formatted as the GUID string the HCS JSON
+   expects (lowercase hex, hyphenated, no braces). out must be at least
+   40 wide chars. */
+ASB_API void hcs_service_guid_str(const wchar_t *os_type, unsigned port,
+                                  wchar_t *out, size_t out_chars);
+
 /* Query guest integration status. Logs GuestConnection info and IC heartbeat.
    Returns TRUE if guest IC services are responding. */
 BOOL hcs_query_guest_status(VmInstance *instance);

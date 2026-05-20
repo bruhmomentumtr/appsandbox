@@ -65,13 +65,54 @@ var hostBridge = (function() {
 
 function sendCmd(action, data) { hostBridge.send(action, data); }
 
-/* Hide Windows-only form fields when running on macOS. */
+/* Hide Windows-only form fields when running on macOS.
+ * On macOS we also hide both image-source rows (.needs-iso for Windows,
+ * .needs-linux-version for Linux) — macOS uses .ipsw via its own
+ * picker, not a path input here. */
 if (hostBridge.isMac) {
-    var winOnly = document.querySelectorAll('.win-only');
-    for (var i = 0; i < winOnly.length; i++) winOnly[i].style.display = 'none';
+    var hide = document.querySelectorAll('.win-only, .needs-iso, .needs-linux-version');
+    for (var i = 0; i < hide.length; i++) hide[i].style.display = 'none';
     var osSelect = document.getElementById('os-type');
     osSelect.value = 'macOS';
     osSelect.disabled = true;
+}
+
+/* OS Type dropdown: drop guest types that aren't available on this host.
+ * Windows host: macOS unavailable (Apple Virtualization is Mac-only).
+ * macOS host:   Windows and Linux unavailable (HCS-only path). */
+{
+    var unavailable = hostBridge.isMac ? ['Windows', 'Linux'] : ['macOS'];
+    unavailable.forEach(function(v) {
+        var opt = document.querySelector('#os-type option[value="' + v + '"]');
+        if (opt) opt.remove();
+    });
+}
+
+/* Apply Create-modal visibility rules for the currently selected OS type.
+ *   Windows: .win-only shown, .needs-iso shown,             .needs-linux-version hidden
+ *   Linux:   .win-only hidden, .needs-iso hidden,           .needs-linux-version shown
+ *   macOS:   handled by the isMac branch above; this function is a no-op there.
+ *
+ * Linux is back to user-picks-an-ISO (Ubuntu Desktop ISO etc.), same as
+ * Windows. The version-dropdown / cloud-image flow is preserved in
+ * asb_core.c under #if 0 in case we need to bring it back. */
+function applyOsTypeUI() {
+    if (hostBridge.isMac) return;
+    var osType = document.getElementById('os-type').value;
+    var isWindows = osType === 'Windows';
+    var isLinux = osType === 'Linux';
+    var winOnly = document.querySelectorAll('.win-only');
+    var needsIso = document.querySelectorAll('.needs-iso');
+    var needsLinuxVersion = document.querySelectorAll('.needs-linux-version');
+    for (var i = 0; i < winOnly.length; i++) winOnly[i].style.display = isWindows ? '' : 'none';
+    /* ISO picker shows for both Windows and Linux now. */
+    for (var j = 0; j < needsIso.length; j++) needsIso[j].style.display = (isWindows || isLinux) ? '' : 'none';
+    /* Linux distribution dropdown is dormant — kept in the DOM but always
+       hidden so the cloud-image code path can be revived without
+       re-adding the markup. */
+    for (var k = 0; k < needsLinuxVersion.length; k++) needsLinuxVersion[k].style.display = 'none';
+    revalidateVmName();
+    updateCreateButtons();
 }
 
 /* Unified dispatch. Native code on either platform calls
@@ -287,10 +328,14 @@ function onBrowseResult(path) {
 /* ---- Create buttons state ---- */
 
 function updateCreateButtons() {
-    var hasImage = document.getElementById('image-path').value.trim() !== '';
+    var osType = document.getElementById('os-type').value;
+    /* Same ISO-required check for Windows and Linux now. */
+    var hasImage = (document.getElementById('image-path').value.trim() !== '');
     var hasTpl = document.getElementById('template-select').value !== '';
     document.getElementById('btn-create').disabled = hostBridge.isMac ? false : !(hasImage || hasTpl);
-    document.getElementById('btn-create-template').disabled = !hasImage;
+    /* Templates are Windows-only; disabling create-as-template for Linux
+       (and macOS) is fine since hasImage is the only signal we check. */
+    document.getElementById('btn-create-template').disabled = (osType !== 'Windows') || !hasImage;
 }
 
 /* Wire up change events */
@@ -350,10 +395,14 @@ onNetModeChange();
 /* ---- Create VM ---- */
 
 function gatherConfig() {
+    var osType = document.getElementById('os-type').value;
+    /* Same ISO-picker path for Windows and Linux. The cloud-image
+       Linux-version dropdown is dormant (see applyOsTypeUI). */
+    var imagePath = document.getElementById('image-path').value.trim();
     return {
         name:        document.getElementById('vm-name').value.trim(),
-        osType:      document.getElementById('os-type').value,
-        imagePath:   document.getElementById('image-path').value.trim(),
+        osType:      osType,
+        imagePath:   imagePath,
         templateName: document.getElementById('template-select').value,
         hddGb:       parseInt(document.getElementById('hdd-size').value) || 64,
         ramMb:       parseInt(document.getElementById('ram-size').value) || 16384,
@@ -377,8 +426,15 @@ function clearCreateForm() {
 
 function validateVmName(name) {
     if (!name) return 'VM name is required.';
-    if (!hostBridge.isMac && name.length > 15) return 'VM name cannot exceed 15 characters (NetBIOS limit).';
-    if (hostBridge.isMac && name.length > 63) return 'VM name cannot exceed 63 characters (macOS LocalHostName limit).';
+    var osSelect = document.getElementById('os-type');
+    var osType = osSelect ? osSelect.value : 'Windows';
+    if (hostBridge.isMac) {
+        if (name.length > 63) return 'VM name cannot exceed 63 characters (macOS LocalHostName limit).';
+    } else if (osType === 'Linux') {
+        if (name.length > 63) return 'VM name cannot exceed 63 characters (Linux hostname limit).';
+    } else {
+        if (name.length > 15) return 'VM name cannot exceed 15 characters (NetBIOS limit).';
+    }
     if (/[^a-zA-Z0-9-]/.test(name)) return 'VM name can only contain letters, digits, and hyphens.';
     if (/^\d+$/.test(name)) return 'VM name cannot be only digits.';
     if (name.startsWith('-') || name.endsWith('-')) return 'VM name cannot start or end with a hyphen.';
@@ -449,6 +505,8 @@ function openCreateModal() {
     document.getElementById('admin-confirm').value = 'test123';
     document.getElementById('test-mode').checked = true;
     document.getElementById('ssh-enabled').checked = false;
+    /* Reset OS type to Windows on each open (skip on macOS host — it's locked) */
+    if (!hostBridge.isMac) document.getElementById('os-type').value = 'Windows';
 
     /* Smart defaults (RAM/cores) from latest host info */
     if (lastHostInfo) applySmartDefaults(lastHostInfo);
@@ -458,8 +516,7 @@ function openCreateModal() {
     document.getElementById('admin-user-warn').textContent = '';
     checkPasswordMatch();
     onNetModeChange();
-    updateCreateButtons();
-    revalidateVmName();
+    applyOsTypeUI();   /* fires updateCreateButtons + revalidateVmName */
 
     document.getElementById('create-vm-overlay').classList.add('active');
     setTimeout(function() { document.getElementById('vm-name').focus(); }, 0);

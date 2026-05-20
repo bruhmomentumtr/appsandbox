@@ -71,23 +71,32 @@
 
             <label for="os-type">OS Type:</label>
             <div class="form-row">
-                <select id="os-type">
+                <select id="os-type" onchange="applyOsTypeUI()">
                     <option value="Windows" selected>Windows</option>
+                    <option value="Linux">Linux</option>
                     <option value="macOS">macOS</option>
                 </select>
             </div>
 
-            <label class="win-only">OS Image:</label>
-            <div class="image-row win-only">
+            <label class="needs-iso">OS Image:</label>
+            <div class="image-row needs-iso">
                 <input type="text" id="image-path" placeholder="Path to ISO or VHDX...">
                 <button id="btn-browse" onclick="sendCmd('browseImage')">Browse...</button>
-                <span class="or-separator">OR</span>
-                <label style="text-align:left">Template:</label>
-                <div class="template-dropdown" id="template-dropdown">
+                <span class="or-separator win-only">OR</span>
+                <label class="win-only" style="text-align:left">Template:</label>
+                <div class="template-dropdown win-only" id="template-dropdown">
                     <div class="template-dropdown-selected" id="template-dropdown-selected">(None)</div>
                     <div class="template-dropdown-list" id="template-dropdown-list"></div>
                     <input type="hidden" id="template-select" value="">
                 </div>
+            </div>
+
+            <label class="needs-linux-version">Distribution:</label>
+            <div class="form-row needs-linux-version">
+                <select id="linux-version">
+                    <option value="ubuntu-26.04" selected>Ubuntu 26.04 LTS</option>
+                </select>
+                <span class="host-info">Downloaded on first create (~600 MB), cached on the host</span>
             </div>
 
             <label for="hdd-size">HDD Size:</label>
@@ -108,8 +117,8 @@
                 <span class="host-info" id="host-cpu"></span>
             </div>
 
-            <label for="gpu-mode" class="win-only">GPU:</label>
-            <div class="form-row win-only">
+            <label for="gpu-mode">GPU:</label>
+            <div class="form-row">
                 <select id="gpu-mode">
                     <option value="0">None</option>
                     <option value="1" selected>Default GPU</option>
