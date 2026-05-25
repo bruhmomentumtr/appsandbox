@@ -961,15 +961,18 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         L"\"RuntimeStateFilePath\":\"%s\""
         L"}", vmgs_esc, vmrs_esc);
 
-    /* VideoMonitor + BasicSession RDP pipe.
-       vmwp.exe historically crashed without VideoMonitor, which is why this
-       block always emits. The BasicSession named pipe is the fallback
-       display channel the MsRdpClient10 ActiveX in vm_display.c attaches
-       to — used by Windows VMs before the IDD path is up and by Linux
-       VMs as a debug view of the synthetic Hyper-V Video adapter during
-       boot. Resolution 1024x768 because vmconnect's basic-session
-       renderer chokes on higher modes. */
-    {
+    /* VideoMonitor + BasicSession RDP pipe — Linux only.
+       Linux VMs use this as a debug view of the synthetic Hyper-V Video
+       adapter during early boot, before the IDD path comes up. The
+       MsRdpClient10 ActiveX in vm_display.c attaches to the named pipe.
+       Resolution 1024x768 because vmconnect's basic-session renderer
+       chokes on higher modes.
+
+       Windows VMs deliberately omit this — the IDD path is the only
+       display we want for Windows, and the BasicSession pipe burns
+       host resources for no real benefit there. */
+    video_section[0] = L'\0';
+    if (!is_windows) {
         wchar_t name_esc[MAX_PATH * 2];
         wchar_t user_sid[128] = L"";
         escape_json_path(config->name, name_esc, MAX_PATH * 2);
