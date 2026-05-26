@@ -20,6 +20,8 @@
 #include <shlwapi.h>
 #include <stdio.h>
 
+#include "ubuntu_vhdx.h"
+
 #pragma comment(lib, "virtdisk.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
@@ -53,7 +55,7 @@ static const GUID VHDX_VENDOR_MS = {
    DONE:<path>          — success, path to output file
 */
 
-static void log_msg(const wchar_t *fmt, ...)
+void log_msg(const wchar_t *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
@@ -64,19 +66,19 @@ static void log_msg(const wchar_t *fmt, ...)
     va_end(ap);
 }
 
-static void log_progress(int pct, const wchar_t *step)
+void log_progress(int pct, const wchar_t *step)
 {
     wprintf(L"PROGRESS:%d:%s\n", pct, step);
     fflush(stdout);
 }
 
-static void log_done(const wchar_t *path)
+void log_done(const wchar_t *path)
 {
     wprintf(L"DONE:%s\n", path);
     fflush(stdout);
 }
 
-static void log_err(const wchar_t *fmt, ...)
+void log_err(const wchar_t *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
@@ -2816,6 +2818,12 @@ int wmain(int argc, wchar_t *argv[])
         wprintf(L"      Builds a sparse raw image, wraps with VHD-fixed footer, then\n");
         wprintf(L"      CreateVirtualDisk converts to VHDX. Emits STATUS / PROGRESS /\n");
         wprintf(L"      DEBUG / ERROR / DONE lines like the other modes.\n\n");
+        wprintf(L"  iso-patch.exe --ubuntu-to-vhdx <ubuntu.iso> --output <vhdx> [options]\n");
+        wprintf(L"      Convert an Ubuntu desktop ISO directly to a fully-installed\n");
+        wprintf(L"      bootable VHDX (no subiquity, no user interaction). Streams\n");
+        wprintf(L"      casper/minimal.squashfs into a freshly-built ext4 partition.\n");
+        wprintf(L"      --size-gb N      virtual size in GiB (default 16, min 16)\n");
+        wprintf(L"      --stage <file>   tab-separated manifest: <src>\\t<rootfs-path>\n\n");
         wprintf(L"Output defaults to next to iso-patch.exe.\n");
         return 1;
     }
@@ -2866,6 +2874,32 @@ int wmain(int argc, wchar_t *argv[])
             return 1;
         }
         return do_qcow2_to_vhdx(qcow2, output);
+    }
+
+    if (_wcsicmp(argv[1], L"--ubuntu-to-vhdx") == 0) {
+        const wchar_t *iso = NULL;
+        const wchar_t *output = NULL;
+        const wchar_t *manifest = NULL;
+        int size_gb = 16;
+        for (int i = 2; i < argc; i++) {
+            if (_wcsicmp(argv[i], L"--output") == 0) {
+                if (i + 1 < argc) { output = argv[++i]; }
+                else { log_err(L"--output requires a path"); return 1; }
+            } else if (_wcsicmp(argv[i], L"--stage") == 0) {
+                if (i + 1 < argc) { manifest = argv[++i]; }
+                else { log_err(L"--stage requires a manifest file"); return 1; }
+            } else if (_wcsicmp(argv[i], L"--size-gb") == 0) {
+                if (i + 1 < argc) { size_gb = _wtoi(argv[++i]); }
+                else { log_err(L"--size-gb requires a number"); return 1; }
+            } else if (!iso) {
+                iso = argv[i];
+            }
+        }
+        if (!iso || !output) {
+            log_err(L"--ubuntu-to-vhdx requires <ubuntu.iso> and --output <vhdx>");
+            return 1;
+        }
+        return do_ubuntu_to_vhdx(iso, output, size_gb, manifest);
     }
 
     if (_wcsicmp(argv[1], L"--to-vhdx") == 0) {

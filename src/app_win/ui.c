@@ -587,8 +587,13 @@ static void do_connect_idd(int idx)
    can close one without re-opening the other. */
 static void do_connect_vm(int idx)
 {
+    /* Direct ISO->VHDX flow boots straight into the configured rootfs with
+       IDD live from the start, so the RDP fallback window is no longer
+       needed. do_connect_rdp() + vm_display.c stay on disk as reference
+       for the RDP-over-named-pipe pattern but are no longer invoked.
+       The g_displays[]/safe_destroy_rdp cleanup paths remain inert
+       because nothing populates the slots. */
     do_connect_idd(idx);
-    do_connect_rdp(idx);
 }
 
 /* ---- System tray ---- */

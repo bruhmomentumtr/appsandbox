@@ -2963,9 +2963,9 @@ static int copy_dir_recursive(const wchar_t *src_dir, const wchar_t *dst_dir)
  *   - wsl-deps .so libs: prefetched into C:\ProgramData\AppSandbox\wsl-deps\
  *     by `tools/wsl-deps/fetch-wsl-deps.ps1` (see tools/wsl-deps/README.md).
  */
-static void stage_linux_agent_and_extras(const wchar_t *staging,
-                                          const wchar_t *res_dir,
-                                          BOOL ssh_enabled)
+void stage_linux_agent_and_extras(const wchar_t *staging,
+                                  const wchar_t *res_dir,
+                                  BOOL ssh_enabled)
 {
     wchar_t extras[MAX_PATH], src[MAX_PATH], dst[MAX_PATH];
     wchar_t repo[MAX_PATH];

@@ -1271,19 +1271,223 @@ done:
     return 0;
 }
 
-/* ---- Background Linux create thread (cloud-image based) ----
+/* ---- Generate staging manifest for the Ubuntu direct-ISO->VHDX flow.
  *
- * Parallel to vhdx_create_thread but skips iso-patch.exe entirely. Linux
- * VMs boot a differencing VHDX off a cached Ubuntu Server cloud image,
- * with first-boot config delivered via a cidata cloud-init ISO. The slow
- * step here is `ensure_ubuntu_cloud_image_cached` (one-time 770 MB
- * download from cloud-images.ubuntu.com on first use; near-instant
- * thereafter). After that the work is fast.
+ * 1. Calls stage_linux_agent_and_extras to populate <staging>/extras/
+ *    with the full set of agent ELFs, kernel modules, DKMS source trees,
+ *    systemd units, modprobe.d/modules-load.d, wsl-mesa, wsl-deps.
  *
- * The post-prep network/HCS/completion code is a direct copy of
- * vhdx_create_thread's tail (lines 1102 onward) — same shape, same
- * critical section, same callbacks. Kept inline rather than refactored
- * to a helper because the two threads can diverge independently later.
+ * 2. Walks <staging>/extras/ recursively and writes one tab-separated
+ *    line per file to the manifest:
+ *
+ *        <host absolute path>\t/opt/appsandbox/<relative path>
+ *
+ *    iso-patch's stage_manifest_into_rootfs reads this and writes each
+ *    file into the ext4 rootfs via ext4_writer_add_file.
+ *
+ *    Forward slashes used in the rootfs destination (Linux convention).
+ *    Parent directories handled by iso-patch's ext4_mkdir_p.
+ *
+ * Returns the count of files staged, or -1 on error. */
+static int write_manifest_walk_dir(FILE *f,
+                                   const wchar_t *abs_dir,
+                                   const char *rootfs_rel_prefix)
+{
+    WIN32_FIND_DATAW fd;
+    wchar_t pattern[MAX_PATH];
+    int count = 0;
+    swprintf_s(pattern, MAX_PATH, L"%s\\*", abs_dir);
+    HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (fd.cFileName[0] == L'.' && (fd.cFileName[1] == L'\0' ||
+            (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0'))) continue;
+        wchar_t abs_path[MAX_PATH];
+        swprintf_s(abs_path, MAX_PATH, L"%s\\%s", abs_dir, fd.cFileName);
+        /* Convert wide filename -> utf8 for the rootfs-side path. */
+        char fn_utf8[260];
+        WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1,
+                            fn_utf8, sizeof(fn_utf8), NULL, NULL);
+        char rootfs_rel[1024];
+        snprintf(rootfs_rel, sizeof(rootfs_rel), "%s/%s",
+                 rootfs_rel_prefix, fn_utf8);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            count += write_manifest_walk_dir(f, abs_path, rootfs_rel);
+        } else {
+            /* manifest line: <host path>\t<rootfs path>\n */
+            fwprintf(f, L"%s\t", abs_path);
+            /* Write rootfs path as wide for utf-8-bom-safe round-trip. */
+            wchar_t rootfs_wide[1024];
+            MultiByteToWideChar(CP_UTF8, 0, rootfs_rel, -1,
+                                rootfs_wide, 1024);
+            fwprintf(f, L"%s\n", rootfs_wide);
+            count++;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return count;
+}
+
+static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
+                                         const wchar_t *staging,
+                                         const wchar_t *res_dir,
+                                         BOOL ssh_enabled)
+{
+    wchar_t extras[MAX_PATH];
+    CreateDirectoryW(staging, NULL);
+    /* Populate staging\extras\ with the full agent + module + units tree. */
+    stage_linux_agent_and_extras(staging, res_dir, ssh_enabled);
+
+    swprintf_s(extras, MAX_PATH, L"%s\\extras", staging);
+    if (GetFileAttributesW(extras) == INVALID_FILE_ATTRIBUTES) {
+        asb_log(L"Linux extras dir was not created: %s", extras);
+        return -1;
+    }
+
+    FILE *f = NULL;
+    if (_wfopen_s(&f, manifest_path, L"w, ccs=UTF-8") != 0 || !f) {
+        asb_log(L"Failed to open Linux manifest for write: %s", manifest_path);
+        return -1;
+    }
+    /* Walk extras\ -> /opt/appsandbox/ */
+    int n = write_manifest_walk_dir(f, extras, "/opt/appsandbox");
+    fclose(f);
+    asb_log(L"Linux staging manifest written: %s (%d file(s))", manifest_path, n);
+    return n;
+}
+
+/* ---- Run iso-patch.exe --ubuntu-to-vhdx and stream its progress. ----
+ *
+ * Parallel helper for the Linux flow. Spawns iso-patch.exe, parses
+ * STATUS:/PROGRESS:/ERROR:/DONE: stdout lines, updates the per-VM
+ * progress callback. Same shape as the iso-patch invocation block
+ * inside vhdx_create_thread, but for the Ubuntu mode (no LANG: handling).
+ */
+static HRESULT run_iso_patch_ubuntu(const wchar_t *iso_path,
+                                     const wchar_t *vhdx_path,
+                                     ULONG hdd_gb,
+                                     const wchar_t *manifest_path,
+                                     int vm_index,
+                                     wchar_t *error_msg, size_t error_msg_cap)
+{
+    wchar_t exe_dir[MAX_PATH], cmdline[2048];
+    wchar_t *slash;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    HANDLE hReadPipe = INVALID_HANDLE_VALUE, hWritePipe = INVALID_HANDLE_VALUE;
+    SECURITY_ATTRIBUTES sa;
+    BYTE line_buf[4096];
+    int pos = 0;
+    DWORD bytes_read = 0, exit_code = 0;
+    HRESULT result = E_FAIL;
+
+    GetModuleFileNameW(g_dll_module, exe_dir, MAX_PATH);
+    slash = wcsrchr(exe_dir, L'\\'); if (slash) *slash = L'\0';
+
+    if (manifest_path && manifest_path[0]) {
+        swprintf_s(cmdline, 2048,
+            L"\"%s\\iso-patch.exe\" --ubuntu-to-vhdx \"%s\" --output \"%s\" --size-gb %lu --stage \"%s\"",
+            exe_dir, iso_path, vhdx_path, hdd_gb, manifest_path);
+    } else {
+        swprintf_s(cmdline, 2048,
+            L"\"%s\\iso-patch.exe\" --ubuntu-to-vhdx \"%s\" --output \"%s\" --size-gb %lu",
+            exe_dir, iso_path, vhdx_path, hdd_gb);
+    }
+
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle = TRUE;
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
+        if (error_msg) swprintf_s(error_msg, error_msg_cap, L"CreatePipe failed (%lu)", GetLastError());
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hWritePipe;
+    ZeroMemory(&pi, sizeof(pi));
+
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        DWORD err = GetLastError();
+        if (error_msg) swprintf_s(error_msg, error_msg_cap, L"Failed to launch iso-patch.exe (%lu)", err);
+        CloseHandle(hReadPipe);
+        CloseHandle(hWritePipe);
+        return HRESULT_FROM_WIN32(err);
+    }
+    CloseHandle(hWritePipe);
+    hWritePipe = INVALID_HANDLE_VALUE;
+
+    {
+        char *cbuf = (char *)line_buf;
+        int cbuf_size = (int)sizeof(line_buf);
+        while (ReadFile(hReadPipe, cbuf + pos, (DWORD)(cbuf_size - pos - 1), &bytes_read, NULL) && bytes_read > 0) {
+            int end = pos + (int)bytes_read;
+            int start = 0;
+            cbuf[end] = '\0';
+            for (int ci = start; ci < end; ci++) {
+                if (cbuf[ci] == '\n' || cbuf[ci] == '\r') {
+                    cbuf[ci] = '\0';
+                    if (ci > start) {
+                        char *line = cbuf + start;
+                        if (strncmp(line, "PROGRESS:", 9) == 0) {
+                            int pct = atoi(line + 9);
+                            /* Match the Windows path exactly: staging flag
+                               flips only on the literal "Staging" substring,
+                               so genuine staging phases set it (e.g.
+                               "Staging grub modules") and ext4/squashfs
+                               progress lines do not. */
+                            BOOL is_staging = (strstr(line + 9, "Staging") != NULL);
+                            if (vm_index >= 0 && vm_index < g_vm_count) {
+                                g_vms[vm_index].vhdx_progress = pct;
+                                g_vms[vm_index].vhdx_staging = is_staging;
+                            }
+                            if (g_progress_cb && vm_index >= 0 && vm_index < g_vm_count)
+                                g_progress_cb(vm_handle(&g_vms[vm_index]), pct, is_staging, g_progress_ud);
+                        } else if (strncmp(line, "ERROR:", 6) == 0) {
+                            if (error_msg && error_msg[0] == L'\0')
+                                MultiByteToWideChar(CP_ACP, 0, line + 6, -1, error_msg, (int)error_msg_cap);
+                            result = E_FAIL;
+                        } else if (strncmp(line, "DONE:", 5) == 0) {
+                            result = S_OK;
+                        }
+                    }
+                    start = ci + 1;
+                    if (start < end && (cbuf[start] == '\n' || cbuf[start] == '\r')) start++;
+                }
+            }
+            if (start < end) { memmove(cbuf, cbuf + start, end - start); pos = end - start; }
+            else pos = 0;
+        }
+    }
+
+    CloseHandle(hReadPipe);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (exit_code != 0 && result != S_OK) {
+        if (error_msg && error_msg[0] == L'\0')
+            swprintf_s(error_msg, error_msg_cap, L"iso-patch.exe exited with code %lu", exit_code);
+        result = E_FAIL;
+    }
+    return result;
+}
+
+/* ---- Background Linux create thread (direct ISO -> VHDX) ----
+ *
+ * Replaces the previous subiquity-via-cidata flow. Spawns iso-patch.exe
+ * --ubuntu-to-vhdx which builds a fully-installed ext4 rootfs + signed
+ * shim/grub ESP directly from the user-picked Ubuntu Desktop ISO. No
+ * autoinstall, no cidata, no user interaction during install.
+ *
+ * First-boot configuration (hostname, user, network, OOBE skip,
+ * grub-install/update-grub) runs from a one-shot systemd unit planted
+ * into the rootfs at build time.
  */
 typedef struct {
     VmConfig    config;
@@ -1303,91 +1507,74 @@ typedef struct {
 static DWORD WINAPI linux_create_thread(LPVOID param)
 {
     LinuxCreateArgs *args = (LinuxCreateArgs *)param;
-    wchar_t exe_dir[MAX_PATH], res_dir[MAX_PATH];
-    wchar_t res_iso[MAX_PATH];
-    wchar_t *slash;
     HRESULT hr;
+    wchar_t exe_dir[MAX_PATH], res_dir[MAX_PATH];
+    wchar_t staging[MAX_PATH], manifest[MAX_PATH];
+    wchar_t *slash;
 
-    /* Linux ISO + autoinstall mode:
-       - cfg.image_path = user-picked Ubuntu Desktop ISO (SCSI slot 1, boot)
-       - cfg.vhdx_path  = empty disk at cfg.hdd_gb (install target)
-       - resources.iso  = cidata with autoinstall config (SCSI slot 2);
-                          subiquity reads NoCloud datasource (vol label
-                          "cidata"), runs unattended install, reboots into
-                          the installed system where cloud-init user-data
-                          applies our bootcmd / agent setup.
-
-       The older cloud-image differencing flow is preserved in #if 0 below
-       in case we need to revive it. */
-
-#if 0  /* ===== Cloud-image / differencing flow (disabled) =====
-    wchar_t base_vhdx[MAX_PATH];
-
-    asb_log(L"Ensuring Ubuntu 26.04 cloud image is cached...");
-    hr = ensure_ubuntu_cloud_image_cached(L"ubuntu-26.04", base_vhdx, MAX_PATH);
-    if (FAILED(hr)) {
-        args->result = hr;
-        swprintf_s(args->error_msg, 512, L"Failed to cache Ubuntu cloud image (0x%08X)", hr);
-        goto done;
-    }
+    /* ---- 1. Build the VHDX directly from the Ubuntu ISO via iso-patch.
+       No subiquity, no cidata, no user interaction. The first-boot service
+       planted inside the rootfs handles per-VM configuration. ---- */
+    asb_log(L"Building Linux VHDX from %s (size=%lu GB)...",
+            args->config.image_path, args->config.hdd_gb);
     DeleteFileW(args->config.vhdx_path);
-    hr = vhdx_create_differencing_resized(args->config.vhdx_path, base_vhdx,
-                                           (ULONGLONG)args->config.hdd_gb);
-    ===== end cloud-image flow ===== */
-#endif
+    /* resources_iso_path is unused for the direct-ISO flow but the field
+       still exists in the config; clear it so hcs_vm doesn't try to attach. */
+    args->config.resources_iso_path[0] = L'\0';
 
-    /* ---- 1. Empty VHDX at user's requested size — autoinstall partitions
-       and formats it. ---- */
-    asb_log(L"Creating empty Linux VHDX (%lu GB), boot ISO: %s",
-            args->config.hdd_gb, args->config.image_path);
-    DeleteFileW(args->config.vhdx_path);
-    hr = vhdx_create(args->config.vhdx_path, (ULONGLONG)args->config.hdd_gb);
-    if (FAILED(hr)) {
-        args->result = hr;
-        swprintf_s(args->error_msg, 512,
-                   L"Failed to create empty Linux VHDX at %lu GB (0x%08X)",
-                   args->config.hdd_gb, hr);
-        goto done;
-    }
-    args->vhdx_created = TRUE;
+    /* ---- 1a. Generate the staging manifest with all the Linux extras
+       (agent ELFs, kernel modules, DKMS sources, systemd units, etc.).
+       iso-patch reads this via --stage and writes each entry into the
+       ext4 rootfs at /opt/appsandbox/<relative>. ---- */
+    swprintf_s(staging, MAX_PATH, L"%s\\_vhdx_staging", args->vhdx_dir);
+    CreateDirectoryW(staging, NULL);
+    swprintf_s(manifest, MAX_PATH, L"%s\\manifest.txt", staging);
 
-    /* ---- 2. NAT IP allocation (BEFORE cidata so autoinstall can bake
-       the static address into the installed system's netplan). ---- */
-    if (args->config.network_mode == NET_NAT && args->vm_index >= 0 && args->vm_index < g_vm_count) {
-        if (allocate_nat_ip(&g_vms[args->vm_index])) {
-            asb_log(L"Allocated NAT IP %S for new VM.", g_vms[args->vm_index].nat_ip);
-            save_vm_list();
-        }
-    }
-
-    /* ---- 3. cidata.iso (autoinstall config + post-install user-data +
-       extras tree). hcs_vm.c attaches it at SCSI slot 2 (image_path is
-       at slot 1 as the bootable Ubuntu Desktop ISO). ---- */
-    swprintf_s(res_iso, MAX_PATH, L"%s\\resources.iso", args->vhdx_dir);
     GetModuleFileNameW(g_dll_module, exe_dir, MAX_PATH);
     slash = wcsrchr(exe_dir, L'\\'); if (slash) *slash = L'\0';
     swprintf_s(res_dir, MAX_PATH, L"%s\\resources", exe_dir);
     if (GetFileAttributesW(res_dir) == INVALID_FILE_ATTRIBUTES)
         wcscpy_s(res_dir, MAX_PATH, exe_dir);
 
-    {
-        const char *cidata_nat_ip = (args->config.network_mode == NET_NAT
-                                      && args->vm_index >= 0
-                                      && args->vm_index < g_vm_count
-                                      && g_vms[args->vm_index].nat_ip[0] != '\0')
-                                    ? g_vms[args->vm_index].nat_ip : NULL;
-        hr = iso_create_resources_ubuntu(res_iso, args->config.name,
-                                          args->config.admin_user, args->config.admin_pass,
-                                          res_dir, args->config.ssh_enabled,
-                                          cidata_nat_ip);
+    int n_staged = generate_vhdx_manifest_ubuntu(manifest, staging, res_dir,
+                                                  args->config.ssh_enabled);
+    if (n_staged < 0) {
+        args->result = E_FAIL;
+        swprintf_s(args->error_msg, 512, L"Failed to generate Linux staging manifest");
+        goto done;
     }
-    /* iso_create_resources_ubuntu wipes admin_pass internally on success;
-       defensively wipe again in case it bailed early. */
+
+    hr = run_iso_patch_ubuntu(args->config.image_path, args->config.vhdx_path,
+                              args->config.hdd_gb,
+                              n_staged > 0 ? manifest : NULL,
+                              args->vm_index, args->error_msg, 512);
+    /* admin_pass currently isn't fed into the rootfs (firstboot uses a
+       static test/test123). Wipe it from the in-memory config either way. */
     SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
-    if (SUCCEEDED(hr))
-        wcscpy_s(args->config.resources_iso_path, MAX_PATH, res_iso);
-    else
-        asb_log(L"Warning: Failed to create Ubuntu cidata ISO (0x%08X).", hr);
+    if (FAILED(hr)) {
+        args->result = hr;
+        if (args->error_msg[0] == L'\0')
+            swprintf_s(args->error_msg, 512,
+                       L"Failed to build Linux VHDX from ISO (0x%08X)", hr);
+        goto done;
+    }
+    args->vhdx_created = TRUE;
+
+    /* The Ubuntu ISO has its own bootable EFI files; if we leave image_path
+       set, hcs_vm.c attaches it at SCSI slot 1 alongside the installed
+       VHDX, and Hyper-V's UEFI firmware sometimes picks the ISO's
+       /EFI/BOOT/BOOTX64.EFI instead of ours. Detach the ISO from the
+       runtime VM — the installed VHDX is fully self-bootable. */
+    args->config.image_path[0] = L'\0';
+
+    /* ---- 2. NAT IP allocation (post-build; the rootfs uses DHCP via
+       NetworkManager so the IP doesn't need to be baked in at build time). ---- */
+    if (args->config.network_mode == NET_NAT && args->vm_index >= 0 && args->vm_index < g_vm_count) {
+        if (allocate_nat_ip(&g_vms[args->vm_index])) {
+            asb_log(L"Allocated NAT IP %S for new VM.", g_vms[args->vm_index].nat_ip);
+            save_vm_list();
+        }
+    }
 
     /* ---- 5. Network + endpoint (same as vhdx_create_thread:1114). ---- */
     if (args->config.network_mode != NET_NONE) {
@@ -1921,12 +2108,15 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             wcscpy_s(args->vhdx_dir, MAX_PATH, vhdx_dir);
             wcscpy_s(args->net_adapter, 256, inst->net_adapter);
 
-            asb_log(L"Building Linux VM \"%s\" (cloud image download may take several minutes on first use)...", cfg.name);
+            asb_log(L"Building Linux VM \"%s\" (direct ISO->VHDX, ~3 minutes)...", cfg.name);
             CloseHandle(CreateThread(NULL, 0, linux_create_thread, args, 0, NULL));
 
-            /* Wipe the plaintext password from cfg; the heap copy in args
-               keeps a copy for the worker thread's iso_create_resources_ubuntu
-               call (which also wipes after use). */
+            /* Wipe the plaintext password from the local cfg; the worker
+               thread has its own heap copy in args->config and wipes that
+               after use (run_iso_patch_ubuntu doesn't consume it today —
+               firstboot.sh uses a static test/test123 — but the field is
+               retained on the config for future password injection via
+               --stage manifest). */
             SecureZeroMemory(cfg.admin_pass, sizeof(cfg.admin_pass));
 
             if (g_state_cb) g_state_cb(vm_handle(inst), FALSE, g_state_ud);

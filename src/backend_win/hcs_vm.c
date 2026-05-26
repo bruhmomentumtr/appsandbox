@@ -889,7 +889,10 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
 
     /* Secure Boot — uses ApplySecureBootTemplate + SecureBootTemplateId
        inside the Uefi section. No BootThis — UEFI auto-discovers boot devices.
-       Skip when test_mode is enabled (required for test-signed drivers like VDD). */
+       Skip when test_mode is enabled (required for test-signed drivers like VDD).
+       Linux: temporarily disabled while debugging the direct-ISO->VHDX boot
+       flow (POC also ran with Skip). Once we confirm the produced VHDX boots,
+       restore the MS UEFI CA template (272e7447-...) for signed shim/grub. */
     secureboot_section[0] = L'\0';
     if (config->test_mode) {
         /* No Secure Boot — allows test-signed drivers to load */
@@ -899,8 +902,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             L",\"SecureBootTemplateId\":\"1734c6e8-3154-4dda-ba5f-a874cc483422\"");
     } else {
         wcscpy_s(secureboot_section, 512,
-            L",\"ApplySecureBootTemplate\":\"Apply\""
-            L",\"SecureBootTemplateId\":\"272e7447-90a4-4563-a4b9-8e4ab00526ce\"");
+            L",\"ApplySecureBootTemplate\":\"Skip\"");
     }
 
     /* VMGS + VMRS files — always created regardless of TPM/SecureBoot.
@@ -961,53 +963,18 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         L"\"RuntimeStateFilePath\":\"%s\""
         L"}", vmgs_esc, vmrs_esc);
 
-    /* VideoMonitor + BasicSession RDP pipe — Linux only.
-       Linux VMs use this as a debug view of the synthetic Hyper-V Video
-       adapter during early boot, before the IDD path comes up. The
-       MsRdpClient10 ActiveX in vm_display.c attaches to the named pipe.
-       Resolution 1024x768 because vmconnect's basic-session renderer
-       chokes on higher modes.
+    /* VideoMonitor is REQUIRED for all OSes — vmwp.exe crashes (0xC0000005)
+       without it. No ConnectionOptions/named pipe — IDD via agent is the
+       display path. (Matches master branch hcs_vm.c.) */
+    wcscpy_s(video_section, 1024,
+        L"\"VideoMonitor\":{"
+            L"\"HorizontalResolution\":1024,"
+            L"\"VerticalResolution\":768"
+        L"},");
 
-       Windows VMs deliberately omit this — the IDD path is the only
-       display we want for Windows, and the BasicSession pipe burns
-       host resources for no real benefit there. */
-    video_section[0] = L'\0';
-    if (!is_windows) {
-        wchar_t name_esc[MAX_PATH * 2];
-        wchar_t user_sid[128] = L"";
-        escape_json_path(config->name, name_esc, MAX_PATH * 2);
-        get_current_user_sid_string(user_sid, 128);
-        swprintf_s(video_section, 2048,
-            L"\"VideoMonitor\":{"
-                L"\"HorizontalResolution\":1024,"
-                L"\"VerticalResolution\":768,"
-                L"\"ConnectionOptions\":{"
-                    L"\"NamedPipe\":\"\\\\\\\\.\\\\pipe\\\\%s.BasicSession\","
-                    L"\"AccessSids\":[\"%s\"]"
-                L"}"
-            L"},",
-            name_esc, user_sid);
-    }
-
-    /* ComPorts — virtual COM1 wired to a named pipe, only for Linux guests.
-       Ubuntu cloud images already kernel-cmdline `console=tty1 console=ttyS0`,
-       so this captures the full boot log: kernel messages, dracut/initramfs,
-       systemd startup, cloud-init, setup.sh apt install — everything that
-       the basic-session video may not render (it sometimes goes stale once
-       the kernel switches video modes).
-
-       Read from the host with:  type \\.\pipe\<vm>.com1
-       (or any tool that connects to a Windows named pipe). */
+    /* ComPorts — no JSON block. com1 named pipe was a debug-time device
+       captured during subiquity install; not needed any more. */
     comports_section[0] = L'\0';
-    if (!is_windows) {
-        wchar_t name_esc[MAX_PATH * 2];
-        escape_json_path(config->name, name_esc, MAX_PATH * 2);
-        swprintf_s(comports_section, 512,
-            L"\"ComPorts\":{"
-                L"\"0\":{\"NamedPipe\":\"\\\\\\\\.\\\\pipe\\\\%s.com1\"}"
-            L"},",
-            name_esc);
-    }
 
     /* SecuritySettings with TPM — enabled for all Windows VMs.
        TPM does not block test-signed drivers; only Secure Boot does. */

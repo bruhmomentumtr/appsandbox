@@ -561,9 +561,13 @@ function updateStatusCell(td, vm) {
         className = 'status-building';
     } else if (vm.running && !vm.installComplete && !vm.isTemplate) {
         needsSpinner = true;
+        var defaultLabel;
+        if (vm.osType === 'macOS')      defaultLabel = 'Installing macOS ';
+        else if (vm.osType === 'Linux') defaultLabel = 'Installing Linux ';
+        else                            defaultLabel = 'Installing Windows ';
         label = (vm.installStatus && vm.installStatus.length > 0)
             ? (vm.installStatus + ' ')
-            : ((vm.osType === 'macOS' ? 'Installing macOS ' : 'Installing Windows '));
+            : defaultLabel;
         className = 'status-building';
     } else if (vm.running) {
         className = 'status-running';
