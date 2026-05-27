@@ -934,6 +934,129 @@ static int stage_grub_modules(wchar_t iso_letter, ext4_writer_t *ew)
 }
 
 /* ======================================================================
+ *  Stage <iso>:\pool\main\ + <iso>:\dists\ -> rootfs at
+ *  /opt/appsandbox/local-apt/. ~296 MiB and ~3000 files.
+ *
+ *  At first boot we write /etc/apt/sources.list.d/appsandbox-local.list
+ *  pointing at file:/opt/appsandbox/local-apt resolute main, then run
+ *  apt update + apt install — no network required for dkms +
+ *  build-essential + linux-headers-$KVER. Matches the f361def flow's
+ *  install-phase apt availability without needing subiquity.
+ * ====================================================================== */
+
+/* Recursively copy a host directory tree into the ext4 writer under a
+ * rootfs prefix. Used by stage_local_apt to dump pool/main + dists/.
+ *
+ *   host_dir:    Windows absolute path of the source dir (no trailing \)
+ *   rootfs_pref: Linux absolute path prefix (no trailing /), e.g.
+ *                "/opt/appsandbox/local-apt/pool"
+ *
+ * Creates intermediate dirs via ext4_writer_add_dir. Files staged with
+ * mode 0644, uid/gid 0. Returns total file count, or -1 on a fatal
+ * error opening the top-level dir. */
+static int u_copy_tree_to_ext4(const wchar_t *host_dir,
+                               const char    *rootfs_pref,
+                               ext4_writer_t *ew,
+                               int           *out_dir_count)
+{
+    wchar_t pattern[MAX_PATH];
+    swprintf(pattern, MAX_PATH, L"%s\\*", host_dir);
+    WIN32_FIND_DATAW fd;
+    HANDLE fh = FindFirstFileW(pattern, &fd);
+    if (fh == INVALID_HANDLE_VALUE) return -1;
+
+    int file_count = 0;
+    do {
+        if (fd.cFileName[0] == L'.' && (fd.cFileName[1] == L'\0' ||
+            (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0')))
+            continue;
+
+        wchar_t child_host[MAX_PATH];
+        swprintf(child_host, MAX_PATH, L"%s\\%s", host_dir, fd.cFileName);
+
+        char child_name_utf8[260];
+        WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1,
+                            child_name_utf8, sizeof(child_name_utf8), NULL, NULL);
+        char child_rootfs[1024];
+        snprintf(child_rootfs, sizeof(child_rootfs), "%s/%s",
+                 rootfs_pref, child_name_utf8);
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            ext4_writer_add_dir(ew, child_rootfs, 0755, 0, 0,
+                                (uint32_t)time(NULL));
+            if (out_dir_count) (*out_dir_count)++;
+            int sub = u_copy_tree_to_ext4(child_host, child_rootfs, ew, out_dir_count);
+            if (sub > 0) file_count += sub;
+        } else {
+            HANDLE mh = CreateFileW(child_host, GENERIC_READ, FILE_SHARE_READ,
+                                    NULL, OPEN_EXISTING,
+                                    FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+            if (mh == INVALID_HANDLE_VALUE) continue;
+            LARGE_INTEGER sz;
+            GetFileSizeEx(mh, &sz);
+            void *buf = malloc((size_t)sz.QuadPart);
+            DWORD br = 0;
+            if (buf && ReadFile(mh, buf, (DWORD)sz.QuadPart, &br, NULL) &&
+                br == sz.QuadPart) {
+                if (ext4_writer_add_file(ew, child_rootfs, 0644, 0, 0,
+                        (uint32_t)time(NULL), buf,
+                        (uint64_t)sz.QuadPart) == 0) file_count++;
+            }
+            free(buf);
+            CloseHandle(mh);
+        }
+    } while (FindNextFileW(fh, &fd));
+    FindClose(fh);
+    return file_count;
+}
+
+static int stage_local_apt(wchar_t iso_letter, ext4_writer_t *ew)
+{
+    /* Create the local-apt root + the two top-level subdirs we copy. */
+    ext4_mkdir_p(ew, "/opt/appsandbox/local-apt");
+    ext4_mkdir_p(ew, "/opt/appsandbox/local-apt/pool");
+    ext4_mkdir_p(ew, "/opt/appsandbox/local-apt/dists");
+
+    int total_files = 0, total_dirs = 0;
+
+    /* pool/main — the .deb blobs. ~3000 files, ~296 MiB on 26.04 daily. */
+    {
+        wchar_t src[MAX_PATH];
+        swprintf(src, MAX_PATH, L"%c:\\pool\\main", iso_letter);
+        if (GetFileAttributesW(src) != INVALID_FILE_ATTRIBUTES) {
+            ext4_mkdir_p(ew, "/opt/appsandbox/local-apt/pool/main");
+            int n = u_copy_tree_to_ext4(src, "/opt/appsandbox/local-apt/pool/main",
+                                        ew, &total_dirs);
+            if (n > 0) {
+                log_msg(L"local-apt: staged %d .deb file(s) from pool/main", n);
+                total_files += n;
+            }
+        } else {
+            log_msg(L"WARN: %s not present on ISO; firstboot DKMS will need internet", src);
+        }
+    }
+
+    /* dists/<release>/ — Release, Release.gpg, main/binary-amd64/Packages{,.gz} */
+    {
+        wchar_t src[MAX_PATH];
+        swprintf(src, MAX_PATH, L"%c:\\dists", iso_letter);
+        if (GetFileAttributesW(src) != INVALID_FILE_ATTRIBUTES) {
+            int n = u_copy_tree_to_ext4(src, "/opt/appsandbox/local-apt/dists",
+                                        ew, &total_dirs);
+            if (n > 0) {
+                log_msg(L"local-apt: staged %d dists/ metadata file(s)", n);
+                total_files += n;
+            }
+        } else {
+            log_msg(L"WARN: %s not present on ISO; apt update will fail", src);
+        }
+    }
+
+    log_msg(L"local-apt: %d files / %d dirs total", total_files, total_dirs);
+    return total_files;
+}
+
+/* ======================================================================
  *  First-boot service planting (runs grub-install + per-VM setup on
  *  first systemd boot, then disables itself).
  *
@@ -1102,13 +1225,58 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "    install -m 0644 \"$EXTRAS/modprobe.d-asb_drm.conf\" /etc/modprobe.d/asb_drm.conf \\\n"
         "      && echo \"OK: /etc/modprobe.d/asb_drm.conf\" || echo \"FAIL\"\n"
         "fi\n"
+        "# dxgkrnl auto-load: the repo has no modules-load.d-dxgkrnl.conf,\n"
+        "# so create one inline (matches f361def setup.sh line 2728). Without\n"
+        "# this, dxgkrnl loads once via STEP 16 modprobe but is gone after\n"
+        "# the STEP 99 reboot, silently breaking /dev/dxg + GPU-PV.\n"
+        "echo dxgkrnl > /etc/modules-load.d/dxgkrnl.conf \\\n"
+        "  && echo \"OK: /etc/modules-load.d/dxgkrnl.conf\" || echo \"FAIL\"\n"
+        "\n"
+        "# --- STEP 10.5: local-apt source + apt update (offline) ---\n"
+        "# At iso-patch time we copied the ISO's pool/main + dists/ to\n"
+        "# /opt/appsandbox/local-apt. Point apt at it before STEP 12 tries\n"
+        "# to install dkms + build-essential + linux-headers. With this,\n"
+        "# apt-get install needs ZERO internet. Matches the OLD flow's\n"
+        "# subiquity-install-phase apt availability.\n"
+        "echo \"==== STEP 10.5: local apt source ====\"\n"
+        "if [ -d /opt/appsandbox/local-apt/dists ]; then\n"
+        "    # Detect release codename from the staged Release file (avoids\n"
+        "    # hardcoding 'resolute' so 26.04+ point releases keep working).\n"
+        "    REL=$(ls /opt/appsandbox/local-apt/dists 2>/dev/null | head -1)\n"
+        "    if [ -n \"$REL\" ]; then\n"
+        "        # [trusted=yes] because the staged Release.gpg is signed by\n"
+        "        # a key not in the guest's apt keyring; we trust it because\n"
+        "        # iso-patch put it there from the user's own ISO.\n"
+        "        echo \"deb [trusted=yes] file:/opt/appsandbox/local-apt $REL main\" \\\n"
+        "            > /etc/apt/sources.list.d/appsandbox-local.list \\\n"
+        "          && echo \"OK: appsandbox-local.list for release '$REL'\" || echo \"FAIL\"\n"
+        "        # Single apt update that ONLY scans local sources. We pass\n"
+        "        # -o Dir::Etc::sourcelist= to force apt to read just our\n"
+        "        # local list (skips ubuntu.sources, which is what would\n"
+        "        # try to talk to archive.ubuntu.com on first boot).\n"
+        "        apt-get update \\\n"
+        "            -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/appsandbox-local.list \\\n"
+        "            -o Dir::Etc::sourceparts=- 2>&1 | tail -5 \\\n"
+        "          && echo \"OK: apt update (local)\" || echo \"WARN: apt update local\"\n"
+        "    else\n"
+        "        echo \"WARN: /opt/appsandbox/local-apt/dists empty\"\n"
+        "    fi\n"
+        "else\n"
+        "    echo \"SKIP STEP 10.5: no /opt/appsandbox/local-apt (iso-patch didn't stage it)\"\n"
+        "fi\n"
         "\n"
         "# --- STEP 11: install prebuilt kernel modules + depmod ---\n"
+        "# TEMP: fast-path disabled — set SKIP_PREBUILT_KO=0 to re-enable.\n"
+        "# When 1, this step is a no-op so STEP 12 (DKMS) always runs and\n"
+        "# we can time how long the DKMS build actually takes.\n"
+        "SKIP_PREBUILT_KO=1\n"
         "echo \"==== STEP 11: kernel modules ====\"\n"
         "TGT_KVER=$(uname -r)\n"
         "echo \"running kernel: $TGT_KVER\"\n"
         "MOD_SRC=\"$EXTRAS/modules/$TGT_KVER\"\n"
-        "if [ -d \"$MOD_SRC\" ]; then\n"
+        "if [ \"$SKIP_PREBUILT_KO\" = \"1\" ]; then\n"
+        "    echo \"SKIP STEP 11: prebuilt fast-path disabled (forcing DKMS)\"\n"
+        "elif [ -d \"$MOD_SRC\" ]; then\n"
         "    MOD_DST=/lib/modules/$TGT_KVER/extra\n"
         "    install -d \"$MOD_DST\"\n"
         "    for ko in \"$MOD_SRC\"/*.ko; do\n"
@@ -1122,37 +1290,60 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "    echo \"no prebuilt modules for $TGT_KVER (DKMS fallback in STEP 12)\"\n"
         "fi\n"
         "\n"
-        "# --- STEP 12: DKMS fallback if prebuilt .ko missing for this kernel ---\n"
-        "echo \"==== STEP 12: DKMS fallback ====\"\n"
+        "# --- STEP 12: DKMS build if prebuilt .ko missing for this kernel ---\n"
+        "# Single-kernel scenario: the ISO ships exactly one kernel\n"
+        "# ($TGT_KVER, e.g. 7.0.0-14-generic) and pool/main has the matching\n"
+        "# linux-headers-$TGT_KVER.deb, so we only build for $TGT_KVER.\n"
+        "# No need for the old flow's `for K in $(ls /lib/modules); do ...`\n"
+        "# iteration — that was defensive against subiquity's mid-install\n"
+        "# kernel bump, which doesn't apply to direct ISO->VHDX.\n"
+        "echo \"==== STEP 12: DKMS build ====\"\n"
+        "DKMS_T0=$SECONDS\n"
         "need_dkms=0\n"
-        "[ -f \"/lib/modules/$TGT_KVER/extra/asb_drm.ko\" ] || need_dkms=1\n"
-        "[ -f \"/lib/modules/$TGT_KVER/extra/dxgkrnl.ko\" ] || need_dkms=1\n"
+        "[ -f \"/lib/modules/$TGT_KVER/extra/asb_drm.ko\"  ] || \\\n"
+        "  [ -f \"/lib/modules/$TGT_KVER/updates/asb_drm.ko\"  ] || \\\n"
+        "  [ -f \"/lib/modules/$TGT_KVER/updates/dkms/asb_drm.ko\" ] || need_dkms=1\n"
+        "[ -f \"/lib/modules/$TGT_KVER/extra/dxgkrnl.ko\" ] || \\\n"
+        "  [ -f \"/lib/modules/$TGT_KVER/updates/dxgkrnl/dxgkrnl.ko\" ] || \\\n"
+        "  [ -f \"/lib/modules/$TGT_KVER/updates/dkms/dxgkrnl.ko\" ] || need_dkms=1\n"
         "if [ \"$need_dkms\" = \"1\" ] && [ -d \"$EXTRAS/asb_drm-src\" -o -d \"$EXTRAS/dxgkrnl-src\" ]; then\n"
         "    if ! command -v dkms >/dev/null 2>&1; then\n"
-        "        echo \"installing dkms + build deps (may take a few min)...\"\n"
+        "        echo \"installing dkms + build-essential + linux-headers-$TGT_KVER from local apt...\"\n"
         "        DEBIAN_FRONTEND=noninteractive apt-get install -y \\\n"
         "            dkms build-essential linux-headers-$TGT_KVER 2>&1 \\\n"
-        "          | tail -5 || echo \"WARN: apt install failed\"\n"
+        "          | tail -10 \\\n"
+        "          && echo \"OK: apt install build deps\" \\\n"
+        "          || echo \"FAIL: apt install build deps\"\n"
         "    fi\n"
         "    for mod in asb_drm dxgkrnl; do\n"
         "        SRC=\"$EXTRAS/$mod-src\"\n"
-        "        [ -d \"$SRC\" ] || continue\n"
-        "        # dkms.conf has PACKAGE_VERSION; read it.\n"
+        "        [ -d \"$SRC\" ] || { echo \"SKIP $mod: no $SRC\"; continue; }\n"
         "        ver=$(awk -F= '/^PACKAGE_VERSION=/{gsub(/\"/,\"\",$2); print $2}' \"$SRC/dkms.conf\" 2>/dev/null)\n"
         "        [ -z \"$ver\" ] && ver=1.0.0\n"
         "        DEST=/usr/src/$mod-$ver\n"
         "        rm -rf \"$DEST\"\n"
         "        cp -r \"$SRC\" \"$DEST\"\n"
-        "        dkms add -m $mod -v $ver 2>&1 || true\n"
-        "        dkms build -m $mod -v $ver -k \"$TGT_KVER\" 2>&1 | tail -3 \\\n"
-        "          && echo \"OK: dkms build $mod\" || echo \"FAIL: dkms build $mod\"\n"
-        "        dkms install -m $mod -v $ver -k \"$TGT_KVER\" 2>&1 \\\n"
+        "        dkms add -m $mod -v $ver 2>&1 | tail -2 || true\n"
+        "        if dkms build -m $mod -v $ver -k \"$TGT_KVER\" 2>&1 | tail -5; then\n"
+        "            echo \"OK: dkms build $mod\"\n"
+        "        else\n"
+        "            echo \"FAIL: dkms build $mod — dumping make.log:\"\n"
+        "            # Old flow's trick (f361def line ~2447): dump the build\n"
+        "            # log to the journal/console so we don't have to ssh in to\n"
+        "            # debug. Truncated to keep com1 output usable.\n"
+        "            for log in $(find /var/lib/dkms -name make.log 2>/dev/null); do\n"
+        "                echo \"---- $log (last 40 lines) ----\"\n"
+        "                tail -40 \"$log\"\n"
+        "            done\n"
+        "        fi\n"
+        "        dkms install -m $mod -v $ver -k \"$TGT_KVER\" 2>&1 | tail -3 \\\n"
         "          && echo \"OK: dkms install $mod\" || echo \"FAIL: dkms install $mod\"\n"
         "    done\n"
-        "    depmod -a \"$TGT_KVER\" || true\n"
+        "    depmod -a \"$TGT_KVER\" && echo \"OK: depmod\" || echo \"FAIL: depmod\"\n"
         "else\n"
         "    [ \"$need_dkms\" = \"0\" ] && echo \"prebuilt .ko present, DKMS not needed\"\n"
         "fi\n"
+        "echo \"==== STEP 12 finished in $((SECONDS - DKMS_T0)) s ====\"\n"
         "\n"
         "# --- STEP 13: wsl-mesa (optional GPU acceleration tarball) ---\n"
         "echo \"==== STEP 13: wsl-mesa ====\"\n"
@@ -1249,10 +1440,81 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "power-button-action='nothing'\n"
         "EOF\n"
         "command -v dconf >/dev/null 2>&1 && dconf update 2>&1 || echo \"SKIP dconf update\"\n"
+        "# Kernel cmdline drop-in: suppress efifb/simplefb fbdev paths so\n"
+        "# asb_drm is the only DRM device on subsequent boots. Matches the\n"
+        "# old flow's late-commands grub.d snippet (f361def line ~2454).\n"
+        "# NOTE this doesn't kill simpledrm on Hyper-V Gen 2 by itself —\n"
+        "# asb-evict-simpledrm.service handles that — but it stops legacy\n"
+        "# fbdev paths from also binding.\n"
+        "install -d /etc/default/grub.d\n"
+        "printf 'GRUB_CMDLINE_LINUX_DEFAULT=\"$GRUB_CMDLINE_LINUX_DEFAULT video=efifb:off video=simplefb:off\"\\n' \\\n"
+        "    > /etc/default/grub.d/99-appsandbox-no-efifb.cfg\n"
+        "command -v update-grub >/dev/null 2>&1 && update-grub 2>&1 | tail -3 \\\n"
+        "  && echo \"OK: update-grub with video=*:off cmdline\" || echo \"SKIP update-grub\"\n"
         "# Load asb_drm + dxgkrnl now so they're live on the next boot (they're\n"
         "# already in modules-load.d so subsequent boots auto-load).\n"
         "modprobe asb_drm 2>&1 || echo \"WARN: modprobe asb_drm\"\n"
         "modprobe dxgkrnl 2>&1 || echo \"WARN: modprobe dxgkrnl\"\n"
+        "\n"
+        "# --- STEP 17: end-of-firstboot verification summary ---\n"
+        "# At-a-glance OK/MISSING for every critical artifact so the com1\n"
+        "# capture tells you immediately whether the VM will work after the\n"
+        "# STEP 99 reboot — no need to grep through scattered WARN lines.\n"
+        "echo \"==== STEP 17: verification ====\"\n"
+        "set +x\n"
+        "_check_file() { if [ -e \"$1\" ]; then echo \"  [OK]      $1\"; else echo \"  [MISSING] $1\"; fi; }\n"
+        "_check_glob() { if compgen -G \"$1\" >/dev/null 2>&1; then echo \"  [OK]      $1\"; else echo \"  [MISSING] $1\"; fi; }\n"
+        "_check_unit_enabled() {\n"
+        "    state=$(systemctl is-enabled \"$1\" 2>&1)\n"
+        "    echo \"  [$state] $1\"\n"
+        "}\n"
+        "echo \"-- agent binaries (in /usr/local/bin/) --\"\n"
+        "for b in appsandbox-agent appsandbox-audio appsandbox-clipboard \\\n"
+        "         appsandbox-display appsandbox-input; do\n"
+        "    _check_file /usr/local/bin/$b\n"
+        "done\n"
+        "echo \"-- system unit files --\"\n"
+        "for u in appsandbox-agent.service appsandbox-audio.service \\\n"
+        "         appsandbox-display.service appsandbox-input.service \\\n"
+        "         asb-evict-simpledrm.service; do\n"
+        "    _check_file /etc/systemd/system/$u\n"
+        "done\n"
+        "_check_file /etc/systemd/user/appsandbox-clipboard.service\n"
+        "echo \"-- unit enablement --\"\n"
+        "for u in appsandbox-agent.service appsandbox-audio.service \\\n"
+        "         appsandbox-display.service appsandbox-input.service \\\n"
+        "         asb-evict-simpledrm.service; do\n"
+        "    _check_unit_enabled $u\n"
+        "done\n"
+        "echo \"-- modules-load.d + modprobe.d --\"\n"
+        "_check_file /etc/modules-load.d/asb_drm.conf\n"
+        "_check_file /etc/modules-load.d/dxgkrnl.conf\n"
+        "_check_file /etc/modules-load.d/snd-aloop.conf\n"
+        "_check_file /etc/modprobe.d/asb_drm.conf\n"
+        "echo \"-- kernel modules for $TGT_KVER --\"\n"
+        "_check_glob \"/lib/modules/$TGT_KVER/extra/asb_drm.ko*\"\n"
+        "_check_glob \"/lib/modules/$TGT_KVER/updates/dkms/asb_drm.ko*\"\n"
+        "_check_glob \"/lib/modules/$TGT_KVER/updates/asb_drm.ko*\"\n"
+        "_check_glob \"/lib/modules/$TGT_KVER/extra/dxgkrnl.ko*\"\n"
+        "_check_glob \"/lib/modules/$TGT_KVER/updates/dkms/dxgkrnl.ko*\"\n"
+        "_check_glob \"/lib/modules/$TGT_KVER/updates/dxgkrnl/dxgkrnl.ko*\"\n"
+        "echo \"-- currently loaded modules --\"\n"
+        "lsmod 2>/dev/null | grep -E '^(asb_drm|dxgkrnl|snd_aloop)' | awk '{print \"  [LOADED]  \"$1}' || true\n"
+        "echo \"-- /dev/dri + /dev/dxg + /dev/uinput --\"\n"
+        "_check_file /dev/dri/card0\n"
+        "_check_file /dev/dri/card1\n"
+        "_check_file /dev/dxg\n"
+        "_check_file /dev/uinput\n"
+        "echo \"-- ldconfig + Vulkan ICD --\"\n"
+        "_check_file /etc/ld.so.conf.d/appsandbox-wsl-deps.conf\n"
+        "_check_file /etc/ld.so.conf.d/wsl-mesa.conf\n"
+        "_check_file /etc/vulkan/icd.d/dzn_icd.x86_64.json\n"
+        "echo \"-- grub cmdline drop-in --\"\n"
+        "_check_file /etc/default/grub.d/99-appsandbox-no-efifb.cfg\n"
+        "echo \"-- local apt source --\"\n"
+        "_check_file /etc/apt/sources.list.d/appsandbox-local.list\n"
+        "_check_glob '/opt/appsandbox/local-apt/pool/main/*'\n"
+        "set -x\n"
         "\n"
         "# --- STEP 99: Mark done + reboot ---\n"
         "echo \"==== STEP 99: mark done + reboot ====\"\n"
@@ -1675,8 +1937,16 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
     log_msg(L"Installing grub modules + shim from ISO .debs...");
     /* "Building" — not "Staging". This is part of the vanilla Ubuntu
        install; the AppSandbox-extras staging phase is later (Step 10). */
-    log_progress(82, L"Installing grub modules");
+    log_progress(78, L"Installing grub modules");
     stage_grub_modules(iso_drive, ew);
+
+    /* ---- Step 7b: Stage the ISO's pool/main + dists/ into rootfs so
+       first-boot apt operations (dkms + build-essential +
+       linux-headers-$(uname -r)) work offline without needing internet
+       or a fresh apt update against archive.ubuntu.com. ~296 MiB. ---- */
+    log_msg(L"Staging ISO pool/main + dists/ as a local apt source...");
+    log_progress(80, L"Building local apt mirror");
+    stage_local_apt(iso_drive, ew);
 
     /* ---- Step 8: Bootstrap /boot/grub/grub.cfg. ---- */
     {
