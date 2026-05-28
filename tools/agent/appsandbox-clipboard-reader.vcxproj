@@ -124,7 +124,8 @@
       <AdditionalDependencies>ws2_32.lib;user32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources"</Command>
+      <Command>if not exist "$(SolutionDir)release\resources\" mkdir "$(SolutionDir)release\resources\"
+xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources\"</Command>
       <Message>Copying appsandbox-clipboard-reader.exe to release\resources\</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
@@ -148,7 +149,8 @@
       <AdditionalDependencies>ws2_32.lib;user32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources"</Command>
+      <Command>if not exist "$(SolutionDir)release\resources\" mkdir "$(SolutionDir)release\resources\"
+xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources\"</Command>
       <Message>Copying appsandbox-clipboard-reader.exe to release\resources\</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>

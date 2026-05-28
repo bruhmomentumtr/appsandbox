@@ -237,6 +237,18 @@ struct VmDisplayIdd {
     BOOL           mouse_in;        /* TRUE while cursor is inside the render area */
     BOOL           tracking;        /* TrackMouseEvent active */
 
+    /* Keyboard hotkey handling */
+    wchar_t        vhdx_path[MAX_PATH]; /* copy of vm->vhdx_path for settings file */
+    volatile BOOL  transmit_hotkeys; /* TRUE = capture host hotkeys + send to guest */
+    volatile BOOL  input_focused;    /* TRUE while our top-level window is active */
+    HHOOK          kbd_hook;          /* WH_KEYBOARD_LL handle, NULL when not installed */
+    /* Held-key tracking (window-thread only, no lock). Indexed by virtual key.
+       held_down[vk]=1 means we forwarded a down with no matching up yet; the
+       saved scan/ext let us synthesize an accurate up when flushing. */
+    BYTE           held_down[256];
+    BYTE           held_scan[256];
+    BYTE           held_ext[256];
+
     /* Guest cursor */
     HCURSOR        guest_cursor;    /* current cursor created from guest bitmap */
     UINT32         cursor_shape_id; /* tracks which shape is current */
@@ -273,7 +285,8 @@ static const wchar_t *IDD_RENDER_CLASS  = L"AppSandboxIddRender";
 static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 
 /* System menu command IDs — must be < 0xF000 and have low 4 bits clear */
-#define IDM_AUDIO_MUTE  0x1000
+#define IDM_AUDIO_MUTE     0x1000
+#define IDM_XMIT_HOTKEYS   0x1010
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 
@@ -497,6 +510,171 @@ static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT3
         const wchar_t *name = type < 4 ? type_names[type] : L"?";
         idd_log(d, L"INPUT %s p1=%u p2=%u p3=%u (#%u)", name, p1, p2, p3, g_input_send_count);
     }
+}
+
+/* ==================================================================
+ * Per-VM display settings (display_settings.json beside disk.vhdx)
+ *
+ * Mirrors the vm_state.json pattern in asb_core.c but is owned entirely
+ * by the IDD display: the file is created lazily the first time a VM's
+ * display opens, so both new and pre-existing VMs get one on demand.
+ * ================================================================== */
+
+static void idd_display_settings_path(const wchar_t *vhdx_path, wchar_t *out, size_t out_chars)
+{
+    wchar_t dir[MAX_PATH];
+    const wchar_t *last_slash;
+    wcscpy_s(dir, MAX_PATH, vhdx_path);
+    last_slash = wcsrchr(dir, L'\\');
+    if (last_slash) dir[last_slash - dir] = L'\0';
+    swprintf_s(out, out_chars, L"%s\\display_settings.json", dir);
+}
+
+static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_hotkeys)
+{
+    wchar_t path[MAX_PATH];
+    FILE *f;
+    if (!vhdx_path || vhdx_path[0] == L'\0') return;
+    idd_display_settings_path(vhdx_path, path, MAX_PATH);
+    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
+    fprintf(f, "{\"transmitKeyboardHotkeys\":%d}\n", transmit_hotkeys ? 1 : 0);
+    fclose(f);
+}
+
+/* Read the persisted setting; if the file is absent, create it with the
+   default (off) and return FALSE. Returns the transmit-hotkeys value. */
+static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path)
+{
+    wchar_t path[MAX_PATH];
+    FILE *f;
+    char buf[256];
+    BOOL transmit = FALSE;
+
+    if (!vhdx_path || vhdx_path[0] == L'\0') return FALSE;
+    idd_display_settings_path(vhdx_path, path, MAX_PATH);
+
+    if (_wfopen_s(&f, path, L"r") != 0 || !f) {
+        /* Lazy creation: file doesn't exist yet (new or pre-existing VM). */
+        idd_display_settings_save(vhdx_path, FALSE);
+        return FALSE;
+    }
+    if (fgets(buf, sizeof(buf), f)) {
+        if (strstr(buf, "\"transmitKeyboardHotkeys\":1"))
+            transmit = TRUE;
+    }
+    fclose(f);
+    return transmit;
+}
+
+/* ==================================================================
+ * Keyboard hotkey capture
+ * ================================================================== */
+
+/* Maximal reserved-hotkey set: keys the host shell would normally consume.
+   In Default mode these are withheld from the guest (host handles them); in
+   Transmit mode they are captured and forwarded to the guest instead.
+   alt_down must reflect whether Alt is currently held (LLKHF_ALTDOWN from the
+   low-level hook, or GetKeyState(VK_MENU) from the wndproc path).
+   Note: Ctrl+Alt+Del and Win+L are secure (SAS) sequences that no user-mode
+   hook can intercept — they always reach the host. */
+static BOOL idd_is_reserved_hotkey(DWORD vk, BOOL alt_down)
+{
+    switch (vk) {
+    case VK_LWIN:
+    case VK_RWIN:
+    case VK_SNAPSHOT:   /* PrintScreen */
+    case VK_APPS:       /* Menu / context key */
+        return TRUE;
+    case VK_TAB:
+        return alt_down;                                  /* Alt+Tab */
+    case VK_ESCAPE:
+        /* Alt+Esc / Ctrl+Esc. GetAsyncKeyState reads real-time physical state,
+           which is reliable both in the wndproc and inside the low-level hook
+           (where the synchronized GetKeyState value may not be updated yet). */
+        return alt_down || (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    default:
+        return FALSE;
+    }
+}
+
+/* Forward a key event to the guest and track held state so a later focus
+   change can release anything still down. Runs on the window thread only. */
+static void idd_forward_key(VmDisplayIdd *d, DWORD vk, DWORD scan, BOOL ext, BOOL up)
+{
+    UINT32 flags = 0;
+    if (ext) flags |= 1;
+    if (up)  flags |= 2;
+    send_input(d, INPUT_KEY, vk, scan, flags);
+
+    if (vk < 256) {
+        if (up) {
+            d->held_down[vk] = 0;
+        } else {
+            d->held_down[vk] = 1;
+            d->held_scan[vk] = (BYTE)scan;
+            d->held_ext[vk]  = (BYTE)(ext ? 1 : 0);
+        }
+    }
+}
+
+/* Send key-up for every key we believe is still held in the guest, then
+   clear tracking. Called when our window loses activation, when Transmit
+   mode is turned off, and on teardown — this is the core stuck-key fix. */
+static void idd_flush_held_keys(VmDisplayIdd *d)
+{
+    int vk;
+    for (vk = 0; vk < 256; vk++) {
+        if (d->held_down[vk]) {
+            UINT32 flags = 2 | (d->held_ext[vk] ? 1 : 0);
+            send_input(d, INPUT_KEY, (UINT32)vk, d->held_scan[vk], flags);
+            d->held_down[vk] = 0;
+        }
+    }
+}
+
+/* Thread-local owner: a WH_KEYBOARD_LL callback runs on the thread that
+   installed it (our window thread), so this resolves each display's context
+   without a global registry, keeping multiple displays independent. */
+static __declspec(thread) VmDisplayIdd *t_hook_display;
+
+static LRESULT CALLBACK idd_ll_keyboard_proc(int code, WPARAM wp, LPARAM lp)
+{
+    VmDisplayIdd *d = t_hook_display;
+
+    if (code == HC_ACTION && d && !d->stop &&
+        d->input_focused && d->transmit_hotkeys) {
+        const KBDLLHOOKSTRUCT *k = (const KBDLLHOOKSTRUCT *)lp;
+        BOOL up  = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
+        BOOL alt = (k->flags & LLKHF_ALTDOWN) != 0;
+        if (idd_is_reserved_hotkey(k->vkCode, alt)) {
+            idd_forward_key(d, k->vkCode, k->scanCode,
+                            (k->flags & LLKHF_EXTENDED) != 0, up);
+            return 1;  /* swallow so the host shell doesn't act on it */
+        }
+    }
+    return CallNextHookEx(NULL, code, wp, lp);
+}
+
+static void idd_install_kbd_hook(VmDisplayIdd *d)
+{
+    if (d->kbd_hook) return;
+    t_hook_display = d;
+    d->kbd_hook = SetWindowsHookExW(WH_KEYBOARD_LL, idd_ll_keyboard_proc,
+                                     d->hInstance, 0);
+    if (!d->kbd_hook)
+        idd_log(d, L"Hotkey hook install failed (err %lu).", GetLastError());
+    else
+        idd_log(d, L"Hotkey capture enabled.");
+}
+
+static void idd_remove_kbd_hook(VmDisplayIdd *d)
+{
+    if (d->kbd_hook) {
+        UnhookWindowsHookEx(d->kbd_hook);
+        d->kbd_hook = NULL;
+        idd_log(d, L"Hotkey capture disabled.");
+    }
+    t_hook_display = NULL;
 }
 
 /* Compute letterboxed/pillarboxed viewport within client rect */
@@ -1676,12 +1854,15 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         DwmSetWindowAttribute(d->hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
     }
 
-    /* Add "Mute audio" toggle to the system menu (right-click title bar) */
+    /* Add toggles to the system menu (right-click title bar) */
     {
         HMENU sysmenu = GetSystemMenu(d->hwnd, FALSE);
         if (sysmenu) {
             AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
+            AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
+            CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
+                          MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
         }
     }
 
@@ -1766,6 +1947,11 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     /* Start a present timer for steady rendering */
     SetTimer(d->hwnd, IDT_PRESENT, PRESENT_MS, NULL);
 
+    /* Install the hotkey hook on this (message-pumping) thread if the
+       persisted setting has Transmit mode enabled. */
+    if (d->transmit_hotkeys)
+        idd_install_kbd_hook(d);
+
     /* Message pump */
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
@@ -1810,6 +1996,26 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             idd_log(d, d->audio_muted ? L"Audio muted." : L"Audio unmuted.");
             return 0;
         }
+        if (d && (wp & 0xFFF0) == IDM_XMIT_HOTKEYS) {
+            HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
+            d->transmit_hotkeys = !d->transmit_hotkeys;
+            if (sysmenu) {
+                CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
+                              MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
+            }
+            if (d->transmit_hotkeys) {
+                idd_install_kbd_hook(d);
+            } else {
+                idd_remove_kbd_hook(d);
+                /* Release anything the guest may be holding from this mode. */
+                idd_flush_held_keys(d);
+            }
+            idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys);
+            idd_log(d, d->transmit_hotkeys
+                        ? L"Transmit Keyboard Hotkeys: ON."
+                        : L"Transmit Keyboard Hotkeys: OFF.");
+            return 0;
+        }
         break;
 
     case WM_CLOSE:
@@ -1817,6 +2023,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             BOOL user_initiated = d->open;
 
             RemoveClipboardFormatListener(hwnd);
+
+            /* Remove the hotkey hook and release any keys still held in the
+               guest before tearing the window down. */
+            idd_remove_kbd_hook(d);
+            idd_flush_held_keys(d);
 
             /* Stop recv threads */
             d->stop = TRUE;
@@ -1872,6 +2083,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_PRESENT);
+        if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
         if (d) d->hwnd = NULL;
         PostQuitMessage(0);
         return 0;
@@ -1950,6 +2162,19 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             vm_clipboard_set_sync_enabled(d->clipboard, FALSE);
         break;
 
+    /* Top-level activation gates keyboard forwarding. Tracking activation
+       (not WM_KILLFOCUS) is correct because focus moves between this window
+       and its render child without losing activation. Losing activation —
+       e.g. the user clicks another window or Alt+Tabs away with a key held —
+       flushes held keys so nothing sticks down in the guest. */
+    case WM_ACTIVATE:
+        if (d) {
+            d->input_focused = (LOWORD(wp) != WA_INACTIVE);
+            if (!d->input_focused)
+                idd_flush_held_keys(d);
+        }
+        break;
+
     case WM_ERASEBKGND:
         return 1;  /* We handle all painting via D3D11 */
 
@@ -2025,23 +2250,27 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d && d->mouse_in) send_input(d, INPUT_MOUSE_WHEEL, (UINT32)(INT32)GET_WHEEL_DELTA_WPARAM(wp), 0, 0);
         return 0;
 
-    /* ---- Keyboard input forwarding (only when mouse is in render area) ---- */
+    /* ---- Keyboard input forwarding (gated on window activation) ----
+       In Transmit mode reserved hotkeys are captured by the low-level hook
+       and never reach here. The mode check below covers Default mode: a
+       reserved hotkey is neither forwarded to the guest nor consumed — it
+       falls through to DefWindowProc so the host handles it normally (this
+       is what avoids the old stuck-key bug). Normal keys are forwarded while
+       the window is the active foreground window. */
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
-    {
-        UINT32 flags = 0;
-        UINT32 scan = (UINT32)((lp >> 16) & 0xFF);
-        if (lp & (1 << 24)) flags |= 1;  /* extended key */
-        if (d && d->mouse_in) send_input(d, INPUT_KEY, (UINT32)wp, scan, flags);
-        return 0;
-    }
     case WM_KEYUP:
     case WM_SYSKEYUP:
     {
-        UINT32 flags = 2;  /* key up */
         UINT32 scan = (UINT32)((lp >> 16) & 0xFF);
-        if (lp & (1 << 24)) flags |= 1;  /* extended key */
-        if (d && d->mouse_in) send_input(d, INPUT_KEY, (UINT32)wp, scan, flags);
+        BOOL ext = (lp & (1 << 24)) != 0;
+        BOOL up  = (msg == WM_KEYUP || msg == WM_SYSKEYUP);
+        if (!d) break;
+        if (!d->transmit_hotkeys &&
+            idd_is_reserved_hotkey((DWORD)wp, (GetKeyState(VK_MENU) & 0x8000) != 0))
+            break;  /* Default mode: let the host handle this hotkey. */
+        if (d->input_focused)
+            idd_forward_key(d, (DWORD)wp, scan, ext, up);
         return 0;
     }
     }
@@ -2067,6 +2296,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
 
     d->vm           = vm;
     wcscpy_s(d->vm_name, 256, vm->name);
+    wcscpy_s(d->vhdx_path, MAX_PATH, vm->vhdx_path);
     d->runtime_id   = vm->runtime_id;
     wcscpy_s(d->os_type, 32, vm->os_type);
     d->hInstance    = hInstance;
@@ -2076,6 +2306,11 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->input_socket       = INVALID_SOCKET;
     d->audio_socket       = INVALID_SOCKET;
     d->clipboard          = NULL;
+
+    /* Load the per-VM display setting, creating display_settings.json with
+       the default (off) if this VM doesn't have one yet. The hook itself is
+       installed later, on the window thread, once the window exists. */
+    d->transmit_hotkeys = idd_display_settings_load_or_create(vm->vhdx_path);
 
     /* Initialize frame buffer at default resolution */
     d->frame_width  = DEFAULT_WIDTH;
