@@ -2254,7 +2254,7 @@ cleanup:
 /* Public-ish wrapper: hash a wide-char password into glibc $6$ format.
    Generates a fresh random 16-char salt. Wipes the UTF-8 conversion of the
    password from memory after use. Returns TRUE on success. */
-static BOOL unix_password_hash(const wchar_t *plain, char *hash_out, size_t hash_out_size)
+BOOL unix_password_hash(const wchar_t *plain, char *hash_out, size_t hash_out_size)
 {
     char utf8[512];
     int  utf8_len;
@@ -2961,18 +2961,49 @@ static int copy_dir_recursive(const wchar_t *src_dir, const wchar_t *dst_dir)
  *     through dist/.
  *
  *   - wsl-deps .so libs: prefetched into C:\ProgramData\AppSandbox\wsl-deps\
- *     by `tools/wsl-deps/fetch-wsl-deps.ps1` (see tools/wsl-deps/README.md).
+ *     by `iso-patch.exe --prefetch-wsl-deps` (called automatically from
+ *     linux_create_thread when the cache is empty). C-only — no PowerShell.
  */
 void stage_linux_agent_and_extras(const wchar_t *staging,
                                   const wchar_t *res_dir,
                                   BOOL ssh_enabled)
+{
+    wchar_t extras[MAX_PATH];
+
+    (void)res_dir;       /* unused — no host-side resource lookups any more */
+    (void)ssh_enabled;   /* SSH packaging handled separately in firstboot */
+
+    /* Direct-stage model: linux_create_thread runs three iso-patch
+     * prefetch modes that already wrote into <staging>\extras\ — agent
+     * source from GitHub, build-dep .debs from archive.ubuntu.com, and
+     * wsl-deps .so files from the Microsoft NuGet feed. This function
+     * just sanity-checks that the directory exists and logs what's
+     * present; nothing more to stage on the host side. */
+
+    swprintf_s(extras, MAX_PATH, L"%s\\extras", staging);
+    if (GetFileAttributesW(extras) == INVALID_FILE_ATTRIBUTES) {
+        ui_log(L"WARN: %s\\extras not present — prefetches all failed?", staging);
+        return;
+    }
+    ui_log(L"Staging Linux extras: prefetches populated %s\\extras", staging);
+}
+
+/* The old find_repo_root + dual-source (res_dir / repo) path is gone.
+ * Keep the original stage_linux_agent_and_extras body below as a giant
+ * dead block in case we ever need to look at it — followed by an early
+ * return. Actually, just delete it: the function body above is the
+ * whole function now. */
+#if 0
+static void DEAD_stage_linux_agent_and_extras_old(const wchar_t *staging,
+                                                   const wchar_t *res_dir,
+                                                   BOOL ssh_enabled)
 {
     wchar_t extras[MAX_PATH], src[MAX_PATH], dst[MAX_PATH];
     wchar_t repo[MAX_PATH];
     BOOL have_repo;
     int i;
 
-    (void)ssh_enabled;  /* SSH packaging is autoinstall-side; nothing to stage */
+    (void)ssh_enabled;
 
     have_repo = find_repo_root(repo, MAX_PATH);
     if (have_repo)
@@ -2983,70 +3014,92 @@ void stage_linux_agent_and_extras(const wchar_t *staging,
     swprintf_s(extras, MAX_PATH, L"%s\\extras", staging);
     CreateDirectoryW(extras, NULL);
 
-    /* --- 1. Agent ELFs (5 of them; no separate clipboard-reader on Linux). --- */
+    /* --- 1. Agent source is NOT staged on the host. Guest firstboot
+     *  curls a tarball of tools/linux/agent/ from GitHub
+     *  (jamesstringer90/appsandbox, wip-linux-vm-support branch) and
+     *  builds against the dev headers in local-apt-extras (section 2).
+     *
+     *  Rationale: a shipped AppSandbox.exe won't have the repo source
+     *  tree alongside it (find_repo_root would return FALSE in
+     *  production). Source-of-truth lives in this repo on GitHub, the
+     *  VM pulls it directly at firstboot. Internet at first boot is
+     *  fine — the host can ensure VMs are wired up. */
+
+    /* --- 2. apt-build-deps cache: the .deb closure needed to apt-install
+     *  the dev headers (libasound2-dev, libxcb1-dev, libxcb-xfixes0-dev,
+     *  libdrm-dev, pkg-config + transitive deps) used by the agent build.
+     *  Populated by asb_core.c::ensure_apt_build_deps_cached before this
+     *  staging step runs, keyed by ISO codename + kernel version.
+     *
+     *  We copy the entire <ProgramData>\AppSandbox\apt-build-deps\
+     *  <codename>\<kver>\ tree (Packages + .closure.json + *.deb) into
+     *  staging/extras/local-apt-extras/. Guest firstboot writes a
+     *  file:// apt source pointing at that dir.
+     *
+     *  Note: we don't yet have the codename/kver in this function's
+     *  signature. So we walk the cache root and pick the most-recently-
+     *  modified <codename>\<kver>\ subdir. The asb_core caller has
+     *  populated exactly one set of files for the ISO being built. */
     {
-        const wchar_t *bins[] = {
-            L"appsandbox-agent", L"appsandbox-audio", L"appsandbox-clipboard",
-            L"appsandbox-display", L"appsandbox-input"
-        };
-        for (i = 0; i < (int)(sizeof(bins) / sizeof(bins[0])); i++) {
-            wchar_t res_sub[MAX_PATH], repo_sub[MAX_PATH];
-            swprintf_s(res_sub, MAX_PATH, L"%s", bins[i]);
-            swprintf_s(repo_sub, MAX_PATH, L"tools\\linux\\dist\\%s", bins[i]);
-            swprintf_s(dst, MAX_PATH, L"%s\\%s", extras, bins[i]);
-            if (!copy_linux_artifact(res_dir, have_repo ? repo : NULL,
-                                      res_sub, repo_sub, dst))
-                ui_log(L"Warning: %s not built/staged (build tools/linux on a "
-                       L"Linux box, copy dist/ into release\\resources\\linux\\)",
-                       bins[i]);
+        wchar_t programdata[MAX_PATH];
+        wchar_t cache_root[MAX_PATH], best[MAX_PATH] = L"";
+        FILETIME best_time = { 0 };
+        if (!GetEnvironmentVariableW(L"ProgramData", programdata, MAX_PATH))
+            wcscpy_s(programdata, MAX_PATH, L"C:\\ProgramData");
+        swprintf_s(cache_root, MAX_PATH,
+                   L"%s\\AppSandbox\\apt-build-deps", programdata);
+
+        WIN32_FIND_DATAW fd1, fd2;
+        wchar_t spec1[MAX_PATH], spec2[MAX_PATH], candidate[MAX_PATH];
+        swprintf_s(spec1, MAX_PATH, L"%s\\*", cache_root);
+        HANDLE h1 = FindFirstFileW(spec1, &fd1);
+        if (h1 != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(fd1.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                if (fd1.cFileName[0] == L'.') continue;
+                /* <codename> level. Now glob <kver>. */
+                swprintf_s(spec2, MAX_PATH, L"%s\\%s\\*", cache_root, fd1.cFileName);
+                HANDLE h2 = FindFirstFileW(spec2, &fd2);
+                if (h2 == INVALID_HANDLE_VALUE) continue;
+                do {
+                    if (!(fd2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                    if (fd2.cFileName[0] == L'.') continue;
+                    swprintf_s(candidate, MAX_PATH,
+                               L"%s\\%s\\%s\\Packages",
+                               cache_root, fd1.cFileName, fd2.cFileName);
+                    if (GetFileAttributesW(candidate) == INVALID_FILE_ATTRIBUTES)
+                        continue;
+                    if (CompareFileTime(&fd2.ftLastWriteTime, &best_time) > 0) {
+                        best_time = fd2.ftLastWriteTime;
+                        swprintf_s(best, MAX_PATH,
+                                   L"%s\\%s\\%s",
+                                   cache_root, fd1.cFileName, fd2.cFileName);
+                    }
+                } while (FindNextFileW(h2, &fd2));
+                FindClose(h2);
+            } while (FindNextFileW(h1, &fd1));
+            FindClose(h1);
+        }
+
+        if (best[0]) {
+            wchar_t extras_apt_dst[MAX_PATH];
+            swprintf_s(extras_apt_dst, MAX_PATH,
+                       L"%s\\local-apt-extras", extras);
+            int n = copy_dir_recursive(best, extras_apt_dst);
+            ui_log(L"Staged %d apt-build-deps file(s) from %s",
+                   n, best);
+        } else {
+            ui_log(L"Warning: no apt-build-deps cache found under %s "
+                   L"— guest agent build will need internet OR fail",
+                   cache_root);
         }
     }
 
-    /* --- 2. Kernel modules: copy whole modules/<kver>/ tree as-is. --- */
-    {
-        wchar_t modules_dst[MAX_PATH];
-        BOOL copied = FALSE;
-        swprintf_s(modules_dst, MAX_PATH, L"%s\\modules", extras);
-
-        /* Primary: <res_dir>\linux\modules\ */
-        swprintf_s(src, MAX_PATH, L"%s\\linux\\modules", res_dir);
-        if (GetFileAttributesW(src) != INVALID_FILE_ATTRIBUTES) {
-            int n = copy_dir_recursive(src, modules_dst);
-            if (n > 0) {
-                ui_log(L"Staged %d kernel module file(s) from release/resources/linux/.", n);
-                copied = TRUE;
-            }
-        }
-        /* Dev fallback: <repo>\tools\linux\dist\modules\ */
-        if (!copied && have_repo) {
-            swprintf_s(src, MAX_PATH, L"%s\\tools\\linux\\dist\\modules", repo);
-            if (GetFileAttributesW(src) != INVALID_FILE_ATTRIBUTES) {
-                int n = copy_dir_recursive(src, modules_dst);
-                if (n > 0) {
-                    ui_log(L"Staged %d kernel module file(s) from tools/linux/dist/.", n);
-                    copied = TRUE;
-                }
-            }
-        }
-        if (!copied)
-            ui_log(L"Warning: no prebuilt .ko modules staged "
-                   L"(DKMS source-build fallback will run in guest at boot).");
-    }
-
-    /* --- 3. DKMS source trees (always from repo source). Each module's source
-       gets staged under extras\<mod>-src\, matching the layout setup.sh
-       expects. */
-    if (have_repo) {
-        swprintf_s(src, MAX_PATH, L"%s\\tools\\linux\\dxgkrnl\\src", repo);
-        swprintf_s(dst, MAX_PATH, L"%s\\dxgkrnl-src", extras);
-        if (GetFileAttributesW(src) != INVALID_FILE_ATTRIBUTES)
-            copy_dir_recursive(src, dst);
-
-        swprintf_s(src, MAX_PATH, L"%s\\tools\\linux\\asb_drm", repo);
-        swprintf_s(dst, MAX_PATH, L"%s\\asb_drm-src", extras);
-        if (GetFileAttributesW(src) != INVALID_FILE_ATTRIBUTES)
-            copy_dir_recursive(src, dst);
-    }
+    /* --- 3. DKMS source trees are NOT staged on the host.
+     *  Same rationale as the agent source (section 1): the guest curls
+     *  a tarball of the repo from GitHub at firstboot and builds against
+     *  the full tools/linux/ tree (agent + asb_drm + dxgkrnl/src in
+     *  one fetch). See ubuntu_vhdx.c::plant_firstboot_service STEP 7.5. */
 
     /* --- 4. systemd units + modules-load.d + modprobe.d (always from repo). */
     if (have_repo) {
@@ -3164,10 +3217,12 @@ void stage_linux_agent_and_extras(const wchar_t *staging,
         }
         if (!any)
             ui_log(L"Warning: wsl-deps libs not staged "
-                   L"(run tools/wsl-deps/fetch-wsl-deps.ps1 to populate "
-                   L"ProgramData\\AppSandbox\\wsl-deps\\)");
+                   L"(ensure_wsl_deps_cached should have populated "
+                   L"ProgramData\\AppSandbox\\wsl-deps\\current\\lib\\ — "
+                   L"check the asb log for prefetch errors)");
     }
 }
+#endif /* DEAD_stage_linux_agent_and_extras_old */
 
 HRESULT iso_create_resources_ubuntu(const wchar_t *iso_path,
                                      const wchar_t *vm_name,

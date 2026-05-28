@@ -972,9 +972,22 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             L"\"VerticalResolution\":768"
         L"},");
 
-    /* ComPorts — no JSON block. com1 named pipe was a debug-time device
-       captured during subiquity install; not needed any more. */
+    /* ComPorts — virtual COM1 wired to a named pipe (\\.\pipe\<vm>.com1)
+       for Linux VMs. systemd's StandardOutput=journal+console writes
+       firstboot script output to /dev/console (= /dev/ttyS0 = com1),
+       which is the only practical way to debug agent / DKMS build
+       failures from the host without an SSH session into the guest.
+       Windows VMs omit it. */
     comports_section[0] = L'\0';
+    if (!is_windows) {
+        wchar_t name_esc[MAX_PATH * 2];
+        escape_json_path(config->name, name_esc, MAX_PATH * 2);
+        swprintf_s(comports_section, 512,
+            L"\"ComPorts\":{"
+                L"\"0\":{\"NamedPipe\":\"\\\\\\\\.\\\\pipe\\\\%s.com1\"}"
+            L"},",
+            name_esc);
+    }
 
     /* SecuritySettings with TPM — enabled for all Windows VMs.
        TPM does not block test-signed drivers; only Secure Boot does. */

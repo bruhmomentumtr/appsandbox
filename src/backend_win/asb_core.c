@@ -23,6 +23,8 @@
 #include <stdlib.h>
 #include <shlobj.h>
 #include <stdarg.h>
+#include <virtdisk.h>
+#pragma comment(lib, "virtdisk.lib")
 
 /* ---- DLL module handle (for locating iso-patch.exe, resources, etc.) ---- */
 
@@ -1328,10 +1330,38 @@ static int write_manifest_walk_dir(FILE *f,
     return count;
 }
 
+/* Write a small utf-8 file at <staging>\<basename>, and append a manifest
+   line mapping it into the rootfs at <rootfs_path>. Returns 1 on success,
+   0 on failure (and logs). Content is written WITHOUT a trailing newline
+   so the firstboot script can read it back unchanged. */
+static int stage_marker_file(FILE *manifest_f, const wchar_t *staging,
+                             const wchar_t *basename,
+                             const char *content, size_t content_len,
+                             const wchar_t *rootfs_path)
+{
+    wchar_t host[MAX_PATH];
+    swprintf_s(host, MAX_PATH, L"%s\\%s", staging, basename);
+    HANDLE h = CreateFileW(host, GENERIC_WRITE, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        asb_log(L"WARN: could not create marker on host: %s", basename);
+        return 0;
+    }
+    if (content_len > 0) {
+        DWORD wr = 0;
+        WriteFile(h, content, (DWORD)content_len, &wr, NULL);
+    }
+    CloseHandle(h);
+    fwprintf(manifest_f, L"%s\t%s\n", host, rootfs_path);
+    return 1;
+}
+
 static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
                                          const wchar_t *staging,
                                          const wchar_t *res_dir,
-                                         BOOL ssh_enabled)
+                                         BOOL ssh_enabled,
+                                         const wchar_t *admin_user,
+                                         const char *admin_pw_hash)
 {
     wchar_t extras[MAX_PATH];
     CreateDirectoryW(staging, NULL);
@@ -1351,9 +1381,249 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
     }
     /* Walk extras\ -> /opt/appsandbox/ */
     int n = write_manifest_walk_dir(f, extras, "/opt/appsandbox");
+
+    /* Admin user + password hash. firstboot STEP 5 reads these to create
+     * the login account. Without them, the firstboot falls back to a
+     * static test/test123 (which is a security smell anyway). */
+    if (admin_user && admin_user[0] && admin_pw_hash && admin_pw_hash[0]) {
+        char user_utf8[128];
+        WideCharToMultiByte(CP_UTF8, 0, admin_user, -1,
+                            user_utf8, sizeof(user_utf8), NULL, NULL);
+        n += stage_marker_file(f, staging, L"admin-user.marker",
+                               user_utf8, strlen(user_utf8),
+                               L"/etc/appsandbox-admin-user");
+        n += stage_marker_file(f, staging, L"admin-hash.marker",
+                               admin_pw_hash, strlen(admin_pw_hash),
+                               L"/etc/appsandbox-admin-hash");
+        asb_log(L"Linux admin: staged user=%s + $6$ hash marker", admin_user);
+    } else {
+        asb_log(L"Linux admin: no admin_user/admin_pass — firstboot will use test/test123");
+    }
+
+    if (ssh_enabled) {
+        /* Zero-byte marker the firstboot keys on to install + enable
+         * openssh-server. */
+        n += stage_marker_file(f, staging, L"ssh-enabled.marker",
+                               NULL, 0, L"/etc/appsandbox-ssh-enabled");
+        asb_log(L"ssh_enabled: staged /etc/appsandbox-ssh-enabled marker");
+    }
     fclose(f);
     asb_log(L"Linux staging manifest written: %s (%d file(s))", manifest_path, n);
     return n;
+}
+
+/* ---- Detect the Ubuntu release codename + kernel version from an ISO.
+ *
+ * Mounts the ISO read-only via VirtDisk, reads:
+ *   - the only subdir under <iso>:\dists\        -> codename (e.g. "resolute")
+ *   - <iso>:\pool\main\l\linux\linux-image-*-generic_*.deb
+ *     -> kernel version (e.g. "7.0.0-14-generic") parsed from filename
+ *
+ * Returns 0 on success and fills the two output buffers; non-zero on
+ * any error (caller logs + skips the build-deps prefetch).
+ *
+ * Output buffers should be at least 64 wchars each. */
+static int detect_iso_kernel(const wchar_t *iso_path,
+                             wchar_t *codename_out, size_t codename_cap,
+                             wchar_t *kver_out, size_t kver_cap)
+{
+    HANDLE iso_handle = INVALID_HANDLE_VALUE;
+    DWORD cdrom_before, cdrom_after, newly;
+    wchar_t iso_drive = 0;
+    int rc = -1;
+
+    codename_out[0] = 0;
+    kver_out[0]     = 0;
+
+    /* Snapshot current CD-ROM drive letters before mount. */
+    cdrom_before = 0;
+    for (int i = 0; i < 26; i++) {
+        wchar_t root[4]; swprintf_s(root, 4, L"%c:\\", (wchar_t)(L'A' + i));
+        if (GetDriveTypeW(root) == DRIVE_CDROM) cdrom_before |= (1u << i);
+    }
+
+    /* Mount the ISO via VirtDisk. */
+    {
+        VIRTUAL_STORAGE_TYPE st;
+        OPEN_VIRTUAL_DISK_PARAMETERS op;
+        ZeroMemory(&st, sizeof(st));
+        st.DeviceId = VIRTUAL_STORAGE_TYPE_DEVICE_ISO;
+        ZeroMemory(&op, sizeof(op));
+        op.Version = OPEN_VIRTUAL_DISK_VERSION_1;
+
+        if (OpenVirtualDisk(&st, iso_path,
+                            VIRTUAL_DISK_ACCESS_READ,
+                            OPEN_VIRTUAL_DISK_FLAG_NONE,
+                            &op, &iso_handle) != ERROR_SUCCESS) {
+            asb_log(L"detect_iso_kernel: OpenVirtualDisk failed (%lu)",
+                    GetLastError());
+            return -1;
+        }
+        if (AttachVirtualDisk(iso_handle, NULL,
+                              ATTACH_VIRTUAL_DISK_FLAG_READ_ONLY,
+                              0, NULL, NULL) != ERROR_SUCCESS) {
+            asb_log(L"detect_iso_kernel: AttachVirtualDisk failed (%lu)",
+                    GetLastError());
+            CloseHandle(iso_handle);
+            return -1;
+        }
+    }
+
+    /* Wait for the drive letter (≤10 s). */
+    for (int i = 0; i < 20; i++) {
+        cdrom_after = 0;
+        for (int b = 0; b < 26; b++) {
+            wchar_t root[4]; swprintf_s(root, 4, L"%c:\\", (wchar_t)(L'A' + b));
+            if (GetDriveTypeW(root) == DRIVE_CDROM) cdrom_after |= (1u << b);
+        }
+        newly = cdrom_after & ~cdrom_before;
+        if (newly) {
+            for (int b = 0; b < 26; b++) {
+                if (newly & (1u << b)) { iso_drive = (wchar_t)(L'A' + b); break; }
+            }
+            break;
+        }
+        Sleep(500);
+    }
+    if (!iso_drive) {
+        asb_log(L"detect_iso_kernel: ISO mounted but no drive letter");
+        goto cleanup;
+    }
+
+    /* Wait for the filesystem to become accessible (the drive letter
+     * appears before the volume's FS is ready to serve directory
+     * enumeration — without this wait, FindFirstFileW on <drive>:\dists\
+     * returns ERROR_PATH_NOT_FOUND even though the path exists). Same
+     * pattern as ubuntu_vhdx.c's iso mount: poll GetVolumeInformationW
+     * until it succeeds. Up to ~15 s. */
+    {
+        wchar_t root[4]; swprintf_s(root, 4, L"%c:\\", iso_drive);
+        wchar_t vol_label[64];
+        int ready = 0;
+        for (int i = 0; i < 30; i++) {
+            if (GetVolumeInformationW(root, vol_label, 64, NULL, NULL, NULL, NULL, 0)) {
+                ready = 1; break;
+            }
+            Sleep(500);
+        }
+        if (!ready) {
+            asb_log(L"detect_iso_kernel: %c:\\ never became accessible", iso_drive);
+            goto cleanup;
+        }
+    }
+
+    /* 1. Codename: first non-dotfile subdir under <iso>:\dists\ */
+    {
+        wchar_t spec[MAX_PATH];
+        swprintf_s(spec, MAX_PATH, L"%c:\\dists\\*", iso_drive);
+        WIN32_FIND_DATAW fd;
+        HANDLE fh = FindFirstFileW(spec, &fd);
+        if (fh == INVALID_HANDLE_VALUE) {
+            asb_log(L"detect_iso_kernel: %c:\\dists\\ not found", iso_drive);
+            goto cleanup;
+        }
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (fd.cFileName[0] == L'.') continue;
+            wcsncpy_s(codename_out, codename_cap, fd.cFileName, _TRUNCATE);
+            break;
+        } while (FindNextFileW(fh, &fd));
+        FindClose(fh);
+        if (!codename_out[0]) {
+            asb_log(L"detect_iso_kernel: no release subdir under dists/");
+            goto cleanup;
+        }
+    }
+
+    /* 2. Kernel version from linux-headers-<X.Y.Z-generic>_*_amd64.deb
+     *    in pool/main/l/linux/. We use linux-headers- not linux-image-
+     *    because the image .deb lives under pool/main/l/linux-signed/
+     *    on signed-kernel Ubuntu releases, but the headers (which we
+     *    need anyway for DKMS builds) are in pool/main/l/linux/ on all
+     *    release flavors. The kver substring is identical.
+     *
+     *    Filename pattern (literal example):
+     *      linux-headers-7.0.0-14-generic_7.0.0-14.14_amd64.deb
+     *
+     *    FindFirstFileW doesn't reliably handle multi-`*` patterns on
+     *    ISO 9660; glob with single wildcard and filter for "-generic_". */
+    {
+        wchar_t spec[MAX_PATH];
+        swprintf_s(spec, MAX_PATH,
+            L"%c:\\pool\\main\\l\\linux\\linux-headers-*.deb", iso_drive);
+        WIN32_FIND_DATAW fd;
+        HANDLE fh = FindFirstFileW(spec, &fd);
+        if (fh == INVALID_HANDLE_VALUE) {
+            asb_log(L"detect_iso_kernel: no linux-headers-*.deb in pool/main/l/linux");
+            goto cleanup;
+        }
+        int found = 0;
+        do {
+            /* Skip the meta-package "linux-headers-X.Y.Z_<ver>_all.deb"
+             * (no "-generic_"). We want the per-flavor headers. */
+            if (!wcsstr(fd.cFileName, L"-generic_")) continue;
+            const wchar_t *p = wcsstr(fd.cFileName, L"linux-headers-");
+            if (!p) continue;
+            p += wcslen(L"linux-headers-");
+            const wchar_t *u = wcschr(p, L'_');
+            if (!u) continue;
+            size_t n = (size_t)(u - p);
+            if (n == 0 || n >= kver_cap) continue;
+            wcsncpy_s(kver_out, kver_cap, p, n);
+            kver_out[n] = 0;
+            found = 1;
+            break;
+        } while (FindNextFileW(fh, &fd));
+        FindClose(fh);
+        if (!found) {
+            asb_log(L"detect_iso_kernel: no linux-headers-*-generic_*.deb found");
+            goto cleanup;
+        }
+    }
+
+    asb_log(L"detect_iso_kernel: codename=%s kver=%s", codename_out, kver_out);
+    rc = 0;
+
+cleanup:
+    if (iso_handle != INVALID_HANDLE_VALUE) {
+        DetachVirtualDisk(iso_handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
+        CloseHandle(iso_handle);
+    }
+    return rc;
+}
+
+/* ---- Spawn iso-patch.exe with one of the --prefetch-* modes and
+ * block. No cache layer: each call writes directly into <out_dir>
+ * which is a subdir of the per-VM staging extras dir.
+ *
+ * args: extra argv tail (no quotes — caller is responsible for safe paths).
+ * Returns 0 on success; -1 on any failure. Logs progress to asb_log. */
+static int spawn_iso_patch_prefetch(const wchar_t *args)
+{
+    wchar_t exe_dir[MAX_PATH];
+    GetModuleFileNameW(g_dll_module, exe_dir, MAX_PATH);
+    { wchar_t *s = wcsrchr(exe_dir, L'\\'); if (s) *s = L'\0'; }
+
+    wchar_t cmdline[2048];
+    swprintf_s(cmdline, 2048,
+        L"\"%s\\iso-patch.exe\" %s", exe_dir, args);
+
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        asb_log(L"prefetch: CreateProcess failed (%lu) for: %s",
+                GetLastError(), cmdline);
+        return -1;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD ec = 1;
+    GetExitCodeProcess(pi.hProcess, &ec);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return ec == 0 ? 0 : -1;
 }
 
 /* ---- Run iso-patch.exe --ubuntu-to-vhdx and stream its progress. ----
@@ -1522,13 +1792,62 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
        still exists in the config; clear it so hcs_vm doesn't try to attach. */
     args->config.resources_iso_path[0] = L'\0';
 
-    /* ---- 1a. Generate the staging manifest with all the Linux extras
-       (agent ELFs, kernel modules, DKMS sources, systemd units, etc.).
-       iso-patch reads this via --stage and writes each entry into the
-       ext4 rootfs at /opt/appsandbox/<relative>. ---- */
+    /* (Detection + prefetch happen below, after we've decided on the
+       staging dir, since the prefetches write directly into it.) */
+
+    /* ---- 1a. Set up staging dir + run 3 prefetches that populate it
+       directly (no host cache). Order doesn't matter functionally;
+       sequential for simpler logging. Failures are non-fatal — VM
+       still builds; firstboot STEP 17 verification will flag any
+       missing artifacts in the rootfs. ---- */
     swprintf_s(staging, MAX_PATH, L"%s\\_vhdx_staging", args->vhdx_dir);
     CreateDirectoryW(staging, NULL);
     swprintf_s(manifest, MAX_PATH, L"%s\\manifest.txt", staging);
+
+    {
+        wchar_t extras[MAX_PATH], args_buf[2048];
+        swprintf_s(extras, MAX_PATH, L"%s\\extras", staging);
+        CreateDirectoryW(extras, NULL);
+
+        /* Prefetch 1: repo source from GitHub. Writes agent-src/,
+           asb_drm-src/, dxgkrnl-src/, systemd/, modprobe.d-asb_drm.conf,
+           50-appsandbox-gpu, org.gnome.Shell-no-gpu.conf, appsandbox-gpu,
+           wsl-mesa.tar.zst directly into <staging>/extras/. */
+        asb_log(L"Prefetch 1/3: cloning repo source from GitHub...");
+        swprintf_s(args_buf, 2048,
+            L"--prefetch-repo --branch \"wip-linux-vm-support\" --out-dir \"%s\"",
+            extras);
+        if (spawn_iso_patch_prefetch(args_buf) != 0)
+            asb_log(L"WARN: prefetch-repo failed (agent + DKMS build will fail)");
+
+        /* Prefetch 2: apt build-deps closure from archive.ubuntu.com.
+           Needs (codename, kernel) detected from the ISO. */
+        asb_log(L"Prefetch 2/3: apt build-deps closure...");
+        wchar_t codename[64] = L"", kver[64] = L"";
+        if (detect_iso_kernel(args->config.image_path,
+                              codename, ARRAYSIZE(codename),
+                              kver,     ARRAYSIZE(kver)) == 0) {
+            wchar_t apt_out[MAX_PATH];
+            swprintf_s(apt_out, MAX_PATH, L"%s\\local-apt-extras", extras);
+            swprintf_s(args_buf, 2048,
+                L"--prefetch-build-deps --codename \"%s\" --kernel \"%s\" "
+                L"--out-dir \"%s\"",
+                codename, kver, apt_out);
+            if (spawn_iso_patch_prefetch(args_buf) != 0)
+                asb_log(L"WARN: prefetch-build-deps failed");
+        } else {
+            asb_log(L"WARN: could not detect ISO kernel — skipping build-deps");
+        }
+
+        /* Prefetch 3: wsl-deps proprietary .so libs from Microsoft NuGet. */
+        asb_log(L"Prefetch 3/3: wsl-deps .so libs...");
+        wchar_t wsl_out[MAX_PATH];
+        swprintf_s(wsl_out, MAX_PATH, L"%s\\wsl-deps", extras);
+        swprintf_s(args_buf, 2048,
+            L"--prefetch-wsl-deps --out-dir \"%s\"", wsl_out);
+        if (spawn_iso_patch_prefetch(args_buf) != 0)
+            asb_log(L"WARN: prefetch-wsl-deps failed");
+    }
 
     GetModuleFileNameW(g_dll_module, exe_dir, MAX_PATH);
     slash = wcsrchr(exe_dir, L'\\'); if (slash) *slash = L'\0';
@@ -1536,8 +1855,27 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
     if (GetFileAttributesW(res_dir) == INVALID_FILE_ATTRIBUTES)
         wcscpy_s(res_dir, MAX_PATH, exe_dir);
 
+    /* Hash the modal-supplied admin password into glibc $6$ format so the
+       firstboot can drop it straight into /etc/shadow via `usermod -p`.
+       Plaintext is wiped immediately after — same pattern as the Windows
+       autounattend path. If the user left password blank, fall through
+       with empty strings; generate_vhdx_manifest_ubuntu logs a warning
+       and the guest falls back to the test/test123 placeholder. */
+    char admin_pw_hash[256] = {0};
+    if (args->config.admin_pass[0] != L'\0') {
+        if (!unix_password_hash(args->config.admin_pass,
+                                admin_pw_hash, sizeof(admin_pw_hash))) {
+            asb_log(L"WARN: failed to hash admin_pass — falling back to test/test123");
+            admin_pw_hash[0] = '\0';
+        }
+    }
+    SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
+
     int n_staged = generate_vhdx_manifest_ubuntu(manifest, staging, res_dir,
-                                                  args->config.ssh_enabled);
+                                                  args->config.ssh_enabled,
+                                                  args->config.admin_user,
+                                                  admin_pw_hash);
+    SecureZeroMemory(admin_pw_hash, sizeof(admin_pw_hash));
     if (n_staged < 0) {
         args->result = E_FAIL;
         swprintf_s(args->error_msg, 512, L"Failed to generate Linux staging manifest");
@@ -1548,9 +1886,6 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
                               args->config.hdd_gb,
                               n_staged > 0 ? manifest : NULL,
                               args->vm_index, args->error_msg, 512);
-    /* admin_pass currently isn't fed into the rootfs (firstboot uses a
-       static test/test123). Wipe it from the in-memory config either way. */
-    SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
     if (FAILED(hr)) {
         args->result = hr;
         if (args->error_msg[0] == L'\0')

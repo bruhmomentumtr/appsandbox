@@ -21,6 +21,9 @@
 #include <stdio.h>
 
 #include "ubuntu_vhdx.h"
+#include "prefetch_build_deps.h"
+#include "prefetch_wsl_deps.h"
+#include "prefetch_repo.h"
 
 #pragma comment(lib, "virtdisk.lib")
 #pragma comment(lib, "ole32.lib")
@@ -2874,6 +2877,53 @@ int wmain(int argc, wchar_t *argv[])
             return 1;
         }
         return do_qcow2_to_vhdx(qcow2, output);
+    }
+
+    if (_wcsicmp(argv[1], L"--prefetch-repo") == 0) {
+        const wchar_t *branch = NULL, *out_dir = NULL;
+        for (int i = 2; i < argc; i++) {
+            if (_wcsicmp(argv[i], L"--branch") == 0 && i + 1 < argc) branch = argv[++i];
+            else if (_wcsicmp(argv[i], L"--out-dir") == 0 && i + 1 < argc) out_dir = argv[++i];
+        }
+        if (!branch || !out_dir) {
+            log_err(L"--prefetch-repo requires --branch and --out-dir");
+            return 1;
+        }
+        return do_prefetch_repo(branch, out_dir);
+    }
+
+    if (_wcsicmp(argv[1], L"--prefetch-wsl-deps") == 0) {
+        const wchar_t *out_dir = NULL;
+        for (int i = 2; i < argc; i++) {
+            if (_wcsicmp(argv[i], L"--out-dir") == 0 && i + 1 < argc)
+                out_dir = argv[++i];
+        }
+        if (!out_dir) {
+            log_err(L"--prefetch-wsl-deps requires --out-dir");
+            return 1;
+        }
+        return do_prefetch_wsl_deps(out_dir);
+    }
+
+    if (_wcsicmp(argv[1], L"--prefetch-build-deps") == 0) {
+        const wchar_t *codename = NULL, *kver = NULL;
+        const wchar_t *out_dir = NULL, *mirror = NULL;
+        for (int i = 2; i < argc; i++) {
+            if (_wcsicmp(argv[i], L"--codename") == 0 && i + 1 < argc) {
+                codename = argv[++i];
+            } else if (_wcsicmp(argv[i], L"--kernel") == 0 && i + 1 < argc) {
+                kver = argv[++i];
+            } else if (_wcsicmp(argv[i], L"--out-dir") == 0 && i + 1 < argc) {
+                out_dir = argv[++i];
+            } else if (_wcsicmp(argv[i], L"--mirror") == 0 && i + 1 < argc) {
+                mirror = argv[++i];
+            }
+        }
+        if (!codename || !kver || !out_dir) {
+            log_err(L"--prefetch-build-deps requires --codename, --kernel, --out-dir");
+            return 1;
+        }
+        return do_prefetch_build_deps(codename, kver, out_dir, mirror);
     }
 
     if (_wcsicmp(argv[1], L"--ubuntu-to-vhdx") == 0) {
