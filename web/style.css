@@ -223,7 +223,10 @@ button.primary:disabled { background: #2a3a4a; border-color: #3a4a5a; }
 .field-warn {
     font-size: 11px;
     color: var(--danger);
-    white-space: nowrap;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    flex: 1 1 0;
+    min-width: 0;
 }
 
 /* Password match validation */

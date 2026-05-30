@@ -819,7 +819,6 @@ static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
     IMMDevice *pDev = NULL;
     IAudioClient *pAC = NULL;
     IAudioRenderClient *pRC = NULL;
-    WAVEFORMATEX *mixfmt = NULL;
     WAVEFORMATEX *renderfmt = NULL;
     BYTE *scratch = NULL;
     UINT32 scratch_cap = 0;
@@ -882,10 +881,13 @@ static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
         hr = IMMDevice_Activate(pDev, &AUDIO_IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&pAC);
         if (FAILED(hr)) { idd_log(d, L"Audio: Activate failed 0x%08lX.", hr); goto session_cleanup; }
 
-        hr = IAudioClient_GetMixFormat(pAC, &mixfmt);
-        if (FAILED(hr) || !mixfmt) { idd_log(d, L"Audio: GetMixFormat failed 0x%08lX.", hr); goto session_cleanup; }
-
-        /* Build the source format exactly matching what the guest is sending. */
+        /* Build the source format exactly matching what the guest is sending.
+           We deliberately do NOT call GetMixFormat: we never use the host's
+           mix format (Initialize runs with AUTOCONVERTPCM, so WASAPI converts
+           our renderfmt to whatever the endpoint needs). On some endpoints
+           (seen on AMD HD Audio) GetMixFormat returns
+           AUDCLNT_E_UNSUPPORTED_FORMAT for the configured default format,
+           which would needlessly kill the whole audio path. */
         renderfmt = (WAVEFORMATEX *)CoTaskMemAlloc(sizeof(WAVEFORMATEX));
         if (!renderfmt) goto session_cleanup;
         ZeroMemory(renderfmt, sizeof(WAVEFORMATEX));
@@ -975,7 +977,6 @@ session_cleanup:
         if (pAC)    { IAudioClient_Release(pAC);          pAC = NULL; }
         if (pDev)   { IMMDevice_Release(pDev);            pDev = NULL; }
         if (pEnum)  { IMMDeviceEnumerator_Release(pEnum); pEnum = NULL; }
-        if (mixfmt)    { CoTaskMemFree(mixfmt);    mixfmt = NULL; }
         if (renderfmt) { CoTaskMemFree(renderfmt); renderfmt = NULL; }
 
         if (d->audio_socket != INVALID_SOCKET) {

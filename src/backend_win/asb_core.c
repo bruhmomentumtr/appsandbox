@@ -1356,12 +1356,236 @@ static int stage_marker_file(FILE *manifest_f, const wchar_t *staging,
     return 1;
 }
 
+/* ====================================================================
+ * Host locale / keyboard / timezone detection + Windows->Linux mapping
+ *
+ * At VM-create time we read the *current user's* Windows regional
+ * settings and translate them to the Ubuntu guest's equivalents, which
+ * firstboot applies (replacing the old hardcoded en_US / us / New_York).
+ *
+ * Language is GATED: Ubuntu's ISO only ships pre-installed UI
+ * translations for 8 languages (de, en, es, fr, it, pt, ru, zh). If the
+ * host language isn't one of those, the locale falls back to en_US.UTF-8
+ * so the guest never lands on a half-translated desktop. Keyboard and
+ * timezone are NOT gated — every XKB layout and IANA zone is present in
+ * the squashfs offline, so they always match the host.
+ * ==================================================================== */
+
+/* Map a BCP-47 tag (e.g. "en-GB", "zh-Hans-CN", "ja-JP") to a Linux
+ * locale string ("en_GB.UTF-8"). Returns the en_US.UTF-8 fallback when
+ * the primary language subtag is not one of the 8 preinstalled langs. */
+static void win_locale_to_linux(const wchar_t *bcp47, char *out, size_t out_sz)
+{
+    static const wchar_t *supported[] = {
+        L"de", L"en", L"es", L"fr", L"it", L"pt", L"ru", L"zh"
+    };
+    /* Default region per language when the host tag carries no region. */
+    static const struct { const wchar_t *lang; const char *loc; } defloc[] = {
+        { L"de", "de_DE" }, { L"en", "en_US" }, { L"es", "es_ES" },
+        { L"fr", "fr_FR" }, { L"it", "it_IT" }, { L"pt", "pt_PT" },
+        { L"ru", "ru_RU" }, { L"zh", "zh_CN" },
+    };
+
+    strcpy_s(out, out_sz, "en_US.UTF-8");
+    if (!bcp47 || !bcp47[0]) return;
+
+    /* Split into up to 4 subtags. */
+    wchar_t buf[64];
+    wcsncpy_s(buf, 64, bcp47, _TRUNCATE);
+    wchar_t lang[16] = L"", script[16] = L"", region[16] = L"";
+    {
+        wchar_t *ctx = NULL;
+        wchar_t *tok = wcstok_s(buf, L"-", &ctx);
+        if (tok) { wcsncpy_s(lang, 16, tok, _TRUNCATE); _wcslwr_s(lang, 16); }
+        while ((tok = wcstok_s(NULL, L"-", &ctx)) != NULL) {
+            size_t l = wcslen(tok);
+            if (l == 4) { wcsncpy_s(script, 16, tok, _TRUNCATE); }       /* script */
+            else if (l == 2 || l == 3) { wcsncpy_s(region, 16, tok, _TRUNCATE);
+                                         _wcsupr_s(region, 16); }        /* region */
+        }
+    }
+    if (!lang[0]) return;
+
+    /* Gate on the 8 supported languages. */
+    int ok = 0;
+    for (int i = 0; i < (int)(sizeof(supported)/sizeof(supported[0])); i++)
+        if (_wcsicmp(lang, supported[i]) == 0) { ok = 1; break; }
+    if (!ok) return;  /* keep en_US.UTF-8 fallback */
+
+    /* Chinese needs script->region resolution (zh_CN vs zh_TW etc.). */
+    if (_wcsicmp(lang, L"zh") == 0) {
+        const char *loc = "zh_CN";
+        if (region[0]) {
+            if      (!_wcsicmp(region, L"TW")) loc = "zh_TW";
+            else if (!_wcsicmp(region, L"HK")) loc = "zh_HK";
+            else if (!_wcsicmp(region, L"SG")) loc = "zh_SG";
+            else                               loc = "zh_CN";
+        } else if (script[0]) {
+            loc = (!_wcsicmp(script, L"Hant")) ? "zh_TW" : "zh_CN";
+        }
+        strcpy_s(out, out_sz, loc);
+        strcat_s(out, out_sz, ".UTF-8");
+        return;
+    }
+
+    if (region[0]) {
+        char lang_a[16], region_a[16];
+        WideCharToMultiByte(CP_UTF8, 0, lang, -1, lang_a, sizeof(lang_a), NULL, NULL);
+        WideCharToMultiByte(CP_UTF8, 0, region, -1, region_a, sizeof(region_a), NULL, NULL);
+        snprintf(out, out_sz, "%s_%s.UTF-8", lang_a, region_a);
+    } else {
+        for (int i = 0; i < (int)(sizeof(defloc)/sizeof(defloc[0])); i++)
+            if (_wcsicmp(lang, defloc[i].lang) == 0) {
+                snprintf(out, out_sz, "%s.UTF-8", defloc[i].loc);
+                break;
+            }
+    }
+}
+
+/* Map a Windows keyboard input-language id (LOWORD of an HKL) to an XKB
+ * layout. Never gated — all layouts ship in xkb-data. Fallback "us". */
+static void langid_to_xkb(WORD langid, char *out, size_t out_sz)
+{
+    static const struct { WORD id; const char *xkb; } map[] = {
+        { 0x0409, "us" }, { 0x0809, "gb" }, { 0x0c09, "us" }, /* en-AU->us */
+        { 0x0407, "de" }, { 0x0c07, "at" }, { 0x0807, "ch" },
+        { 0x040c, "fr" }, { 0x0c0c, "ca" }, { 0x080c, "be" }, { 0x100c, "ch" },
+        { 0x0410, "it" }, { 0x0810, "ch" },
+        { 0x040a, "es" }, { 0x080a, "latam" }, { 0x0c0a, "es" },
+        { 0x0416, "br" }, { 0x0816, "pt" },
+        { 0x0411, "jp" }, { 0x0412, "kr" },
+        { 0x0804, "cn" }, { 0x0404, "tw" }, { 0x0c04, "cn" }, { 0x1404, "cn" },
+        { 0x0419, "ru" }, { 0x0415, "pl" },
+        { 0x0413, "nl" }, { 0x0813, "be" },
+        { 0x041d, "se" }, { 0x0414, "no" }, { 0x0406, "dk" }, { 0x040b, "fi" },
+        { 0x0405, "cz" }, { 0x040e, "hu" }, { 0x041f, "tr" },
+        { 0x0401, "ara" }, { 0x040d, "il" }, { 0x041e, "th" },
+        { 0x0422, "ua" }, { 0x0418, "ro" }, { 0x0408, "gr" },
+        { 0x0402, "bg" }, { 0x041a, "hr" }, { 0x041b, "sk" }, { 0x0424, "si" },
+        { 0x0425, "ee" }, { 0x0426, "lv" }, { 0x0427, "lt" },
+    };
+    strcpy_s(out, out_sz, "us");
+    for (int i = 0; i < (int)(sizeof(map)/sizeof(map[0])); i++)
+        if (map[i].id == langid) { strcpy_s(out, out_sz, map[i].xkb); return; }
+    /* Fall back on the primary language id (low 10 bits) for unlisted
+     * sublang variants. */
+    WORD prim = (WORD)(langid & 0x3ff);
+    for (int i = 0; i < (int)(sizeof(map)/sizeof(map[0])); i++)
+        if ((WORD)(map[i].id & 0x3ff) == prim) { strcpy_s(out, out_sz, map[i].xkb); return; }
+}
+
+/* Map a Windows time-zone key name to an IANA zone. Never gated — all
+ * zones ship in tzdata. Fallback "Etc/UTC". Subset of CLDR windowsZones
+ * covering the common zones; unknown keys fall back to UTC. */
+static void win_tz_to_iana(const wchar_t *keyname, char *out, size_t out_sz)
+{
+    static const struct { const wchar_t *win; const char *iana; } map[] = {
+        { L"Dateline Standard Time",        "Etc/GMT+12" },
+        { L"Hawaiian Standard Time",        "Pacific/Honolulu" },
+        { L"Alaskan Standard Time",         "America/Anchorage" },
+        { L"Pacific Standard Time",         "America/Los_Angeles" },
+        { L"US Mountain Standard Time",     "America/Phoenix" },
+        { L"Mountain Standard Time",        "America/Denver" },
+        { L"Central Standard Time",         "America/Chicago" },
+        { L"Canada Central Standard Time",  "America/Regina" },
+        { L"Central America Standard Time", "America/Guatemala" },
+        { L"Eastern Standard Time",         "America/New_York" },
+        { L"US Eastern Standard Time",      "America/Indiana/Indianapolis" },
+        { L"Atlantic Standard Time",        "America/Halifax" },
+        { L"SA Pacific Standard Time",      "America/Bogota" },
+        { L"SA Eastern Standard Time",      "America/Cayenne" },
+        { L"E. South America Standard Time","America/Sao_Paulo" },
+        { L"Argentina Standard Time",       "America/Buenos_Aires" },
+        { L"Greenwich Standard Time",       "Atlantic/Reykjavik" },
+        { L"GMT Standard Time",             "Europe/London" },
+        { L"W. Europe Standard Time",       "Europe/Berlin" },
+        { L"Central Europe Standard Time",  "Europe/Budapest" },
+        { L"Romance Standard Time",         "Europe/Paris" },
+        { L"Central European Standard Time","Europe/Warsaw" },
+        { L"W. Central Africa Standard Time","Africa/Lagos" },
+        { L"FLE Standard Time",             "Europe/Kiev" },
+        { L"GTB Standard Time",             "Europe/Bucharest" },
+        { L"E. Europe Standard Time",       "Europe/Chisinau" },
+        { L"Russian Standard Time",         "Europe/Moscow" },
+        { L"Turkey Standard Time",          "Europe/Istanbul" },
+        { L"Israel Standard Time",          "Asia/Jerusalem" },
+        { L"Egypt Standard Time",           "Africa/Cairo" },
+        { L"South Africa Standard Time",    "Africa/Johannesburg" },
+        { L"Arabian Standard Time",         "Asia/Dubai" },
+        { L"Arab Standard Time",            "Asia/Riyadh" },
+        { L"Iran Standard Time",            "Asia/Tehran" },
+        { L"Pakistan Standard Time",        "Asia/Karachi" },
+        { L"India Standard Time",           "Asia/Kolkata" },
+        { L"Bangladesh Standard Time",      "Asia/Dhaka" },
+        { L"SE Asia Standard Time",         "Asia/Bangkok" },
+        { L"China Standard Time",           "Asia/Shanghai" },
+        { L"Singapore Standard Time",       "Asia/Singapore" },
+        { L"Taipei Standard Time",          "Asia/Taipei" },
+        { L"Tokyo Standard Time",           "Asia/Tokyo" },
+        { L"Korea Standard Time",           "Asia/Seoul" },
+        { L"W. Australia Standard Time",    "Australia/Perth" },
+        { L"AUS Central Standard Time",     "Australia/Darwin" },
+        { L"AUS Eastern Standard Time",     "Australia/Sydney" },
+        { L"E. Australia Standard Time",    "Australia/Brisbane" },
+        { L"New Zealand Standard Time",     "Pacific/Auckland" },
+        { L"UTC",                           "Etc/UTC" },
+    };
+    strcpy_s(out, out_sz, "Etc/UTC");
+    if (!keyname || !keyname[0]) return;
+    for (int i = 0; i < (int)(sizeof(map)/sizeof(map[0])); i++)
+        if (_wcsicmp(keyname, map[i].win) == 0) {
+            strcpy_s(out, out_sz, map[i].iana); return;
+        }
+}
+
+/* Read the current user's locale, keyboard layout, and timezone from the
+ * Windows host and translate to Linux equivalents. Best-effort: any
+ * failure leaves the corresponding output at its safe default. */
+static void detect_host_locale_settings(char *locale, size_t locale_sz,
+                                        char *xkb, size_t xkb_sz,
+                                        char *tz, size_t tz_sz)
+{
+    /* Locale (gated). */
+    {
+        wchar_t name[LOCALE_NAME_MAX_LENGTH] = L"";
+        if (GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH) > 0)
+            win_locale_to_linux(name, locale, locale_sz);
+        else
+            strcpy_s(locale, locale_sz, "en_US.UTF-8");
+        asb_log(L"Host locale: %s -> %hs", name[0] ? name : L"(none)", locale);
+    }
+    /* Keyboard (not gated). */
+    {
+        HKL list[16];
+        int n = GetKeyboardLayoutList(16, list);
+        WORD langid = 0x0409;
+        if (n > 0) langid = (WORD)((UINT_PTR)list[0] & 0xFFFF);
+        langid_to_xkb(langid, xkb, xkb_sz);
+        asb_log(L"Host keyboard: langid=0x%04x -> %hs", langid, xkb);
+    }
+    /* Timezone (not gated). */
+    {
+        DYNAMIC_TIME_ZONE_INFORMATION dtzi;
+        DWORD r = GetDynamicTimeZoneInformation(&dtzi);
+        if (r != TIME_ZONE_ID_INVALID && dtzi.TimeZoneKeyName[0])
+            win_tz_to_iana(dtzi.TimeZoneKeyName, tz, tz_sz);
+        else
+            strcpy_s(tz, tz_sz, "Etc/UTC");
+        asb_log(L"Host timezone: %s -> %hs",
+                (r != TIME_ZONE_ID_INVALID) ? dtzi.TimeZoneKeyName : L"(invalid)", tz);
+    }
+}
+
 static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
                                          const wchar_t *staging,
                                          const wchar_t *res_dir,
                                          BOOL ssh_enabled,
                                          const wchar_t *admin_user,
-                                         const char *admin_pw_hash)
+                                         const char *admin_pw_hash,
+                                         const char *host_locale,
+                                         const char *host_xkb,
+                                         const char *host_tz,
+                                         const wchar_t *vm_name)
 {
     wchar_t extras[MAX_PATH];
     CreateDirectoryW(staging, NULL);
@@ -1407,6 +1631,40 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
                                NULL, 0, L"/etc/appsandbox-ssh-enabled");
         asb_log(L"ssh_enabled: staged /etc/appsandbox-ssh-enabled marker");
     }
+
+    /* Host-derived locale / keyboard / timezone. firstboot STEP 3 + 4
+     * read these; absent markers fall back to en_US.UTF-8 / us / Etc/UTC. */
+    if (host_locale && host_locale[0])
+        n += stage_marker_file(f, staging, L"locale.marker",
+                               host_locale, strlen(host_locale),
+                               L"/etc/appsandbox-locale");
+    if (host_xkb && host_xkb[0])
+        n += stage_marker_file(f, staging, L"keyboard.marker",
+                               host_xkb, strlen(host_xkb),
+                               L"/etc/appsandbox-keyboard");
+    if (host_tz && host_tz[0])
+        n += stage_marker_file(f, staging, L"timezone.marker",
+                               host_tz, strlen(host_tz),
+                               L"/etc/appsandbox-timezone");
+    asb_log(L"Host regional markers staged: locale=%hs keyboard=%hs tz=%hs",
+            host_locale ? host_locale : "(none)",
+            host_xkb ? host_xkb : "(none)",
+            host_tz ? host_tz : "(none)");
+
+    /* Hostname from the AppSandbox VM name (mirrors the Windows
+     * ComputerName path). The web UI already validates the name to a
+     * legal lowercase RFC-1123 hostname, so we write it verbatim;
+     * firstboot STEP 2 reads it and falls back to "ubuntu" if absent. */
+    if (vm_name && vm_name[0]) {
+        char host_utf8[256];
+        WideCharToMultiByte(CP_UTF8, 0, vm_name, -1,
+                            host_utf8, sizeof(host_utf8), NULL, NULL);
+        n += stage_marker_file(f, staging, L"hostname.marker",
+                               host_utf8, strlen(host_utf8),
+                               L"/etc/appsandbox-hostname");
+        asb_log(L"Linux hostname: staged /etc/appsandbox-hostname = %s", vm_name);
+    }
+
     fclose(f);
     asb_log(L"Linux staging manifest written: %s (%d file(s))", manifest_path, n);
     return n;
@@ -1871,10 +2129,20 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
     }
     SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
 
+    /* Read the current user's Windows regional settings and translate to
+     * Linux. Language is gated to the 8 ISO-preinstalled languages
+     * (else en_US.UTF-8); keyboard + timezone always match the host. */
+    char host_locale[64], host_xkb[32], host_tz[64];
+    detect_host_locale_settings(host_locale, sizeof(host_locale),
+                                host_xkb, sizeof(host_xkb),
+                                host_tz, sizeof(host_tz));
+
     int n_staged = generate_vhdx_manifest_ubuntu(manifest, staging, res_dir,
                                                   args->config.ssh_enabled,
                                                   args->config.admin_user,
-                                                  admin_pw_hash);
+                                                  admin_pw_hash,
+                                                  host_locale, host_xkb, host_tz,
+                                                  args->config.name);
     SecureZeroMemory(admin_pw_hash, sizeof(admin_pw_hash));
     if (n_staged < 0) {
         args->result = E_FAIL;

@@ -111,7 +111,15 @@ function applyOsTypeUI() {
        hidden so the cloud-image code path can be revived without
        re-adding the markup. */
     for (var k = 0; k < needsLinuxVersion.length; k++) needsLinuxVersion[k].style.display = 'none';
+    /* Swap the default VM name between OS conventions, but only when the
+       field still holds the *other* OS's untouched default — never clobber a
+       name the user typed. Linux hostnames must be lowercase. */
+    var nameEl = document.getElementById('vm-name');
+    if (isLinux && nameEl.value === 'MyAppSandbox') nameEl.value = 'myappsandbox';
+    else if (!isLinux && nameEl.value === 'myappsandbox') nameEl.value = 'MyAppSandbox';
     revalidateVmName();
+    revalidateUsername();
+    revalidatePassword();
     updateCreateButtons();
 }
 
@@ -351,9 +359,16 @@ function revalidateVmName() {
     document.getElementById('vm-name-warn').textContent = validateVmName(name) || '';
 }
 document.getElementById('vm-name').addEventListener('input', revalidateVmName);
-document.getElementById('admin-user').addEventListener('input', function() {
-    document.getElementById('admin-user-warn').textContent = validateUsername(this.value.trim()) || '';
-});
+
+function revalidateUsername() {
+    var u = document.getElementById('admin-user').value.trim();
+    document.getElementById('admin-user-warn').textContent = validateUsername(u) || '';
+}
+function revalidatePassword() {
+    var p = document.getElementById('admin-pass').value;
+    document.getElementById('admin-pass-warn').textContent = validatePassword(p) || '';
+}
+document.getElementById('admin-user').addEventListener('input', revalidateUsername);
 
 function checkPasswordMatch() {
     var pass = document.getElementById('admin-pass').value;
@@ -370,7 +385,10 @@ function checkPasswordMatch() {
         confirm.classList.add('pass-mismatch');
     }
 }
-document.getElementById('admin-pass').addEventListener('input', checkPasswordMatch);
+document.getElementById('admin-pass').addEventListener('input', function() {
+    checkPasswordMatch();
+    revalidatePassword();
+});
 document.getElementById('admin-confirm').addEventListener('input', checkPasswordMatch);
 checkPasswordMatch();
 
@@ -424,15 +442,19 @@ function clearCreateForm() {
     updateCreateButtons();
 }
 
+/* VM name / hostname validation. Per-guest-OS rules, keyed off the
+   selected OS Type (on a macOS host the dropdown is locked to 'macOS',
+   so osType is an accurate guest discriminator on all hosts). */
 function validateVmName(name) {
     if (!name) return 'VM name is required.';
     var osSelect = document.getElementById('os-type');
     var osType = osSelect ? osSelect.value : 'Windows';
-    if (hostBridge.isMac) {
+    if (osType === 'macOS') {
         if (name.length > 63) return 'VM name cannot exceed 63 characters (macOS LocalHostName limit).';
     } else if (osType === 'Linux') {
         if (name.length > 63) return 'VM name cannot exceed 63 characters (Linux hostname limit).';
-    } else {
+        if (/[A-Z]/.test(name)) return 'Linux hostname must be lowercase.';
+    } else { /* Windows */
         if (name.length > 15) return 'VM name cannot exceed 15 characters (NetBIOS limit).';
     }
     if (/[^a-zA-Z0-9-]/.test(name)) return 'VM name can only contain letters, digits, and hyphens.';
@@ -448,8 +470,23 @@ function validateVmName(name) {
     return null;
 }
 
+/* Username validation. Per-guest-OS rules keyed off osType. Each branch
+   is explicit so it's clear which OS's account rules apply. */
 function validateUsername(name) {
     if (!name) return 'Username is required.';
+    var osSelect = document.getElementById('os-type');
+    var osType = osSelect ? osSelect.value : 'Windows';
+    if (osType === 'Linux') {
+        /* Ubuntu useradd/adduser: lowercase, start with a letter or
+           underscore, then [a-z0-9_-], max 32 chars. */
+        if (name.length > 32) return 'Username cannot exceed 32 characters (Linux limit).';
+        if (!/^[a-z_][a-z0-9_-]*$/.test(name))
+            return 'Lowercase alphanumeric only.';
+        return null;
+    }
+    /* macOS and Windows: keep the existing Windows-account ruleset.
+       (macOS-specific shortname rules are not yet verified; treated the
+       same as Windows for now — see validatePassword note.) */
     if (name.length > 20) return 'Username cannot exceed 20 characters.';
     if (/["\\/\[\]:;|=,+*?<>]/.test(name)) return 'Username contains invalid characters.';
     if (/^[.\s]+$/.test(name)) return 'Username cannot be only dots or spaces.';
@@ -461,12 +498,33 @@ function validateUsername(name) {
     return null;
 }
 
+/* Password validation. Per-guest-OS rules keyed off osType.
+   - Linux: Ubuntu accepts ALL characters via the host's $6$ hash path
+     (usermod -p bypasses pwquality), so the only limits are non-empty
+     and a sane byte ceiling.
+   - macOS / Windows: no extra content rule enforced here today. */
+function validatePassword(pass) {
+    var osSelect = document.getElementById('os-type');
+    var osType = osSelect ? osSelect.value : 'Windows';
+    if (osType === 'Linux') {
+        if (!pass) return 'Password is required.';
+        /* UTF-8 byte length (encodeURIComponent escapes multibyte). */
+        var bytes = unescape(encodeURIComponent(pass)).length;
+        if (bytes > 255) return 'Password is too long (max 255 bytes).';
+        return null;
+    }
+    /* macOS / Windows: no additional constraints today. */
+    return null;
+}
+
 function onCreateVm() {
     var cfg = gatherConfig();
     var nameErr = validateVmName(cfg.name);
     if (nameErr) { sendCmd('log', { message: nameErr }); return; }
     var userErr = validateUsername(cfg.adminUser);
     if (userErr) { sendCmd('log', { message: userErr }); return; }
+    var passErr = validatePassword(cfg.adminPass);
+    if (passErr) { sendCmd('log', { message: passErr }); return; }
     if (cfg.adminPass !== cfg.adminConfirm) {
         sendCmd('log', { message: 'Passwords do not match.' });
         return;
@@ -514,6 +572,7 @@ function openCreateModal() {
     /* Clear validation state */
     document.getElementById('vm-name-warn').textContent = '';
     document.getElementById('admin-user-warn').textContent = '';
+    document.getElementById('admin-pass-warn').textContent = '';
     checkPasswordMatch();
     onNetModeChange();
     applyOsTypeUI();   /* fires updateCreateButtons + revalidateVmName */

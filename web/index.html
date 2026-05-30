@@ -63,12 +63,6 @@
     <div class="modal wide">
         <h3>New Sandbox</h3>
         <div class="form-grid">
-            <label for="vm-name">VM Name:</label>
-            <div class="form-row">
-                <input type="text" id="vm-name" value="MyAppSandbox" class="input-md">
-                <span class="field-warn" id="vm-name-warn"></span>
-            </div>
-
             <label for="os-type">OS Type:</label>
             <div class="form-row">
                 <select id="os-type" onchange="applyOsTypeUI()">
@@ -76,6 +70,12 @@
                     <option value="Linux">Linux</option>
                     <option value="macOS">macOS</option>
                 </select>
+            </div>
+
+            <label for="vm-name">VM Name:</label>
+            <div class="form-row">
+                <input type="text" id="vm-name" value="MyAppSandbox" class="input-md">
+                <span class="field-warn" id="vm-name-warn"></span>
             </div>
 
             <label class="needs-iso">OS Image:</label>
@@ -150,6 +150,7 @@
                 <label>Confirm:</label>
                 <input type="password" id="admin-confirm" value="test123">
                 <span class="toggle-pass" onmousedown="showPassword()" onmouseup="hidePassword()" onmouseleave="hidePassword()">&#x1F441;</span>
+                <span class="field-warn" id="admin-pass-warn"></span>
             </div>
 
             <label>Options:</label>
