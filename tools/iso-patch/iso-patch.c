@@ -2320,8 +2320,8 @@ static HRESULT raw_to_vhdx(const wchar_t *raw_src, const wchar_t *vhdx_dst,
     vt.VendorId = VHDX_VENDOR_MS_GUID;
 
     /* --- 1. Create empty dynamic VHDX at the raw image's natural size.
-       Per-VM disk-size is the differencing child's responsibility — see
-       disk_util.c::vhdx_create_differencing_resized. */
+       Per-VM disk sizing is handled separately by the differencing
+       child created in disk_util.c. */
     ZeroMemory(&params, sizeof(params));
     params.Version = CREATE_VIRTUAL_DISK_VERSION_2;
     params.Version2.MaximumSize = size_bytes;

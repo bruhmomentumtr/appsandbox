@@ -11,16 +11,6 @@ HRESULT vhdx_create(const wchar_t *path, ULONGLONG size_gb);
    New writes go to child_path; parent_path remains unchanged. */
 HRESULT vhdx_create_differencing(const wchar_t *child_path, const wchar_t *parent_path);
 
-/* Create a differencing child, then resize it to size_gb GiB. The child
-   normally inherits the parent's MaximumSize; on Win10+ ResizeVirtualDisk
-   can stretch the differencing VHDX past the parent, giving per-VM disk
-   sizing without re-doing the qcow2 → raw → VHDX conversion. If size_gb
-   is 0 or <= parent's size, falls through to plain vhdx_create_differencing
-   with no resize attempt. */
-HRESULT vhdx_create_differencing_resized(const wchar_t *child_path,
-                                          const wchar_t *parent_path,
-                                          ULONGLONG size_gb);
-
 /* Merge a differencing VHDX into its parent.
    After merge, child_path can be deleted. */
 HRESULT vhdx_merge(const wchar_t *child_path);
