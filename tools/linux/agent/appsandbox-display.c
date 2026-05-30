@@ -690,8 +690,18 @@ have_card:
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGINT,  on_signal);
-    signal(SIGTERM, on_signal);
+    /* Install SIGINT/SIGTERM WITHOUT SA_RESTART so a blocking accept()
+     * returns EINTR on signal (the loop below checks for it) instead of
+     * auto-restarting. glibc's signal() defaults to BSD SA_RESTART
+     * semantics, which would leave accept() blocked through shutdown and
+     * make systemd wait the full stop timeout. Mirrors the agent. */
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_signal;
+        sigaction(SIGINT,  &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+    }
 
     int srv = vsock_listen(VSOCK_PORT);
     if (srv < 0) return 1;
