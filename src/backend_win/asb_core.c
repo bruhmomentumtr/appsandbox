@@ -2008,10 +2008,10 @@ static HRESULT run_iso_patch_ubuntu(const wchar_t *iso_path,
 
 /* ---- Background Linux create thread (direct ISO -> VHDX) ----
  *
- * Replaces the previous subiquity-via-cidata flow. Spawns iso-patch.exe
- * --ubuntu-to-vhdx which builds a fully-installed ext4 rootfs + signed
- * shim/grub ESP directly from the user-picked Ubuntu Desktop ISO. No
- * autoinstall, no cidata, no user interaction during install.
+ * Spawns iso-patch.exe --ubuntu-to-vhdx, which builds a fully-installed
+ * ext4 rootfs + signed shim/grub ESP directly from the user-picked
+ * Ubuntu Desktop ISO. Host-side install (squashfs -> ext4), no in-guest
+ * installer and no user interaction.
  *
  * First-boot configuration (hostname, user, network, OOBE skip,
  * grub-install/update-grub) runs from a one-shot systemd unit planted
@@ -2041,8 +2041,9 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
     wchar_t *slash;
 
     /* ---- 1. Build the VHDX directly from the Ubuntu ISO via iso-patch.
-       No subiquity, no cidata, no user interaction. The first-boot service
-       planted inside the rootfs handles per-VM configuration. ---- */
+       Host-side install (squashfs -> ext4), no in-guest installer. The
+       first-boot service planted inside the rootfs handles per-VM
+       configuration. ---- */
     asb_log(L"Building Linux VHDX from %s (size=%lu GB)...",
             args->config.image_path, args->config.hdd_gb);
     DeleteFileW(args->config.vhdx_path);
@@ -2170,8 +2171,10 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
        runtime VM — the installed VHDX is fully self-bootable. */
     args->config.image_path[0] = L'\0';
 
-    /* ---- 2. NAT IP allocation (post-build; the rootfs uses DHCP via
-       NetworkManager so the IP doesn't need to be baked in at build time). ---- */
+    /* ---- 2. NAT IP allocation. The chosen static /24 address is baked
+       into the HCN endpoint policy below and pushed to the guest at
+       runtime by the agent (set_ip -> static netplan); the guest never
+       DHCPs in NAT mode. ---- */
     if (args->config.network_mode == NET_NAT && args->vm_index >= 0 && args->vm_index < g_vm_count) {
         if (allocate_nat_ip(&g_vms[args->vm_index])) {
             asb_log(L"Allocated NAT IP %S for new VM.", g_vms[args->vm_index].nat_ip);
@@ -2476,8 +2479,8 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     if (cfg.ram_mb == 0) cfg.ram_mb = 4096;
     if (cfg.cpu_cores == 0) cfg.cpu_cores = 4;
 
-    /* Linux defaults: respect the UI's gpu_mode (GPU-PV now works via
-       autoinstall-built dxgkrnl + asb_drm). Force test_mode=TRUE so the
+    /* Linux defaults: respect the UI's gpu_mode (GPU-PV works via
+       DKMS-built dxgkrnl + asb_drm). Force test_mode=TRUE so the
        unsigned out-of-tree .ko's load — Secure Boot would otherwise
        reject them, and we don't ship a MOK enrollment flow. */
     if (_wcsicmp(cfg.os_type, L"Linux") == 0) {
@@ -2654,17 +2657,16 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         }
     }
 
-    /* ---- Linux cloud-image path (parallel to use_vhdx_first) ----
+    /* ---- Linux creation path (parallel to use_vhdx_first) ----
      *
-     * Linux VMs differencing-clone off a cached Ubuntu Server cloud image
-     * and use cidata.iso for first-boot config. The cloud-image fetch
-     * (770 MB on first use) is slow, so the whole flow runs on a worker
-     * thread; the UI thread returns immediately. */
+     * Linux VMs build a bootable VHDX directly from the user-picked Ubuntu
+     * Desktop ISO. The build (squashfs -> ext4 + host-side prefetches) is
+     * slow, so the whole flow runs on a worker thread (linux_create_thread);
+     * the UI thread returns immediately. */
     {
-        /* Linux VM creation: ISO-based manual install. image_path is the
-           Ubuntu Desktop (or other Linux) installer ISO the user picked.
-           admin_pass is no longer required at create-time — the user
-           supplies it interactively to the installer. */
+        /* image_path is the Ubuntu Desktop installer ISO the user picked;
+           the VHDX is built from it on the host. admin_pass flows through
+           to the guest's firstboot as a $6$ hash (see linux_create_thread). */
         BOOL use_linux_cloud = (!from_template && !is_template_create &&
                                 _wcsicmp(cfg.os_type, L"Linux") == 0 &&
                                 cfg.image_path[0] != L'\0');
@@ -2787,8 +2789,8 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
                 else asb_log(L"Warning: Failed to create resources ISO (0x%08X).", hr);
             }
             /* Linux: handled entirely in linux_create_thread via the
-               use_linux_cloud branch above. No synchronous Linux cidata
-               path here. */
+               use_linux_cloud branch above. No synchronous Linux path
+               here. */
         }
     }
     SecureZeroMemory(cfg.admin_pass, sizeof(cfg.admin_pass));

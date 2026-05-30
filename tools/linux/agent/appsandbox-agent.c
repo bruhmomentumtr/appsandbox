@@ -211,12 +211,12 @@ static void find_mutter_xauth(uid_t uid, char *out, size_t cap)
 /* True if the UID looks like a regular human user we can spawn the
  * clipboard helper as — has a /home/... directory and a real login shell.
  *
- * Without this filter we'd accept system users like gdm (UID is in the
- * 1000-65534 range on Ubuntu, but pw_dir=/var/lib/gdm3 and
+ * Without this filter we'd accept system users like gdm (pw_dir=/var/lib/gdm3,
  * pw_shell=/usr/sbin/nologin). The greeter's own mutter creates a
  * /run/user/<gdm-uid>/.mutter-Xwaylandauth.* cookie for the login screen,
  * which would match the xauth probe. Spawning the clipboard helper as gdm
- * crashloops (exit 1) until the user actually logs in. */
+ * crashloops (exit 1) until the user actually logs in. The pw_dir + shell
+ * checks below reject gdm regardless of its UID. */
 static int uid_is_real_user(uid_t uid)
 {
     struct passwd *pw = getpwuid(uid);
@@ -507,12 +507,11 @@ static void handle_set_ip(int fd, const char *tag, const char *args)
     snprintf(gw, sizeof(gw), "%s", colon2 + 1);
 
     n = snprintf(cmd, sizeof(cmd),
-        /* Detect the active netplan renderer. Ubuntu Desktop ships with
-         * NetworkManager; Server ships with systemd-networkd. cloud-init
-         * picks the matching one at install time, and netplan generates
-         * config files for whichever is active. Forcing the wrong one
-         * makes the active renderer stop managing the NIC entirely
-         * (which is why "no network in Ubuntu Settings" happened). */
+        /* Pick the renderer by probing whether the NetworkManager service
+         * is active (Ubuntu Desktop); otherwise default to systemd-networkd
+         * (Server). Writing a netplan with the wrong renderer makes the
+         * active one stop managing the NIC entirely (which is why "no
+         * network in Ubuntu Settings" happened). */
         "RENDERER=networkd; "
         "if systemctl is-active --quiet NetworkManager; then "
         "  RENDERER=NetworkManager; "

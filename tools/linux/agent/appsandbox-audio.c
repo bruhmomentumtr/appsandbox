@@ -27,9 +27,9 @@
  *     u32 magic        = 'ASA1' (0x31415341)
  *     u32 sample_rate  = 48000
  *     u16 channels     = 2
- *     u16 bits         = 16
+ *     u16 bits         = 32
  *     u16 format_tag   = 1 (WAVE_FORMAT_PCM)
- *     u16 block_align  = 4
+ *     u16 block_align  = 8
  *
  *   then repeating:
  *     u32 bytes
@@ -70,7 +70,8 @@
 #define BYTES_PER_PACKET    (FRAMES_PER_PACKET * BLOCK_ALIGN)
 
 /* snd-aloop pairs playback subdev N on device 0 with capture subdev N
- * on device 1. Any of the eight subdevs would work; pick 0. */
+ * on device 1. We capture subdev 0 (hw:Loopback,1,0); the WirePlumber
+ * policy routes desktop playback to the matching hw:Loopback,0,0. */
 #define LOOPBACK_CAPTURE_PCM   "hw:Loopback,1,0"
 
 #pragma pack(push, 1)
@@ -229,7 +230,7 @@ static void serve(int client_fd)
         return;
     }
 
-    /* Stream loop. snd_pcm_readi blocks until a period's worth of frames
+    /* Stream loop. snd_pcm_readn blocks until a period's worth of frames
      * is available — the snd-aloop kernel module fills its ring as soon
      * as the playback side writes, so this also paces our send rate.
      *

@@ -51,44 +51,6 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
                                        BOOL ssh_enabled,
                                        const wchar_t *lang);
 
-/* Create a cloud-init NoCloud "cidata" ISO for Ubuntu guests. Combines
-   the cidata datasource (user-data + meta-data) with the resources tree
-   (agent ELFs, dxgkrnl + asb_drm modules, wsl-mesa, wsl-deps .so, setup.sh,
-   systemd units) on a single ISO9660 volume labelled "cidata". On a
-   freshly-booted Ubuntu Server cloud image, cloud-init reads user-data
-   from this ISO and runs setup.sh which installs ubuntu-desktop, our
-   agent service, and the GPU-PV bits.
-   The password is wiped from memory after use. */
-/* `nat_ip` is the host-allocated /24 address (e.g. "192.168.42.5") for
-   NAT-mode VMs, or NULL for other network modes (external = DHCP works,
-   none = no network). When set, the generated network-config writes a
-   static netplan for eth0 so cloud-init brings networking up at boot
-   without waiting for DHCP. The agent overrides this on every boot via
-   /etc/netplan/99-appsandbox.yaml. */
-HRESULT iso_create_resources_ubuntu(const wchar_t *iso_path,
-                                     const wchar_t *vm_name,
-                                     const wchar_t *admin_user,
-                                     wchar_t *admin_pass,
-                                     const wchar_t *res_dir,
-                                     BOOL ssh_enabled,
-                                     const char *nat_ip);
-
-/* Ensure the cached, ready-to-boot Ubuntu cloud-image VHDX exists in
-   C:\ProgramData\AppSandbox\linux-base\<version>\base.vhdx. If not,
-   downloads the .tar.gz from cloud-images.ubuntu.com, extracts the raw
-   .img, appends a VHD-fixed footer, converts VHD->VHDX via
-   CreateVirtualDisk SourcePath, marks the result read-only.
-
-   `version` is currently a fixed string: L"ubuntu-26.04". Future
-   versions will accept other LTS codenames.
-
-   On success, fills `out_vhdx_path` with the cached file path.
-   Returns S_OK if the file is in the cache (either already-cached or
-   freshly-downloaded). */
-HRESULT ensure_ubuntu_cloud_image_cached(const wchar_t *version,
-                                          wchar_t *out_vhdx_path,
-                                          int out_max);
-
 /* ---- VHDX-First VM Creation (no resources ISO) ---- */
 
 /* Forward declaration for GPU share list */

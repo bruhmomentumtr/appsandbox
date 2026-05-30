@@ -242,7 +242,7 @@ out:
 /* ---- Cursor plane: discover + emit ASCR on change ----
  *
  * Mutter updates the cursor plane independently of the primary plane,
- * so the host sees smooth pointer movement even at our 30 fps primary
+ * so the host sees smooth pointer movement even at our TARGET_FPS primary
  * cadence. We cache the plane id + the CRTC_X / CRTC_Y / HOTSPOT_X /
  * HOTSPOT_Y property ids once at startup, then on every tick read the
  * current values via drmModeObjectGetProperties (one ioctl, ~µs cost). */
@@ -506,13 +506,14 @@ static void capture_loop(int client_fd)
 {
     struct capture_ctx ctx = { .fd = -1, .dma_fd = -1 };
 
-    /* Find a /dev/dri/cardN with a connected output, in driver preference
-     * order:
+    /* Find a /dev/dri/cardN by DRM driver name, in preference order:
      *   asb_drm     — our custom virtual display driver (preferred)
      *   hyperv_drm  — Hyper-V synthetic GPU (fallback for VMs without asb_drm)
      *
-     * Skip boot framebuffers (simpledrm/efifb/vesafb) — they always report
-     * a connected output but Mutter isn't rendering there. */
+     * Matching on driver name inherently skips the boot framebuffers
+     * (simpledrm/efifb/vesafb) that Mutter isn't rendering to. The legacy
+     * fallback below (used only if neither driver is found) is the path
+     * that filters on a connected connector instead. */
     static const char *DRIVER_PRIORITY[] = {
         "asb_drm",
         "hyperv_drm",

@@ -194,8 +194,8 @@ typedef struct {
     uint64_t root_length;      /* bytes */
 } linux_gpt_layout_t;
 
-/* Byte-equivalent to POC gpt.c::gpt_write. Differences from earlier port
- * (all bugs that broke boot, see POC gpt.c for line-by-line rationale):
+/* Write a protective-MBR + primary/backup GPT for the Gen2 VHDX.
+ * Notable correctness points (each was a boot-breaker if wrong):
  *   - NPART=4 (multiple-of-4 required by Windows; last 2 zeroed)
  *   - RewritePartition=TRUE on each active entry
  *   - Gpt.MaxPartitionCount=128 on CREATE_DISK and layout
@@ -320,7 +320,7 @@ static BOOL apply_linux_gpt_layout(HANDLE disk_handle,
     free(layout);
 
     /* DELIBERATELY no IOCTL_DISK_UPDATE_PROPERTIES here — deferred to the
-       caller after ext4 writes complete. See header comment + POC gpt.c. */
+       caller after ext4 writes complete. See header comment above. */
 
     out_layout->esp_offset  = esp_start_lba  * SECTOR_BYTES;
     out_layout->esp_length  = (esp_end_lba  - esp_start_lba  + 1) * SECTOR_BYTES;
@@ -521,7 +521,7 @@ static int write_redirect_grub_cfg(const wchar_t *esp_dir, const char *root_uuid
 }
 
 /* ======================================================================
- *  Squashfs -> ext4 ingest pipeline (port of POC main.c producer/consumer).
+ *  Squashfs -> ext4 ingest pipeline (producer/consumer).
  *
  *  - producer (walker thread, this thread): walks squashfs entries,
  *    dispatches files to N decompress workers, pushes non-files inline
@@ -940,8 +940,8 @@ static int stage_grub_modules(wchar_t iso_letter, ext4_writer_t *ew)
  *  At first boot we write /etc/apt/sources.list.d/appsandbox-local.list
  *  pointing at file:/opt/appsandbox/local-apt resolute main, then run
  *  apt update + apt install — no network required for dkms +
- *  build-essential + linux-headers-$KVER. Matches the f361def flow's
- *  install-phase apt availability without needing subiquity.
+ *  build-essential + linux-headers-$KVER. installed from the staged
+ *  local apt mirror.
  * ====================================================================== */
 
 /* Recursively copy a host directory tree into the ext4 writer under a
@@ -1066,7 +1066,7 @@ static int stage_local_apt(wchar_t iso_letter, ext4_writer_t *ew)
 
 static void plant_firstboot_service(ext4_writer_t *ew)
 {
-    /* Defensive variant of the POC firstboot script:
+    /* First-boot provisioning script:
      *   - NO `set -e` — we want every step attempted even if earlier ones
      *     failed (e.g. grub-install missing from minimal.squashfs)
      *   - `set -x` so every command is echoed to stderr → systemd journal
@@ -1086,7 +1086,7 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "set -o pipefail\n"
         "echo \"\"\n"
         "echo \"================================================================\"\n"
-        "echo \"==== poc-firstboot starting $(date -u 2>/dev/null || echo ?) ====\"\n"
+        "echo \"==== appsandbox-firstboot starting $(date -u 2>/dev/null || echo ?) ====\"\n"
         "echo \"================================================================\"\n"
         "\n"
         "# diagnostic: what's actually in the rootfs?\n"
@@ -1241,7 +1241,7 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "EOF\n"
         "\n"
         "# ============================================================\n"
-        "# AppSandbox guest extras install (was setup.sh in old flow)\n"
+        "# AppSandbox guest extras install\n"
         "# ============================================================\n"
         "EXTRAS=/opt/appsandbox\n"
         "\n"
@@ -1392,7 +1392,7 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "      && echo \"OK: /etc/modprobe.d/asb_drm.conf\" || echo \"FAIL\"\n"
         "fi\n"
         "# dxgkrnl auto-load: the repo has no modules-load.d-dxgkrnl.conf,\n"
-        "# so create one inline (matches f361def setup.sh line 2728). Without\n"
+        "# so create one inline. Without\n"
         "# this, dxgkrnl loads once via STEP 16 modprobe but is gone after\n"
         "# the STEP 99 reboot, silently breaking /dev/dxg + GPU-PV.\n"
         "echo dxgkrnl > /etc/modules-load.d/dxgkrnl.conf \\\n"
@@ -1538,7 +1538,7 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "command -v dconf >/dev/null 2>&1 && dconf update 2>&1 || echo \"SKIP dconf update\"\n"
         "# Kernel cmdline drop-in: suppress efifb/simplefb fbdev paths so\n"
         "# asb_drm is the only DRM device on subsequent boots. Matches the\n"
-        "# old flow's late-commands grub.d snippet (f361def line ~2454).\n"
+        "# a grub.d drop-in.\n"
         "# NOTE this doesn't kill simpledrm on Hyper-V Gen 2 by itself —\n"
         "# asb-evict-simpledrm.service handles that — but it stops legacy\n"
         "# fbdev paths from also binding.\n"
@@ -1647,14 +1647,14 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "# --- STEP 99: Mark done + reboot ---\n"
         "echo \"==== STEP 99: mark done + reboot ====\"\n"
         "mkdir -p /var/lib || true\n"
-        "touch /var/lib/poc-firstboot.done\n"
-        "systemctl disable poc-firstboot.service 2>&1 || true\n"
+        "touch /var/lib/appsandbox-firstboot.done\n"
+        "systemctl disable appsandbox-firstboot.service 2>&1 || true\n"
         "sync\n"
-        "echo \"==== poc-firstboot finished, rebooting ====\"\n"
+        "echo \"==== appsandbox-firstboot finished, rebooting ====\"\n"
         "systemctl reboot --force --force\n";
 
     ext4_mkdir_p(ew, "/usr/local/bin");
-    ext4_writer_add_file(ew, "/usr/local/bin/poc-firstboot.sh",
+    ext4_writer_add_file(ew, "/usr/local/bin/appsandbox-firstboot.sh",
                          0755, 0, 0, (uint32_t)time(NULL),
                          firstboot_sh, strlen(firstboot_sh));
 
@@ -1666,12 +1666,12 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "[Unit]\n"
         "Description=AppSandbox first-boot setup\n"
         "After=local-fs.target\n"
-        "ConditionPathExists=!/var/lib/poc-firstboot.done\n"
+        "ConditionPathExists=!/var/lib/appsandbox-firstboot.done\n"
         "\n"
         "[Service]\n"
         "Type=oneshot\n"
         "RemainAfterExit=yes\n"
-        "ExecStart=/usr/local/bin/poc-firstboot.sh\n"
+        "ExecStart=/usr/local/bin/appsandbox-firstboot.sh\n"
         "StandardOutput=journal+console\n"
         "StandardError=journal+console\n"
         "TimeoutStartSec=300\n"
@@ -1679,7 +1679,7 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "[Install]\n"
         "WantedBy=multi-user.target\n";
     ext4_mkdir_p(ew, "/etc/systemd/system");
-    ext4_writer_add_file(ew, "/etc/systemd/system/poc-firstboot.service",
+    ext4_writer_add_file(ew, "/etc/systemd/system/appsandbox-firstboot.service",
                          0644, 0, 0, (uint32_t)time(NULL),
                          firstboot_unit, strlen(firstboot_unit));
 
@@ -1687,9 +1687,9 @@ static void plant_firstboot_service(ext4_writer_t *ew)
        `systemctl enable` writes at runtime. */
     ext4_mkdir_p(ew, "/etc/systemd/system/multi-user.target.wants");
     ext4_writer_add_symlink(ew,
-        "/etc/systemd/system/multi-user.target.wants/poc-firstboot.service",
-        "/etc/systemd/system/poc-firstboot.service",
-        (uint32_t)strlen("/etc/systemd/system/poc-firstboot.service"),
+        "/etc/systemd/system/multi-user.target.wants/appsandbox-firstboot.service",
+        "/etc/systemd/system/appsandbox-firstboot.service",
+        (uint32_t)strlen("/etc/systemd/system/appsandbox-firstboot.service"),
         0, 0, (uint32_t)time(NULL));
 }
 
@@ -1896,7 +1896,7 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
         params.Version2.SectorSizeInBytes = 512;
         params.Version2.PhysicalSectorSizeInBytes = 4096;
         /* Dynamic VHDX: file grows on demand, matches the Windows
-           --to-vhdx path. The POC used fixed for raw-write speed but
+           --to-vhdx path. An earlier revision used fixed allocation but
            with the GPT/UPDATE_PROPERTIES bug fixed, dynamic works for
            Linux too and saves the upfront 40 GB zeroing. */
         result = CreateVirtualDisk(&st, vhdx_path,
@@ -1916,7 +1916,7 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
         /* BYPASS_DEFAULT_ENCRYPTION_POLICY: prevents the new VHDX from
            auto-inheriting BitLocker encryption on host volumes that have
            default-encrypt enabled, which would block UEFI from reading
-           our boot sectors. Matches POC vhdx.c:114-119. */
+           our boot sectors.  */
         result = AttachVirtualDisk(vhdx_handle, NULL,
                                    ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER |
                                    ATTACH_VIRTUAL_DISK_FLAG_BYPASS_DEFAULT_ENCRYPTION_POLICY,
@@ -1936,7 +1936,7 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
         disk_number = u_get_disk_number_from_path(phys_path);
     }
     /* FILE_FLAG_NO_BUFFERING + FILE_FLAG_WRITE_THROUGH: mandatory for fast
-       writes through \\.\PhysicalDriveN (POC gpt.c:24-31). Without these,
+       writes through \\.\PhysicalDriveN. Without these,
        writes go through NTFS cache - 10-30 MB/s throughput AND ordering
        issues. NO_BUFFERING requires sector-aligned offsets/lengths/buffers,
        which the ext4 writer already guarantees. */
