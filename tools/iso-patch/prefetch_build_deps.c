@@ -1,9 +1,10 @@
 /* prefetch_build_deps.c - see header for design.
  *
  * Pipeline:
- *   1. WinHTTP-download Packages.gz for <codename>/main/binary-amd64
- *   2. Shell out to %SystemRoot%\System32\tar.exe to gunzip it
- *      (avoids vendoring zlib; tar.exe ships with Win10+ since 1803)
+ *   1. WinHTTP-download Packages.xz for <codename>/main/binary-amd64
+ *   2. Decompress it in-process with the vendored xz-embedded decoder
+ *      (xz_decompress_file_to_file below; Packages.gz is raw-gzipped
+ *      text that tar.exe rejects, so we target the .xz instead).
  *   3. Parse the resulting text into a hashtable of stanzas keyed by
  *      Package name. Each stanza is stored verbatim so we can write
  *      it back into the synthetic Packages we ship.
@@ -15,9 +16,10 @@
  *      rewriting Filename: to point at the local basename so
  *      apt's file:/// source resolves correctly.
  *   7. Write .closure.json (free-form, easy enough to hand-format).
- *   8. Atomic-rename staging dir -> out_dir.
+ *      Output is written directly into out_dir (per-VM staging, no
+ *      host cache layer).
  *
- * Memory: the Packages file is ~125 KiB uncompressed for resolute/main.
+ * Memory: the decompressed Packages file is a few MiB (resolute/main).
  * We slurp the whole thing into memory and parse in-place. Stanzas
  * point into that single buffer (no per-stanza allocations).
  */
@@ -103,7 +105,7 @@ static BOOL u_rmdir_recursive(const wchar_t *path)
  * decode directly with the xz_dec already linked in iso-patch.exe.
  *
  * Streams the decompressed output to disk in 4 MiB chunks so the
- * Packages file (~50 MiB uncompressed for Ubuntu's main component)
+ * Packages file (a few MiB uncompressed for Ubuntu's main component)
  * never has to fit in RAM as a single buffer. */
 static int xz_decompress_file_to_file(const wchar_t *src,
                                       const wchar_t *dst)
