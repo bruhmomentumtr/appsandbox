@@ -50,4 +50,13 @@ BOOL gpu_get_default_driver_path(GpuList *list,
    Returns TRUE if shares are available. */
 BOOL gpu_get_driver_shares(GpuList *gpu_list, GpuDriverShareList *out);
 
+/* Append the host's lxss\lib directory as a synthetic Plan9 share entry
+   (name "AppSandbox.HostLxssLib") to a share list. Linux guests need
+   this — Microsoft's WSL installer stages NVIDIA's Linux userspace .so
+   files there and a Linux VM with GPU-PV mounts it at /usr/lib/wsl/lib.
+   Windows guests don't, so callers should gate on os_type. Returns TRUE
+   if the share was added, FALSE if the directory doesn't exist or the
+   list is full. */
+BOOL gpu_append_lxsslib_share(GpuDriverShareList *list);
+
 #endif /* GPU_ENUM_H */

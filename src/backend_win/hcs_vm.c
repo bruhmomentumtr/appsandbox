@@ -5,28 +5,6 @@
 #include <sddl.h>
 #include <aclapi.h>
 
-/* Get current user's SID as a string (e.g. "S-1-5-21-...").
-   Caller must LocalFree the returned string. Returns NULL on failure. */
-static wchar_t *get_current_user_sid(void)
-{
-    HANDLE token;
-    TOKEN_USER *tu = NULL;
-    DWORD len = 0;
-    wchar_t *sid_str = NULL;
-
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
-        return NULL;
-
-    GetTokenInformation(token, TokenUser, NULL, 0, &len);
-    tu = (TOKEN_USER *)HeapAlloc(GetProcessHeap(), 0, len);
-    if (tu && GetTokenInformation(token, TokenUser, tu, len, &len))
-        ConvertSidToStringSidW(tu->User.Sid, &sid_str);
-
-    if (tu) HeapFree(GetProcessHeap(), 0, tu);
-    CloseHandle(token);
-    return sid_str;
-}
-
 /* ---- HCS function pointer types ---- */
 
 typedef void (CALLBACK *HCS_OPERATION_COMPLETION)(HCS_OPERATION op, void *ctx);
@@ -66,12 +44,12 @@ typedef HRESULT (WINAPI *PFN_HcsCreateEmptyRuntimeStateFile)(PCWSTR path);
 typedef HRESULT (WINAPI *PFN_HcsEnumerateComputeSystems)(
     PCWSTR query, HCS_OPERATION op);
 
-/* HCS V1 callback API — matches hcsshim/moby (proven reliable).
+/* HCS V1 callback API.
    HcsRegisterComputeSystemCallback / HcsUnregisterComputeSystemCallback */
 
 typedef void *HCS_CALLBACK;  /* Opaque callback handle */
 
-/* V1 notification types (from hcsshim callback.go) */
+/* V1 notification types */
 #define HCS_NOTIFY_INVALID                        0x00000000
 #define HCS_NOTIFY_SYSTEM_EXITED                  0x00000001
 #define HCS_NOTIFY_SYSTEM_CREATE_COMPLETED        0x00000002
@@ -162,6 +140,93 @@ static void escape_json_path(const wchar_t *in, wchar_t *out, size_t out_size)
     out[j] = L'\0';
 }
 
+/* Fill `out` with the current process user's SID in string form
+   (e.g. L"S-1-5-21-..."), suitable for the HCS VideoMonitor
+   ConnectionOptions.AccessSids array. Returns TRUE on success.
+   OpenProcessToken -> GetTokenInformation(TokenUser) -> ConvertSidToStringSidW.
+   Caches the result since the process user can't change at runtime. */
+static BOOL get_current_user_sid_string(wchar_t *out, size_t out_chars)
+{
+    static wchar_t cached[128] = {0};
+    HANDLE token = NULL;
+    DWORD needed = 0;
+    PTOKEN_USER tu = NULL;
+    LPWSTR sid_str = NULL;
+    BOOL ok = FALSE;
+
+    if (cached[0]) {
+        wcscpy_s(out, out_chars, cached);
+        return TRUE;
+    }
+
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return FALSE;
+
+    GetTokenInformation(token, TokenUser, NULL, 0, &needed);
+    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && needed > 0) {
+        tu = (PTOKEN_USER)HeapAlloc(GetProcessHeap(), 0, needed);
+        if (tu && GetTokenInformation(token, TokenUser, tu, needed, &needed)) {
+            if (ConvertSidToStringSidW(tu->User.Sid, &sid_str) && sid_str) {
+                wcsncpy_s(cached, 128, sid_str, _TRUNCATE);
+                wcscpy_s(out, out_chars, cached);
+                LocalFree(sid_str);
+                ok = TRUE;
+            }
+        }
+        if (tu) HeapFree(GetProcessHeap(), 0, tu);
+    }
+
+    CloseHandle(token);
+    return ok;
+}
+
+void hcs_service_guid(const wchar_t *os_type, unsigned port, GUID *out)
+{
+    /* Default to Windows-style GUIDs whenever os_type isn't explicitly
+       set to a non-Windows value. Protects existing Windows VMs from any
+       regression if their os_type field happens to be missing/empty —
+       e.g. a vms.cfg entry from an older build that pre-dates the field.
+       Only the explicit string "Linux" (or any other non-Windows guest
+       string in the future) flips to the vsock-template GUIDs. */
+    BOOL is_windows = !os_type
+                   || os_type[0] == L'\0'
+                   || _wcsicmp(os_type, L"Windows") == 0;
+    if (is_windows) {
+        /* a5b0cafe-<port>-4000-8000-000000000001 — the original AppSandbox
+           service GUIDs, reached via AF_HYPERV from a Windows guest. */
+        out->Data1    = 0xa5b0cafeu;
+        out->Data2    = (unsigned short)port;
+        out->Data3    = 0x4000;
+        out->Data4[0] = 0x80; out->Data4[1] = 0x00;
+        out->Data4[2] = 0x00; out->Data4[3] = 0x00;
+        out->Data4[4] = 0x00; out->Data4[5] = 0x00;
+        out->Data4[6] = 0x00; out->Data4[7] = 0x01;
+    } else {
+        /* <port>-FACB-11E6-BD58-64006A7986D3 — the Linux vsock template.
+           A Linux guest calling bind/connect on AF_VSOCK port N is mapped
+           by hv_sock onto exactly this GUID on the Hyper-V side. */
+        out->Data1    = port;
+        out->Data2    = 0xFACB;
+        out->Data3    = 0x11E6;
+        out->Data4[0] = 0xBD; out->Data4[1] = 0x58;
+        out->Data4[2] = 0x64; out->Data4[3] = 0x00;
+        out->Data4[4] = 0x6A; out->Data4[5] = 0x79;
+        out->Data4[6] = 0x86; out->Data4[7] = 0xD3;
+    }
+}
+
+void hcs_service_guid_str(const wchar_t *os_type, unsigned port,
+                          wchar_t *out, size_t out_chars)
+{
+    GUID g;
+    hcs_service_guid(os_type, port, &g);
+    swprintf_s(out, out_chars,
+        L"%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        g.Data1, g.Data2, g.Data3,
+        g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3],
+        g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+}
+
 /* HCS_E_OPERATION_TIMEOUT — returned by HcsWaitForOperationResult on timeout */
 #ifndef HCS_E_OPERATION_TIMEOUT
 #define HCS_E_OPERATION_TIMEOUT ((HRESULT)0x80370102L)
@@ -221,7 +286,7 @@ void hcs_set_state_callback(HcsVmStateCallback cb)
     g_state_callback = cb;
 }
 
-/* V1 names (HcsRegisterComputeSystemCallback — hcsshim/moby numbering) */
+/* V1 names (HcsRegisterComputeSystemCallback notification numbering) */
 static const wchar_t *hcs_notify_name_v1(DWORD type)
 {
     switch (type) {
@@ -279,7 +344,7 @@ static void hcs_cb_log(const wchar_t *fmt, ...)
     }
 }
 
-/* V1 callback — matches hcsshim notificationWatcher signature */
+/* V1 callback signature */
 static void CALLBACK hcs_notify_cb_v1(
     DWORD notificationType, void *context, HRESULT notificationStatus, PCWSTR notificationData)
 {
@@ -327,7 +392,7 @@ void hcs_register_vm_callback(VmInstance *instance)
         return;
     }
 
-    /* Try V1 first (hcsshim/moby pattern) */
+    /* Try V1 first */
     if (pfnRegisterCallback) {
         HCS_CALLBACK cb_handle = NULL;
         hr = pfnRegisterCallback(instance->handle, hcs_notify_cb_v1, instance, &cb_handle);
@@ -780,8 +845,10 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     wchar_t secureboot_section[512];
     wchar_t security_section[512];
     wchar_t guest_state_section[1024];
-    wchar_t video_section[1024];
+    wchar_t video_section[2048];
+    wchar_t comports_section[512];
     wchar_t plan9_section[5120];
+    wchar_t service_table[2048];
     wchar_t vmgs_path[MAX_PATH];
     wchar_t vmrs_path[MAX_PATH];
     wchar_t dir[MAX_PATH];
@@ -822,7 +889,10 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
 
     /* Secure Boot — uses ApplySecureBootTemplate + SecureBootTemplateId
        inside the Uefi section. No BootThis — UEFI auto-discovers boot devices.
-       Skip when test_mode is enabled (required for test-signed drivers like VDD). */
+       Skip when test_mode is enabled (required for test-signed drivers like VDD).
+       Linux: never applies a template — the direct-ISO->VHDX build produces an
+       unsigned GRUB/kernel chain, so Secure Boot would block boot. Only the
+       Windows, non-test-mode path applies the MS UEFI CA template below. */
     secureboot_section[0] = L'\0';
     if (config->test_mode) {
         /* No Secure Boot — allows test-signed drivers to load */
@@ -832,8 +902,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             L",\"SecureBootTemplateId\":\"1734c6e8-3154-4dda-ba5f-a874cc483422\"");
     } else {
         wcscpy_s(secureboot_section, 512,
-            L",\"ApplySecureBootTemplate\":\"Apply\""
-            L",\"SecureBootTemplateId\":\"272e7447-90a4-4563-a4b9-8e4ab00526ce\"");
+            L",\"ApplySecureBootTemplate\":\"Skip\"");
     }
 
     /* VMGS + VMRS files — always created regardless of TPM/SecureBoot.
@@ -894,13 +963,31 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         L"\"RuntimeStateFilePath\":\"%s\""
         L"}", vmgs_esc, vmrs_esc);
 
-    /* VideoMonitor is REQUIRED — vmwp.exe crashes (0xC0000005) without it.
-       No ConnectionOptions/named pipe — IDD via agent is the display path. */
+    /* VideoMonitor is REQUIRED for all OSes — vmwp.exe crashes (0xC0000005)
+       without it. No ConnectionOptions/named pipe — IDD via agent is the
+       display path. (Matches master branch hcs_vm.c.) */
     wcscpy_s(video_section, 1024,
         L"\"VideoMonitor\":{"
             L"\"HorizontalResolution\":1024,"
             L"\"VerticalResolution\":768"
         L"},");
+
+    /* ComPorts — virtual COM1 wired to a named pipe (\\.\pipe\<vm>.com1)
+       for Linux VMs. systemd's StandardOutput=journal+console writes
+       firstboot script output to /dev/console (= /dev/ttyS0 = com1),
+       which is the only practical way to debug agent / DKMS build
+       failures from the host without an SSH session into the guest.
+       Windows VMs omit it. */
+    comports_section[0] = L'\0';
+    if (!is_windows) {
+        wchar_t name_esc[MAX_PATH * 2];
+        escape_json_path(config->name, name_esc, MAX_PATH * 2);
+        swprintf_s(comports_section, 512,
+            L"\"ComPorts\":{"
+                L"\"0\":{\"NamedPipe\":\"\\\\\\\\.\\\\pipe\\\\%s.com1\"}"
+            L"},",
+            name_esc);
+    }
 
     /* SecuritySettings with TPM — enabled for all Windows VMs.
        TPM does not block test-signed drivers; only Secure Boot does. */
@@ -953,29 +1040,35 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             ui_log(L"Plan9 share: %s -> %s", ds->share_name, ds->host_path);
         }
 
-        /* lxss\lib: GPU libs for Linux guests */
-        {
-            wchar_t sys_dir[MAX_PATH];
-            wchar_t path[MAX_PATH];
-            GetSystemDirectoryW(sys_dir, MAX_PATH);
-            swprintf_s(path, MAX_PATH, L"%s\\lxss\\lib", sys_dir);
-            if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
-                if (pfnGrantAccess) pfnGrantAccess(config->name, path);
-                escape_json_path(path, esc_buf, MAX_PATH * 2);
-                swprintf_s(shares + wcslen(shares), 8192 - wcslen(shares),
-                    L"%s{\"Name\":\"AppSandbox.HostLxssLib\","
-                    L"\"AccessName\":\"AppSandbox.HostLxssLib\","
-                    L"\"Path\":\"%s\","
-                    L"\"Port\":50001,"
-                    L"\"Flags\":1}",
-                    share_count > 0 ? L"," : L"", esc_buf);
-                share_count++;
-            }
-        }
-
         if (share_count > 0) {
             swprintf_s(plan9_section, 5120,
                 L",\"Plan9\":{\"Shares\":[%s]}", shares);
+        }
+    }
+
+    /* ServiceTable: list the AppSandbox service GUIDs the guest is
+       permitted to bind on. Windows guests get the a5b0cafe-XXXX-...
+       form (reached via AF_HYPERV from the in-VM agent and helpers).
+       Linux guests get the vsock-template form so a guest doing
+       bind(AF_VSOCK, port=N) ends up registered as the corresponding
+       <N>-FACB-... GUID on the host side. Same security descriptors
+       for both. Ports 1–6 cover agent + frame + input + audio + the
+       two clipboard channels. */
+    {
+        wchar_t entry[256];
+        wchar_t guid_str[64];
+        unsigned port;
+        service_table[0] = L'\0';
+        for (port = 1; port <= 6; port++) {
+            hcs_service_guid_str(config->os_type, port, guid_str, 64);
+            swprintf_s(entry, 256,
+                L"%s\"%s\":{"
+                    L"\"BindSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
+                    L"\"ConnectSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
+                    L"\"AllowWildcardBinds\":true"
+                L"}",
+                (port > 1) ? L"," : L"", guid_str);
+            wcscat_s(service_table, 2048, entry);
         }
     }
 
@@ -1011,39 +1104,9 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                     L"}"
                 L"},"
                 L"%s"
+                L"%s"
                 L"\"HvSocket\":{\"HvSocketConfig\":{"
-                    L"\"ServiceTable\":{"
-                        L"\"a5b0cafe-0001-4000-8000-000000000001\":{"
-                            L"\"BindSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
-                            L"\"ConnectSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
-                            L"\"AllowWildcardBinds\":true"
-                        L"},"
-                        L"\"a5b0cafe-0002-4000-8000-000000000001\":{"
-                            L"\"BindSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
-                            L"\"ConnectSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
-                            L"\"AllowWildcardBinds\":true"
-                        L"},"
-                        L"\"a5b0cafe-0003-4000-8000-000000000001\":{"
-                            L"\"BindSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
-                            L"\"ConnectSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
-                            L"\"AllowWildcardBinds\":true"
-                        L"},"
-                        L"\"a5b0cafe-0004-4000-8000-000000000001\":{"
-                            L"\"BindSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
-                            L"\"ConnectSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
-                            L"\"AllowWildcardBinds\":true"
-                        L"},"
-                        L"\"a5b0cafe-0005-4000-8000-000000000001\":{"
-                            L"\"BindSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
-                            L"\"ConnectSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
-                            L"\"AllowWildcardBinds\":true"
-                        L"},"
-                        L"\"a5b0cafe-0006-4000-8000-000000000001\":{"
-                            L"\"BindSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
-                            L"\"ConnectSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
-                            L"\"AllowWildcardBinds\":true"
-                        L"}"
-                    L"}"
+                    L"\"ServiceTable\":{%s}"
                 L"}},"
                 L"\"Keyboard\":{},"
                 L"\"Mouse\":{}"
@@ -1062,6 +1125,8 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         iso_section,
         res_section,
         video_section,
+        comports_section,
+        service_table,
         net_section,
         plan9_section,
         security_section,
@@ -1461,8 +1526,8 @@ static DWORD WINAPI close_vm_thread(LPVOID param)
 
 void hcs_close_vm(VmInstance *instance)
 {
-    /* Unregister callback before closing handle — matches hcsshim pattern.
-       Must NOT hold any locks during unregister (it waits for pending callbacks). */
+    /* Unregister callback before closing handle. Must NOT hold any locks
+       during unregister (it waits for pending callbacks). */
     hcs_unregister_vm_callback(instance);
 
     if (g_hcs_dll && pfnClose && instance->handle) {

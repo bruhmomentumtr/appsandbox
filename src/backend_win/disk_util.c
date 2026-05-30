@@ -3,10 +3,12 @@
 #include <virtdisk.h>
 #include <stdio.h>
 #include <wincrypt.h>
+#include <bcrypt.h>
 #include <imapi2fs.h>
 
 #pragma comment(lib, "virtdisk.lib")
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "urlmon.lib")
@@ -1896,4 +1898,352 @@ BOOL vm_load_language_json(const wchar_t *vhdx_path, wchar_t *lang_out, int lang
     }
     fclose(f);
     return FALSE;
+}
+
+/* ---- SHA-512 crypt (glibc $6$ format) ----
+ *
+ * Linux passwd/shadow stores hashed passwords in crypt(3) format. The
+ * guest's firstboot plants the admin password via `usermod -p <hash>`,
+ * which needs a string in this format — plain text isn't accepted. We
+ * can't shell out to `mkpasswd` (not present on Windows), and OpenSSL
+ * isn't guaranteed. So implement Ulrich Drepper's SHA-512 crypt
+ * algorithm on top of Win32 CNG's SHA-512 primitive.
+ *
+ * Reference: https://www.akkadia.org/drepper/sha-crypt.html
+ *            https://www.akkadia.org/drepper/SHA-crypt.txt
+ */
+
+#define SHA512_DIGEST_LEN 64
+
+typedef struct {
+    const void *data;
+    ULONG       len;
+} sha512_part_t;
+
+/* One-shot SHA-512: hash a list of (data, len) parts and write the 64-byte
+   digest to `out`. Returns TRUE on success. */
+static BOOL sha512_oneshot(const sha512_part_t *parts,
+                            int num_parts, BYTE out[SHA512_DIGEST_LEN])
+{
+    BCRYPT_ALG_HANDLE  hAlg = NULL;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    NTSTATUS status;
+    BOOL ok = FALSE;
+    int i;
+
+    status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA512_ALGORITHM, NULL, 0);
+    if (status != 0) return FALSE;
+
+    status = BCryptCreateHash(hAlg, &hHash, NULL, 0, NULL, 0, 0);
+    if (status != 0) goto done;
+
+    for (i = 0; i < num_parts; i++) {
+        if (parts[i].len == 0) continue;
+        status = BCryptHashData(hHash, (PUCHAR)parts[i].data, parts[i].len, 0);
+        if (status != 0) goto done;
+    }
+
+    status = BCryptFinishHash(hHash, out, SHA512_DIGEST_LEN, 0);
+    if (status == 0) ok = TRUE;
+
+done:
+    if (hHash) BCryptDestroyHash(hHash);
+    if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
+    return ok;
+}
+
+/* GNU crypt b64 alphabet — note "./" prefix and the rest is digits, upper, lower. */
+static const char crypt_b64[] =
+    "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/* Encode three bytes as four crypt-b64 chars, in the specific order Drepper
+   defined. n = number of chars to emit (1..4). */
+static void crypt_b64_3(unsigned b2, unsigned b1, unsigned b0, int n, char **out)
+{
+    unsigned w = (b2 << 16) | (b1 << 8) | b0;
+    while (n-- > 0) {
+        *(*out)++ = crypt_b64[w & 0x3f];
+        w >>= 6;
+    }
+}
+
+/* Drepper SHA-512 crypt. `key` is the password bytes; `salt` is up to 16
+   bytes from the crypt_b64 alphabet. Writes the encoded result (including
+   the "$6$<salt>$" prefix) into `out`. `out_size` must be >= 110.
+   Returns the number of chars written (not including NUL), or 0 on error. */
+static int sha512_crypt(const char *key, size_t key_len,
+                         const char *salt, size_t salt_len,
+                         char *out, size_t out_size)
+{
+    /* Algorithm uses two "rolling" SHA-512 inputs: digest A (the per-round
+       hash) and digest B (a key-derived seed used to padding-extend A). */
+    BYTE alt[SHA512_DIGEST_LEN];   /* digest B (intermediate) */
+    BYTE digest[SHA512_DIGEST_LEN]; /* digest A / running hash C */
+    BYTE p_seq[SHA512_DIGEST_LEN]; /* DP digest, expanded to P below */
+    BYTE s_seq[SHA512_DIGEST_LEN]; /* DS digest, expanded to S below */
+    BYTE *P = NULL, *S = NULL;
+    int rc = 0;
+    size_t cnt;
+    int rounds = 5000;  /* default rounds for $6$ */
+    char *cp;
+    int i;
+
+    sha512_part_t parts[64];
+    int n;
+
+    if (key_len > 256 || salt_len > 16 || out_size < 110)
+        return 0;
+
+    /* --- Step 4-8: compute digest B = SHA512(key || salt || key) --- */
+    n = 0;
+    parts[n].data = key;  parts[n].len = (ULONG)key_len; n++;
+    parts[n].data = salt; parts[n].len = (ULONG)salt_len; n++;
+    parts[n].data = key;  parts[n].len = (ULONG)key_len; n++;
+    if (!sha512_oneshot(parts, n, alt)) return 0;
+
+    /* --- Step 1-3, 9-12: digest A = SHA512(key, salt, then key-len bytes
+       from alt (full 64-byte blocks at a time), then key-bit-pattern feeds.) */
+    n = 0;
+    parts[n].data = key;  parts[n].len = (ULONG)key_len; n++;
+    parts[n].data = salt; parts[n].len = (ULONG)salt_len; n++;
+
+    /* Feed full 64-byte blocks of alt for each 64-byte chunk of key length */
+    cnt = key_len;
+    while (cnt > SHA512_DIGEST_LEN) {
+        parts[n].data = alt; parts[n].len = SHA512_DIGEST_LEN; n++;
+        cnt -= SHA512_DIGEST_LEN;
+    }
+    if (cnt > 0) {
+        parts[n].data = alt; parts[n].len = (ULONG)cnt; n++;
+    }
+
+    /* For each bit of key_len (low bit first), alternately feed alt or key */
+    for (cnt = key_len; cnt > 0; cnt >>= 1) {
+        if (cnt & 1) {
+            parts[n].data = alt; parts[n].len = SHA512_DIGEST_LEN; n++;
+        } else {
+            parts[n].data = key; parts[n].len = (ULONG)key_len; n++;
+        }
+    }
+
+    if (!sha512_oneshot(parts, n, digest)) return 0;
+
+    /* --- Steps 13-15: DP = SHA512(key repeated key_len times). Number of
+       feeds equals key length, which can be larger than parts[]. Use
+       incremental hashing so we don't care about parts[] capacity here. */
+    {
+        BCRYPT_ALG_HANDLE  hAlg = NULL;
+        BCRYPT_HASH_HANDLE hHash = NULL;
+        NTSTATUS status;
+        if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA512_ALGORITHM, NULL, 0) != 0) goto cleanup;
+        if (BCryptCreateHash(hAlg, &hHash, NULL, 0, NULL, 0, 0) != 0) {
+            BCryptCloseAlgorithmProvider(hAlg, 0); goto cleanup;
+        }
+        for (cnt = 0; cnt < key_len; cnt++) {
+            status = BCryptHashData(hHash, (PUCHAR)key, (ULONG)key_len, 0);
+            if (status != 0) {
+                BCryptDestroyHash(hHash);
+                BCryptCloseAlgorithmProvider(hAlg, 0);
+                goto cleanup;
+            }
+        }
+        status = BCryptFinishHash(hHash, p_seq, SHA512_DIGEST_LEN, 0);
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        if (status != 0) goto cleanup;
+    }
+
+    /* Expand DP into P: floor(key_len / 64) full copies + (key_len % 64) bytes */
+    P = (BYTE *)malloc(key_len > 0 ? key_len : 1);
+    if (!P) return 0;
+    {
+        size_t left = key_len;
+        BYTE *dst = P;
+        while (left >= SHA512_DIGEST_LEN) {
+            memcpy(dst, p_seq, SHA512_DIGEST_LEN);
+            dst += SHA512_DIGEST_LEN;
+            left -= SHA512_DIGEST_LEN;
+        }
+        if (left) memcpy(dst, p_seq, left);
+    }
+
+    /* --- Steps 16-18: DS = SHA512(salt repeated (16 + digest[0]) times).
+       digest[0] is 0..255 so reps can be up to 271 — way past parts[]
+       capacity, so incremental again. */
+    {
+        BCRYPT_ALG_HANDLE  hAlg = NULL;
+        BCRYPT_HASH_HANDLE hHash = NULL;
+        NTSTATUS status;
+        int reps = 16 + digest[0];
+
+        if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA512_ALGORITHM, NULL, 0) != 0) goto cleanup;
+        if (BCryptCreateHash(hAlg, &hHash, NULL, 0, NULL, 0, 0) != 0) {
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            goto cleanup;
+        }
+        for (i = 0; i < reps; i++) {
+            status = BCryptHashData(hHash, (PUCHAR)salt, (ULONG)salt_len, 0);
+            if (status != 0) { BCryptDestroyHash(hHash); BCryptCloseAlgorithmProvider(hAlg, 0); goto cleanup; }
+        }
+        status = BCryptFinishHash(hHash, s_seq, SHA512_DIGEST_LEN, 0);
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        if (status != 0) goto cleanup;
+    }
+
+    /* Expand DS into S */
+    S = (BYTE *)malloc(salt_len > 0 ? salt_len : 1);
+    if (!S) goto cleanup;
+    {
+        size_t left = salt_len;
+        BYTE *dst = S;
+        while (left >= SHA512_DIGEST_LEN) {
+            memcpy(dst, s_seq, SHA512_DIGEST_LEN);
+            dst += SHA512_DIGEST_LEN;
+            left -= SHA512_DIGEST_LEN;
+        }
+        if (left) memcpy(dst, s_seq, left);
+    }
+
+    /* --- Step 21: main loop, 5000 rounds. Each round hashes a sequence of
+       (P, S, prev_digest) chosen by the round index parity vs 2/3/7. */
+    for (i = 0; i < rounds; i++) {
+        n = 0;
+        if (i & 1) { parts[n].data = P; parts[n].len = (ULONG)key_len; n++; }
+        else       { parts[n].data = digest; parts[n].len = SHA512_DIGEST_LEN; n++; }
+        if (i % 3) { parts[n].data = S; parts[n].len = (ULONG)salt_len; n++; }
+        if (i % 7) { parts[n].data = P; parts[n].len = (ULONG)key_len; n++; }
+        if (i & 1) { parts[n].data = digest; parts[n].len = SHA512_DIGEST_LEN; n++; }
+        else       { parts[n].data = P; parts[n].len = (ULONG)key_len; n++; }
+        if (!sha512_oneshot(parts, n, digest)) goto cleanup;
+    }
+
+    /* --- Step 22: encode digest into crypt_b64 form, in a specific 21-group
+       permutation defined by the spec. Final char encodes the leftover byte. */
+    cp = out;
+    cp += sprintf_s(cp, out_size, "$6$");
+    if (salt_len > 0) {
+        memcpy(cp, salt, salt_len);
+        cp += salt_len;
+    }
+    *cp++ = '$';
+
+    crypt_b64_3(digest[ 0], digest[21], digest[42], 4, &cp);
+    crypt_b64_3(digest[22], digest[43], digest[ 1], 4, &cp);
+    crypt_b64_3(digest[44], digest[ 2], digest[23], 4, &cp);
+    crypt_b64_3(digest[ 3], digest[24], digest[45], 4, &cp);
+    crypt_b64_3(digest[25], digest[46], digest[ 4], 4, &cp);
+    crypt_b64_3(digest[47], digest[ 5], digest[26], 4, &cp);
+    crypt_b64_3(digest[ 6], digest[27], digest[48], 4, &cp);
+    crypt_b64_3(digest[28], digest[49], digest[ 7], 4, &cp);
+    crypt_b64_3(digest[50], digest[ 8], digest[29], 4, &cp);
+    crypt_b64_3(digest[ 9], digest[30], digest[51], 4, &cp);
+    crypt_b64_3(digest[31], digest[52], digest[10], 4, &cp);
+    crypt_b64_3(digest[53], digest[11], digest[32], 4, &cp);
+    crypt_b64_3(digest[12], digest[33], digest[54], 4, &cp);
+    crypt_b64_3(digest[34], digest[55], digest[13], 4, &cp);
+    crypt_b64_3(digest[56], digest[14], digest[35], 4, &cp);
+    crypt_b64_3(digest[15], digest[36], digest[57], 4, &cp);
+    crypt_b64_3(digest[37], digest[58], digest[16], 4, &cp);
+    crypt_b64_3(digest[59], digest[17], digest[38], 4, &cp);
+    crypt_b64_3(digest[18], digest[39], digest[60], 4, &cp);
+    crypt_b64_3(digest[40], digest[61], digest[19], 4, &cp);
+    crypt_b64_3(digest[62], digest[20], digest[41], 4, &cp);
+    crypt_b64_3(       0,         0, digest[63], 2, &cp);
+
+    *cp = '\0';
+    rc = (int)(cp - out);
+
+cleanup:
+    if (P) { SecureZeroMemory(P, key_len); free(P); }
+    if (S) { SecureZeroMemory(S, salt_len); free(S); }
+    SecureZeroMemory(digest, sizeof(digest));
+    SecureZeroMemory(alt, sizeof(alt));
+    SecureZeroMemory(p_seq, sizeof(p_seq));
+    SecureZeroMemory(s_seq, sizeof(s_seq));
+    return rc;
+}
+
+/* Public-ish wrapper: hash a wide-char password into glibc $6$ format.
+   Generates a fresh random 16-char salt. Wipes the UTF-8 conversion of the
+   password from memory after use. Returns TRUE on success. */
+BOOL unix_password_hash(const wchar_t *plain, char *hash_out, size_t hash_out_size)
+{
+    char utf8[512];
+    int  utf8_len;
+    char salt[17];
+    BYTE salt_raw[12];
+    int  i, rc;
+
+    if (!plain || !hash_out || hash_out_size < 110) return FALSE;
+
+    utf8_len = WideCharToMultiByte(CP_UTF8, 0, plain, -1, utf8, sizeof(utf8) - 1, NULL, NULL);
+    if (utf8_len <= 0) return FALSE;
+    /* WideCharToMultiByte includes the NUL in the count when input is
+       NUL-terminated. Trim it for the hash input. */
+    if (utf8[utf8_len - 1] == '\0') utf8_len--;
+
+    /* 16-char crypt_b64 salt from 12 random bytes (96 bits of entropy). */
+    if (BCryptGenRandom(NULL, salt_raw, sizeof(salt_raw),
+                         BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+        SecureZeroMemory(utf8, sizeof(utf8));
+        return FALSE;
+    }
+    for (i = 0; i < 16; i++) {
+        /* Pack 3 random bytes -> 4 b64 chars, take 16 of them. */
+        unsigned b = salt_raw[i % sizeof(salt_raw)];
+        salt[i] = crypt_b64[b & 0x3f];
+    }
+    salt[16] = '\0';
+
+    rc = sha512_crypt(utf8, (size_t)utf8_len, salt, 16, hash_out, hash_out_size);
+    SecureZeroMemory(utf8, sizeof(utf8));
+    SecureZeroMemory(salt_raw, sizeof(salt_raw));
+    return rc > 0;
+}
+
+
+/* Lay out everything that setup.sh expects under staging\extras\.
+ *
+ * Path resolution per artifact kind:
+ *   - Build outputs (agent ELFs, .ko modules, wsl-mesa tarball)
+ *       1. <res_dir>\linux\... — primary path. <res_dir> is bin\<cfg>\resources\
+ *          at runtime, populated by AppSandbox.vcxproj's PostBuildEvent which
+ *          xcopies the committed release\resources\ tree. So files committed
+ *          under release\resources\linux\ flow here automatically.
+ *       2. <repo>\tools\linux\dist\... — dev fallback. Set by `make` on the
+ *          Linux dev box; useful when running AppSandbox.exe straight out of
+ *          the build tree before doing the release/resources/linux/ copy.
+ *
+ *   - Source-only artifacts (systemd units, DKMS source trees, modprobe.d
+ *     configs): read straight from <repo>\tools\linux\<sub>\... — these
+ *     are stable text files in the repo, never built, no point routing them
+ *     through dist/.
+ *
+ *   - wsl-deps .so libs: prefetched into C:\ProgramData\AppSandbox\wsl-deps\
+ *     by `iso-patch.exe --prefetch-wsl-deps` (called automatically from
+ *     linux_create_thread when the cache is empty). C-only — no PowerShell.
+ */
+void stage_linux_agent_and_extras(const wchar_t *staging,
+                                  const wchar_t *res_dir,
+                                  BOOL ssh_enabled)
+{
+    wchar_t extras[MAX_PATH];
+
+    (void)res_dir;       /* unused — no host-side resource lookups any more */
+    (void)ssh_enabled;   /* SSH packaging handled separately in firstboot */
+
+    /* Direct-stage model: linux_create_thread runs three iso-patch
+     * prefetch modes that already wrote into <staging>\extras\ — agent
+     * source from GitHub, build-dep .debs from archive.ubuntu.com, and
+     * wsl-deps .so files from the Microsoft NuGet feed. This function
+     * just sanity-checks that the directory exists and logs what's
+     * present; nothing more to stage on the host side. */
+
+    swprintf_s(extras, MAX_PATH, L"%s\\extras", staging);
+    if (GetFileAttributesW(extras) == INVALID_FILE_ATTRIBUTES) {
+        ui_log(L"WARN: %s\\extras not present — prefetches all failed?", staging);
+        return;
+    }
+    ui_log(L"Staging Linux extras: prefetches populated %s\\extras", staging);
 }

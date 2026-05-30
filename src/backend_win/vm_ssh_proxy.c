@@ -27,6 +27,8 @@ typedef struct _SOCKADDR_HV {
     GUID ServiceId;
 } SOCKADDR_HV;
 
+/* Superseded by hcs_service_guid(os_type, 7, ...) — kept for grep.
+   Windows VMs reach the byte-identical GUID via the helper. */
 static const GUID SSH_SERVICE_GUID =
     { 0xa5b0cafe, 0x0007, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
 
@@ -77,7 +79,7 @@ static SshProxy *find_proxy(VmInstance *vm)
 
 /* ---- HV socket connect (non-blocking with timeout) ---- */
 
-static SOCKET connect_to_hv_ssh(const GUID *vm_runtime_id)
+static SOCKET connect_to_hv_ssh(const GUID *vm_runtime_id, const wchar_t *os_type)
 {
     SOCKET s;
     SOCKADDR_HV addr;
@@ -99,7 +101,7 @@ static SOCKET connect_to_hv_ssh(const GUID *vm_runtime_id)
     memset(&addr, 0, sizeof(addr));
     addr.Family    = AF_HYPERV;
     addr.VmId      = *vm_runtime_id;
-    addr.ServiceId = SSH_SERVICE_GUID;
+    hcs_service_guid(os_type, 7, &addr.ServiceId);
 
     if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         if (WSAGetLastError() != WSAEWOULDBLOCK) {
@@ -247,7 +249,7 @@ bound:
             continue;
 
         /* Connect to guest SSH proxy via HV socket */
-        SOCKET hv = connect_to_hv_ssh(&proxy->vm->runtime_id);
+        SOCKET hv = connect_to_hv_ssh(&proxy->vm->runtime_id, proxy->vm->os_type);
         if (hv == INVALID_SOCKET) {
             ui_log(L"SSH proxy: cannot connect to guest for \"%s\".", proxy->vm->name);
             closesocket(client);

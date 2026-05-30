@@ -34,11 +34,16 @@ typedef struct VmClipboardData *VmClipboard;
 
 /* Create a clipboard instance for a VM.
  * runtime_id: the VM's HCS runtime GUID (for HV socket connections).
+ * os_type: VM's guest OS string ("Windows", "Linux", ...). Used to pick
+ *         the HV-socket service GUID variant via hcs_service_guid().
+ *         May be NULL/empty — defaults to Windows form.
  * hwnd: the display window that owns the clipboard listener.
  * log_fn/log_ud: optional logging callback (fires on same thread as event).
  * The instance starts with sync DISABLED — call set_sync_enabled after
  * the display window is ready to receive focus. */
-ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id, HWND hwnd,
+ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id,
+                                        const wchar_t *os_type,
+                                        HWND hwnd,
                                         VmClipboardLogFn log_fn, void *log_ud);
 
 /* Tear down: close sockets, stop threads, free memory. */

@@ -519,6 +519,44 @@ static void ui_show_alert(const wchar_t *message)
 
 /* ---- Display connections ---- */
 
+/* Linux / legacy display path: connects to vmwp.exe's Basic Session named
+   pipe (\\.\pipe\<vm-name>.BasicSession) and renders via MsRdpClient10
+   ActiveX. Reads the synthetic Hyper-V Video adapter framebuffer — works
+   for any guest from BIOS / GRUB onward, no guest cooperation required.
+   Used as a side-debug window during install: while cloud-init is still
+   bringing up the desktop and our IDD agent isn't up yet, this is the
+   only way to see what the VM is actually doing. Coexists with IDD —
+   they render from independent sources so both can stay open. */
+static void do_connect_rdp(int idx)
+{
+    VmInstance *v;
+    wchar_t pipe[300];
+    int tries;
+    if (idx < 0 || idx >= asb_vm_count()) return;
+    v = asb_vm_instance(asb_vm_get(idx));
+    if (!v || !v->running) { ui_log(L"VM \"%s\" is not running.", v ? v->name : L"?"); return; }
+    if (g_displays[idx] && vm_display_is_open(g_displays[idx])) {
+        ui_log(L"RDP display already open."); return;
+    }
+    safe_destroy_rdp(idx);
+
+    /* vmwp.exe creates the pipe a couple of seconds after the VM starts;
+       poll briefly so the first Connect click doesn't race the worker. */
+    swprintf_s(pipe, 300, L"\\\\.\\pipe\\%s.BasicSession", v->name);
+    for (tries = 0; tries < 50; tries++) {
+        if (WaitNamedPipeW(pipe, 0)) break;
+        {
+            DWORD err = GetLastError();
+            if (err != ERROR_FILE_NOT_FOUND && err != ERROR_SEM_TIMEOUT) break;
+        }
+        Sleep(100);
+    }
+
+    ui_log(L"Opening RDP basic-session display for \"%s\"...", v->name);
+    g_displays[idx] = vm_display_create(v, g_hInstance, g_hwnd_main);
+    if (!g_displays[idx]) ui_log(L"Error: Failed to create RDP display window.");
+}
+
 static void do_connect_idd(int idx)
 {
     VmInstance *v;
@@ -532,6 +570,30 @@ static void do_connect_idd(int idx)
     ui_log(L"Opening IDD display for \"%s\"...", v->name);
     g_idd_displays[idx] = vm_display_idd_create(v, g_hInstance, g_hwnd_main);
     if (!g_idd_displays[idx]) ui_log(L"Error: Failed to create IDD display window.");
+}
+
+/* User-initiated Connect: open BOTH the IDD display and the RDP
+   basic-session display side-by-side.
+     - IDD renders the in-VM agent's captured framebuffer (Windows: VDD,
+       Linux: appsandbox-display via vsock :2). Empty until the agent
+       comes online.
+     - RDP renders the Hyper-V Video adapter framebuffer via vmwp.exe's
+       BasicSession named pipe. Works from BIOS / GRUB onward, no guest
+       cooperation needed. Crucial for debugging install / first boot —
+       you can watch cloud-init, kernel messages, GDM coming up.
+   Both windows are independent; either can be closed manually. The
+   automatic RDP -> IDD switching handlers (WM_VM_AGENT_ONLINE,
+   WM_VM_HYPERV_VIDEO_OFF) keep using the per-display functions so they
+   can close one without re-opening the other. */
+static void do_connect_vm(int idx)
+{
+    /* Direct ISO->VHDX flow boots straight into the configured rootfs with
+       IDD live from the start, so the RDP fallback window is no longer
+       needed. do_connect_rdp() + vm_display.c stay on disk as reference
+       for the RDP-over-named-pipe pattern but are no longer invoked.
+       The g_displays[]/safe_destroy_rdp cleanup paths remain inert
+       because nothing populates the slots. */
+    do_connect_idd(idx);
 }
 
 /* ---- System tray ---- */
@@ -767,7 +829,7 @@ static void tray_show_menu(HWND hwnd)
         asb_vm_shutdown(asb_vm_get(cmd - TRAY_CMD_SHUTDOWN_BASE));
         send_vm_list();
     } else if (cmd >= TRAY_CMD_CONNECT_BASE) {
-        do_connect_idd(cmd - TRAY_CMD_CONNECT_BASE);
+        do_connect_vm(cmd - TRAY_CMD_CONNECT_BASE);
     }
 }
 
@@ -894,7 +956,7 @@ static void on_webview2_message(const wchar_t *json)
             send_vm_list();
         }
     } else if (wcscmp(action, L"connectIddVm") == 0) {
-        int idx; if (json_get_int(json, L"vmIndex", &idx)) do_connect_idd(idx);
+        int idx; if (json_get_int(json, L"vmIndex", &idx)) do_connect_vm(idx);
     } else if (wcscmp(action, L"sshConnect") == 0) {
         int idx;
         if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {

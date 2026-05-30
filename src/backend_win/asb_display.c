@@ -31,6 +31,8 @@ typedef struct _SOCKADDR_HV {
     GUID ServiceId;
 } SOCKADDR_HV;
 
+/* Both superseded by hcs_service_guid(os_type, port, ...) — kept for grep.
+   Windows VMs reach byte-identical GUIDs via the helper. */
 static const GUID FRAME_SERVICE_GUID =
     { 0xa5b0cafe, 0x0002, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
 
@@ -99,6 +101,7 @@ typedef struct {
 struct AsbDisplay {
     VmInstance      *vm;
     GUID             runtime_id;
+    wchar_t          os_type[32];
     BYTE            *frame_buf;
     UINT             frame_width;
     UINT             frame_height;
@@ -217,7 +220,8 @@ static DWORD WINAPI display_recv_thread(LPVOID param)
 
         /* Connect input channel */
         if (input_s == INVALID_SOCKET) {
-            input_s = connect_hv_service(&d->runtime_id, &INPUT_SERVICE_GUID, 1000);
+            GUID svc_input; hcs_service_guid(d->os_type, 3, &svc_input);
+            input_s = connect_hv_service(&d->runtime_id, &svc_input, 1000);
             if (input_s != INVALID_SOCKET) {
                 UINT32 ready_magic = 0;
                 if (recv_exact(input_s, &ready_magic, sizeof(ready_magic)) &&
@@ -235,7 +239,10 @@ static DWORD WINAPI display_recv_thread(LPVOID param)
         }
 
         /* Connect frame channel */
-        s = connect_hv_service(&d->runtime_id, &FRAME_SERVICE_GUID, 3000);
+        {
+            GUID svc_frame; hcs_service_guid(d->os_type, 2, &svc_frame);
+            s = connect_hv_service(&d->runtime_id, &svc_frame, 3000);
+        }
         if (s == INVALID_SOCKET) {
             int wait;
             for (wait = 0; wait < 3000 && !d->stop; wait += 500)
@@ -376,7 +383,9 @@ static DWORD WINAPI display_recv_thread(LPVOID param)
                 input_s = INVALID_SOCKET;
             }
             if (input_s == INVALID_SOCKET) {
-                SOCKET new_s = connect_hv_service(&d->runtime_id, &INPUT_SERVICE_GUID, 1000);
+                GUID svc_input2; SOCKET new_s;
+                hcs_service_guid(d->os_type, 3, &svc_input2);
+                new_s = connect_hv_service(&d->runtime_id, &svc_input2, 1000);
                 if (new_s != INVALID_SOCKET) {
                     UINT32 ready_magic = 0;
                     if (recv_exact(new_s, &ready_magic, sizeof(ready_magic)) &&
@@ -428,6 +437,7 @@ ASB_API AsbDisplay *asb_display_connect(AsbVm vm)
 
     d->vm = inst;
     d->runtime_id = inst->runtime_id;
+    wcsncpy_s(d->os_type, 32, inst->os_type, _TRUNCATE);
     d->input_socket = INVALID_SOCKET;
     InitializeCriticalSection(&d->frame_cs);
 

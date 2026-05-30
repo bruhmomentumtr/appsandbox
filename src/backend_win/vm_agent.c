@@ -20,6 +20,8 @@ typedef struct _SOCKADDR_HV {
     GUID ServiceId;
 } SOCKADDR_HV;
 
+/* Superseded by hcs_service_guid(vm->os_type, 1, ...) — kept for grep.
+   Windows VMs end up reaching the byte-identical GUID via the helper. */
 static const GUID AGENT_SERVICE_GUID =
     { 0xa5b0cafe, 0x0001, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
 
@@ -163,7 +165,7 @@ static SOCKET connect_to_agent(VmInstance *vm, int timeout_ms)
     memset(&addr, 0, sizeof(addr));
     addr.Family = AF_HYPERV;
     addr.VmId = runtime_id;
-    addr.ServiceId = AGENT_SERVICE_GUID;
+    hcs_service_guid(vm->os_type, 1, &addr.ServiceId);
 
     if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         if (WSAGetLastError() != WSAEWOULDBLOCK) {

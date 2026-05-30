@@ -65,13 +65,62 @@ var hostBridge = (function() {
 
 function sendCmd(action, data) { hostBridge.send(action, data); }
 
-/* Hide Windows-only form fields when running on macOS. */
+/* Hide Windows-only form fields when running on macOS.
+ * On macOS we also hide both image-source rows (.needs-iso for Windows,
+ * .needs-linux-version for Linux) — macOS uses .ipsw via its own
+ * picker, not a path input here. */
 if (hostBridge.isMac) {
-    var winOnly = document.querySelectorAll('.win-only');
-    for (var i = 0; i < winOnly.length; i++) winOnly[i].style.display = 'none';
+    var hide = document.querySelectorAll('.win-only, .needs-iso, .needs-linux-version');
+    for (var i = 0; i < hide.length; i++) hide[i].style.display = 'none';
     var osSelect = document.getElementById('os-type');
     osSelect.value = 'macOS';
     osSelect.disabled = true;
+}
+
+/* OS Type dropdown: drop guest types that aren't available on this host.
+ * Windows host: macOS unavailable (Apple Virtualization is Mac-only).
+ * macOS host:   Windows and Linux unavailable (HCS-only path). */
+{
+    var unavailable = hostBridge.isMac ? ['Windows', 'Linux'] : ['macOS'];
+    unavailable.forEach(function(v) {
+        var opt = document.querySelector('#os-type option[value="' + v + '"]');
+        if (opt) opt.remove();
+    });
+}
+
+/* Apply Create-modal visibility rules for the currently selected OS type.
+ *   Windows: .win-only shown, .needs-iso shown,             .needs-linux-version hidden
+ *   Linux:   .win-only hidden, .needs-iso hidden,           .needs-linux-version shown
+ *   macOS:   handled by the isMac branch above; this function is a no-op there.
+ *
+ * Linux is back to user-picks-an-ISO (Ubuntu Desktop ISO etc.), same as
+ * Windows. The version-dropdown / cloud-image flow is preserved in
+ * asb_core.c under #if 0 in case we need to bring it back. */
+function applyOsTypeUI() {
+    if (hostBridge.isMac) return;
+    var osType = document.getElementById('os-type').value;
+    var isWindows = osType === 'Windows';
+    var isLinux = osType === 'Linux';
+    var winOnly = document.querySelectorAll('.win-only');
+    var needsIso = document.querySelectorAll('.needs-iso');
+    var needsLinuxVersion = document.querySelectorAll('.needs-linux-version');
+    for (var i = 0; i < winOnly.length; i++) winOnly[i].style.display = isWindows ? '' : 'none';
+    /* ISO picker shows for both Windows and Linux now. */
+    for (var j = 0; j < needsIso.length; j++) needsIso[j].style.display = (isWindows || isLinux) ? '' : 'none';
+    /* Linux distribution dropdown is dormant — kept in the DOM but always
+       hidden so the cloud-image code path can be revived without
+       re-adding the markup. */
+    for (var k = 0; k < needsLinuxVersion.length; k++) needsLinuxVersion[k].style.display = 'none';
+    /* Swap the default VM name between OS conventions, but only when the
+       field still holds the *other* OS's untouched default — never clobber a
+       name the user typed. Linux hostnames must be lowercase. */
+    var nameEl = document.getElementById('vm-name');
+    if (isLinux && nameEl.value === 'MyAppSandbox') nameEl.value = 'myappsandbox';
+    else if (!isLinux && nameEl.value === 'myappsandbox') nameEl.value = 'MyAppSandbox';
+    revalidateVmName();
+    revalidateUsername();
+    revalidatePassword();
+    updateCreateButtons();
 }
 
 /* Unified dispatch. Native code on either platform calls
@@ -287,10 +336,14 @@ function onBrowseResult(path) {
 /* ---- Create buttons state ---- */
 
 function updateCreateButtons() {
-    var hasImage = document.getElementById('image-path').value.trim() !== '';
+    var osType = document.getElementById('os-type').value;
+    /* Same ISO-required check for Windows and Linux now. */
+    var hasImage = (document.getElementById('image-path').value.trim() !== '');
     var hasTpl = document.getElementById('template-select').value !== '';
     document.getElementById('btn-create').disabled = hostBridge.isMac ? false : !(hasImage || hasTpl);
-    document.getElementById('btn-create-template').disabled = !hasImage;
+    /* Templates are Windows-only; disabling create-as-template for Linux
+       (and macOS) is fine since hasImage is the only signal we check. */
+    document.getElementById('btn-create-template').disabled = (osType !== 'Windows') || !hasImage;
 }
 
 /* Wire up change events */
@@ -306,9 +359,16 @@ function revalidateVmName() {
     document.getElementById('vm-name-warn').textContent = validateVmName(name) || '';
 }
 document.getElementById('vm-name').addEventListener('input', revalidateVmName);
-document.getElementById('admin-user').addEventListener('input', function() {
-    document.getElementById('admin-user-warn').textContent = validateUsername(this.value.trim()) || '';
-});
+
+function revalidateUsername() {
+    var u = document.getElementById('admin-user').value.trim();
+    document.getElementById('admin-user-warn').textContent = validateUsername(u) || '';
+}
+function revalidatePassword() {
+    var p = document.getElementById('admin-pass').value;
+    document.getElementById('admin-pass-warn').textContent = validatePassword(p) || '';
+}
+document.getElementById('admin-user').addEventListener('input', revalidateUsername);
 
 function checkPasswordMatch() {
     var pass = document.getElementById('admin-pass').value;
@@ -325,7 +385,10 @@ function checkPasswordMatch() {
         confirm.classList.add('pass-mismatch');
     }
 }
-document.getElementById('admin-pass').addEventListener('input', checkPasswordMatch);
+document.getElementById('admin-pass').addEventListener('input', function() {
+    checkPasswordMatch();
+    revalidatePassword();
+});
 document.getElementById('admin-confirm').addEventListener('input', checkPasswordMatch);
 checkPasswordMatch();
 
@@ -350,10 +413,14 @@ onNetModeChange();
 /* ---- Create VM ---- */
 
 function gatherConfig() {
+    var osType = document.getElementById('os-type').value;
+    /* Same ISO-picker path for Windows and Linux. The cloud-image
+       Linux-version dropdown is dormant (see applyOsTypeUI). */
+    var imagePath = document.getElementById('image-path').value.trim();
     return {
         name:        document.getElementById('vm-name').value.trim(),
-        osType:      document.getElementById('os-type').value,
-        imagePath:   document.getElementById('image-path').value.trim(),
+        osType:      osType,
+        imagePath:   imagePath,
         templateName: document.getElementById('template-select').value,
         hddGb:       parseInt(document.getElementById('hdd-size').value) || 64,
         ramMb:       parseInt(document.getElementById('ram-size').value) || 16384,
@@ -375,10 +442,21 @@ function clearCreateForm() {
     updateCreateButtons();
 }
 
+/* VM name / hostname validation. Per-guest-OS rules, keyed off the
+   selected OS Type (on a macOS host the dropdown is locked to 'macOS',
+   so osType is an accurate guest discriminator on all hosts). */
 function validateVmName(name) {
     if (!name) return 'VM name is required.';
-    if (!hostBridge.isMac && name.length > 15) return 'VM name cannot exceed 15 characters (NetBIOS limit).';
-    if (hostBridge.isMac && name.length > 63) return 'VM name cannot exceed 63 characters (macOS LocalHostName limit).';
+    var osSelect = document.getElementById('os-type');
+    var osType = osSelect ? osSelect.value : 'Windows';
+    if (osType === 'macOS') {
+        if (name.length > 63) return 'VM name cannot exceed 63 characters (macOS LocalHostName limit).';
+    } else if (osType === 'Linux') {
+        if (name.length > 63) return 'VM name cannot exceed 63 characters (Linux hostname limit).';
+        if (/[A-Z]/.test(name)) return 'Linux hostname must be lowercase.';
+    } else { /* Windows */
+        if (name.length > 15) return 'VM name cannot exceed 15 characters (NetBIOS limit).';
+    }
     if (/[^a-zA-Z0-9-]/.test(name)) return 'VM name can only contain letters, digits, and hyphens.';
     if (/^\d+$/.test(name)) return 'VM name cannot be only digits.';
     if (name.startsWith('-') || name.endsWith('-')) return 'VM name cannot start or end with a hyphen.';
@@ -392,8 +470,23 @@ function validateVmName(name) {
     return null;
 }
 
+/* Username validation. Per-guest-OS rules keyed off osType. Each branch
+   is explicit so it's clear which OS's account rules apply. */
 function validateUsername(name) {
     if (!name) return 'Username is required.';
+    var osSelect = document.getElementById('os-type');
+    var osType = osSelect ? osSelect.value : 'Windows';
+    if (osType === 'Linux') {
+        /* Ubuntu useradd/adduser: lowercase, start with a letter or
+           underscore, then [a-z0-9_-], max 32 chars. */
+        if (name.length > 32) return 'Username cannot exceed 32 characters (Linux limit).';
+        if (!/^[a-z_][a-z0-9_-]*$/.test(name))
+            return 'Lowercase alphanumeric only.';
+        return null;
+    }
+    /* macOS and Windows: keep the existing Windows-account ruleset.
+       (macOS-specific shortname rules are not yet verified; treated the
+       same as Windows for now — see validatePassword note.) */
     if (name.length > 20) return 'Username cannot exceed 20 characters.';
     if (/["\\/\[\]:;|=,+*?<>]/.test(name)) return 'Username contains invalid characters.';
     if (/^[.\s]+$/.test(name)) return 'Username cannot be only dots or spaces.';
@@ -405,12 +498,33 @@ function validateUsername(name) {
     return null;
 }
 
+/* Password validation. Per-guest-OS rules keyed off osType.
+   - Linux: Ubuntu accepts ALL characters via the host's $6$ hash path
+     (usermod -p bypasses pwquality), so the only limits are non-empty
+     and a sane byte ceiling.
+   - macOS / Windows: no extra content rule enforced here today. */
+function validatePassword(pass) {
+    var osSelect = document.getElementById('os-type');
+    var osType = osSelect ? osSelect.value : 'Windows';
+    if (osType === 'Linux') {
+        if (!pass) return 'Password is required.';
+        /* UTF-8 byte length (encodeURIComponent escapes multibyte). */
+        var bytes = unescape(encodeURIComponent(pass)).length;
+        if (bytes > 255) return 'Password is too long (max 255 bytes).';
+        return null;
+    }
+    /* macOS / Windows: no additional constraints today. */
+    return null;
+}
+
 function onCreateVm() {
     var cfg = gatherConfig();
     var nameErr = validateVmName(cfg.name);
     if (nameErr) { sendCmd('log', { message: nameErr }); return; }
     var userErr = validateUsername(cfg.adminUser);
     if (userErr) { sendCmd('log', { message: userErr }); return; }
+    var passErr = validatePassword(cfg.adminPass);
+    if (passErr) { sendCmd('log', { message: passErr }); return; }
     if (cfg.adminPass !== cfg.adminConfirm) {
         sendCmd('log', { message: 'Passwords do not match.' });
         return;
@@ -449,6 +563,8 @@ function openCreateModal() {
     document.getElementById('admin-confirm').value = 'test123';
     document.getElementById('test-mode').checked = true;
     document.getElementById('ssh-enabled').checked = false;
+    /* Reset OS type to Windows on each open (skip on macOS host — it's locked) */
+    if (!hostBridge.isMac) document.getElementById('os-type').value = 'Windows';
 
     /* Smart defaults (RAM/cores) from latest host info */
     if (lastHostInfo) applySmartDefaults(lastHostInfo);
@@ -456,10 +572,10 @@ function openCreateModal() {
     /* Clear validation state */
     document.getElementById('vm-name-warn').textContent = '';
     document.getElementById('admin-user-warn').textContent = '';
+    document.getElementById('admin-pass-warn').textContent = '';
     checkPasswordMatch();
     onNetModeChange();
-    updateCreateButtons();
-    revalidateVmName();
+    applyOsTypeUI();   /* fires updateCreateButtons + revalidateVmName */
 
     document.getElementById('create-vm-overlay').classList.add('active');
     setTimeout(function() { document.getElementById('vm-name').focus(); }, 0);
@@ -504,9 +620,13 @@ function updateStatusCell(td, vm) {
         className = 'status-building';
     } else if (vm.running && !vm.installComplete && !vm.isTemplate) {
         needsSpinner = true;
+        var defaultLabel;
+        if (vm.osType === 'macOS')      defaultLabel = 'Installing macOS ';
+        else if (vm.osType === 'Linux') defaultLabel = 'Installing Linux ';
+        else                            defaultLabel = 'Installing Windows ';
         label = (vm.installStatus && vm.installStatus.length > 0)
             ? (vm.installStatus + ' ')
-            : ((vm.osType === 'macOS' ? 'Installing macOS ' : 'Installing Windows '));
+            : defaultLabel;
         className = 'status-building';
     } else if (vm.running) {
         className = 'status-running';
