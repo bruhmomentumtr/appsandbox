@@ -890,9 +890,9 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     /* Secure Boot — uses ApplySecureBootTemplate + SecureBootTemplateId
        inside the Uefi section. No BootThis — UEFI auto-discovers boot devices.
        Skip when test_mode is enabled (required for test-signed drivers like VDD).
-       Linux: temporarily disabled while debugging the direct-ISO->VHDX boot
-       flow (POC also ran with Skip). Once we confirm the produced VHDX boots,
-       restore the MS UEFI CA template (272e7447-...) for signed shim/grub. */
+       Linux: never applies a template — the direct-ISO->VHDX build produces an
+       unsigned GRUB/kernel chain, so Secure Boot would block boot. Only the
+       Windows, non-test-mode path applies the MS UEFI CA template below. */
     secureboot_section[0] = L'\0';
     if (config->test_mode) {
         /* No Secure Boot — allows test-signed drivers to load */
