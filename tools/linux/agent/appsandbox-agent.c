@@ -236,10 +236,10 @@ static int uid_is_real_user(uid_t uid)
  * graphical session we want to spawn the clipboard helper into. Returns
  * 0 (not found) or a valid uid_t.
  *
- * We can't hardcode a username — autoinstall lets the user pick anything
- * for cfg.admin_user. Looking for the live mutter xauth file is more
- * robust than parsing /etc/passwd because it implicitly filters for "user
- * who actually has a graphical session right now". */
+ * We can't hardcode a username — the create-VM modal lets the user pick
+ * any account name. Looking for the live mutter xauth file is more robust
+ * than parsing /etc/passwd because it implicitly filters for "user who
+ * actually has a graphical session right now". */
 static uid_t find_graphical_session_uid(void)
 {
     DIR *d = opendir("/run/user");

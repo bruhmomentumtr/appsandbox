@@ -94,9 +94,8 @@ BOOL ensure_ssh_msi_cached(wchar_t *msi_path_out, int max_chars);
 
 /* Stage the Linux agent ELFs + kernel modules + DKMS sources + systemd
    units + modprobe.d/modules-load.d + wsl-mesa + wsl-deps under
-   <staging>/extras/. Same content the cidata builder used to ship —
-   exposed so the new direct-ISO->VHDX flow can populate a staging dir
-   and turn it into a manifest for iso-patch --stage. */
+   <staging>/extras/. The direct-ISO->VHDX flow populates this dir (via
+   the prefetch modules) and turns it into a manifest for iso-patch --stage. */
 void stage_linux_agent_and_extras(const wchar_t *staging,
                                   const wchar_t *res_dir,
                                   BOOL ssh_enabled);

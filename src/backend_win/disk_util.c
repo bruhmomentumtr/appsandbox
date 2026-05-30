@@ -112,9 +112,9 @@ HRESULT vhdx_create_differencing_resized(const wchar_t *child_path,
     DWORD result;
     ULONGLONG target_bytes;
 
-    /* Step 1: plain differencing-create. Child inherits parent's MaximumSize.
-       For Ubuntu cloud-image parent that's ~2.5 GB, which isn't enough for
-       an ubuntu-desktop-minimal install. */
+    /* Step 1: plain differencing-create. Child inherits parent's
+       MaximumSize, which may be smaller than the user-requested disk; the
+       optional resize in step 2 stretches it. */
     hr = vhdx_create_differencing(child_path, parent_path);
     if (FAILED(hr)) return hr;
 

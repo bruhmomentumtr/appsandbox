@@ -2734,9 +2734,9 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     /* Populate name early so log lines (e.g. NAT IP allocation) identify the VM. */
     wcscpy_s(inst->name, 256, cfg.name);
 
-    /* Create disk (synchronous path: from-template only — Linux cloud-image
-       creates go through use_linux_cloud above; Windows ISO installs go
-       through use_vhdx_first above). */
+    /* Create disk (synchronous path: from-template only — Linux ISO
+       creates go through the use_linux_cloud branch above; Windows ISO
+       installs go through use_vhdx_first above). */
     if (from_template) {
         asb_log(L"Creating differencing VHDX from template \"%s\"...", g_templates[template_idx].name);
         DeleteFileW(cfg.vhdx_path);
