@@ -12,6 +12,7 @@
 #include "gpu_enum.h"
 #include "hcn_network.h"
 #include "disk_util.h"
+#include "d3dlayers.h"
 #include "snapshot.h"
 #include "vmms_cert.h"
 #include "vm_agent.h"
@@ -46,6 +47,33 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 /* ---- Globals ---- */
 
 static GpuList g_gpu_list;
+
+/* Prepare the GL mapping-layer Plan9 share for a Windows GPU guest: ensure the
+ * D3D mapping layers are fetched/cached on the host, place the OpenGL ICD shim
+ * alongside them, then append the "AppSandbox.GlLayers" share. The guest agent
+ * copies this share AFTER the GPU driver shares and provisions it (stages
+ * dxil.dll to System32, sets AppInit_DLLs + the Khronos OpenCL/Vulkan ICD keys).
+ * Best-effort: if the layers can't be fetched, no share is added and GL/CL/
+ * Vulkan acceleration is simply unavailable. */
+static void prepare_gl_layers_share(GpuDriverShareList *shares)
+{
+    wchar_t dir[MAX_PATH], exe[MAX_PATH], src[MAX_PATH], dst[MAX_PATH], *slash;
+
+    if (!d3dlayers_ensure_cached(dir, MAX_PATH))
+        return;
+
+    /* Stage the OpenGL ICD shim into the same dir so one share carries it. */
+    GetModuleFileNameW(NULL, exe, MAX_PATH);
+    slash = wcsrchr(exe, L'\\');
+    if (slash) *slash = L'\0';
+    swprintf_s(src, MAX_PATH, L"%s\\resources\\appsandbox_gl_shim.dll", exe);
+    if (GetFileAttributesW(src) == INVALID_FILE_ATTRIBUTES)
+        swprintf_s(src, MAX_PATH, L"%s\\appsandbox_gl_shim.dll", exe);
+    swprintf_s(dst, MAX_PATH, L"%s\\appsandbox_gl_shim.dll", dir);
+    CopyFileW(src, dst, FALSE);  /* best-effort; shim may not be built yet */
+
+    gpu_append_gl_layers_share(shares, dir);
+}
 
 static VmInstance g_vms[ASB_MAX_VMS];
 static int g_vm_count = 0;
@@ -862,6 +890,8 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
          * per-GPU driver shares. Windows guests have no use for it. */
         if (_wcsicmp(args->config.os_type, L"Linux") == 0)
             gpu_append_lxsslib_share(&args->config.gpu_shares);
+        else if (_wcsicmp(args->config.os_type, L"Windows") == 0)
+            prepare_gl_layers_share(&args->config.gpu_shares);
     }
 
     asb_log(L"Re-creating HCS compute system for \"%s\"...", vm->name);
@@ -2598,6 +2628,8 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
          * /usr/lib/wsl/lib by the agent on first connect. */
         if (_wcsicmp(cfg.os_type, L"Linux") == 0)
             gpu_append_lxsslib_share(&cfg.gpu_shares);
+        else if (_wcsicmp(cfg.os_type, L"Windows") == 0)
+            prepare_gl_layers_share(&cfg.gpu_shares);
     }
 
     /* ---- VHDX-first path (Windows, from ISO) ---- */

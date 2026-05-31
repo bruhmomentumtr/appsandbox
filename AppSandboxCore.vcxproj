@@ -173,6 +173,7 @@
     <ClCompile Include="src\backend_win\hcn_network.c" />
     <ClCompile Include="src\backend_win\gpu_enum.c" />
     <ClCompile Include="src\backend_win\disk_util.c" />
+    <ClCompile Include="src\backend_win\d3dlayers.c" />
     <ClCompile Include="src\backend_win\snapshot.c" />
     <ClCompile Include="src\backend_win\vmms_cert.c" />
     <ClCompile Include="src\backend_win\vm_agent.c" />
@@ -189,6 +190,8 @@
     <ClInclude Include="src\backend_win\hcn_network.h" />
     <ClInclude Include="src\backend_win\gpu_enum.h" />
     <ClInclude Include="src\backend_win\disk_util.h" />
+    <ClInclude Include="src\backend_win\d3dlayers.h" />
+    <ClInclude Include="src\backend_win\fe3_templates.h" />
     <ClInclude Include="src\backend_win\snapshot.h" />
     <ClInclude Include="src\backend_win\vmms_cert.h" />
     <ClInclude Include="src\backend_win\vm_agent.h" />

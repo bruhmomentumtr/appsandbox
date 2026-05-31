@@ -392,6 +392,81 @@ static BOOL logoff_session(DWORD session_id)
     return result;
 }
 
+/* Provision the D3D mapping layers after the agent has copied them into `dir`
+   (C:\Windows\AppSandbox\d3dlayers) over Plan9. Runs as SYSTEM from the GPU
+   copy thread, AFTER the GPU driver copy. Stages dxil.dll into System32 (the
+   layers load it by leaf name) and registers the ICDs: OpenGL via AppInit_DLLs
+   (full path to the shim), OpenCL + Vulkan via their Khronos registry keys.
+   Each step is gated on the file being present; idempotent across boots. */
+static void gl_provision(const wchar_t *dir)
+{
+    wchar_t path[MAX_PATH], sys[MAX_PATH], dst[MAX_PATH];
+    HKEY key;
+    DWORD one = 1, zero = 0;
+
+    agent_log("GL: provisioning mapping layers from %ls", dir);
+
+    /* dxil.dll -> System32 (OpenGLOn12 / vulkan_dzn load it by leaf name). */
+    if (GetSystemDirectoryW(sys, MAX_PATH)) {
+        swprintf_s(path, MAX_PATH, L"%s\\dxil.dll", dir);
+        swprintf_s(dst, MAX_PATH, L"%s\\dxil.dll", sys);
+        if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+            if (CopyFileW(path, dst, FALSE))
+                agent_log("GL: staged dxil.dll to System32.");
+            else
+                agent_log("GL: dxil.dll -> System32 failed (%lu).", GetLastError());
+        }
+    }
+
+    /* OpenGL: AppInit_DLLs = full path to the shim; enable; allow unsigned. */
+    swprintf_s(path, MAX_PATH, L"%s\\appsandbox_gl_shim.dll", dir);
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE,
+                L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows",
+                0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL) == ERROR_SUCCESS) {
+            RegSetValueExW(key, L"AppInit_DLLs", 0, REG_SZ,
+                           (const BYTE *)path, (DWORD)((wcslen(path) + 1) * sizeof(wchar_t)));
+            RegSetValueExW(key, L"LoadAppInit_DLLs", 0, REG_DWORD,
+                           (const BYTE *)&one, sizeof(one));
+            RegSetValueExW(key, L"RequireSignedAppInit_DLLs", 0, REG_DWORD,
+                           (const BYTE *)&zero, sizeof(zero));
+            RegCloseKey(key);
+            agent_log("GL: AppInit_DLLs set to %ls", path);
+        } else {
+            agent_log("GL: failed to open AppInit_DLLs key.");
+        }
+    } else {
+        agent_log("GL: shim not present in share; OpenGL not enabled.");
+    }
+
+    /* OpenCL: Khronos vendor key — value name = ICD path, data 0 (= load it). */
+    swprintf_s(path, MAX_PATH, L"%s\\OpenCLOn12.dll", dir);
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Khronos\\OpenCL\\Vendors",
+                0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL) == ERROR_SUCCESS) {
+            RegSetValueExW(key, path, 0, REG_DWORD, (const BYTE *)&zero, sizeof(zero));
+            RegCloseKey(key);
+            agent_log("GL: registered OpenCL ICD %ls", path);
+        }
+    }
+
+    /* Vulkan: Khronos driver key — value name = ICD manifest path, data 0.
+       The manifest's library_path is the absolute guest DLL path (set host-side
+       in d3dlayers.c) so the loader can LoadLibraryEx it under
+       LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, which requires a fully-qualified path. */
+    swprintf_s(path, MAX_PATH, L"%s\\dzn_icd.x64.json", dir);
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Khronos\\Vulkan\\Drivers",
+                0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL) == ERROR_SUCCESS) {
+            RegSetValueExW(key, path, 0, REG_DWORD, (const BYTE *)&zero, sizeof(zero));
+            RegCloseKey(key);
+            agent_log("GL: registered Vulkan (Dozen) ICD %ls", path);
+        }
+    }
+
+    agent_log("GL: provisioning complete.");
+}
+
 static DWORD WINAPI gpu_copy_thread(LPVOID param)
 {
     GpuCopyState *state = (GpuCopyState *)param;
@@ -399,7 +474,9 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
     int total_files = 0;
     int failed_shares = 0;
     char msg[256];
+    wchar_t gl_dir[MAX_PATH];
 
+    gl_dir[0] = 0;
     agent_log("GPU copy starting (%d shares)...", state->count);
 
     for (i = 0; i < state->count; i++) {
@@ -409,6 +486,10 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
         int rc;
 
         MultiByteToWideChar(CP_UTF8, 0, si->dest_path, -1, dest_wide, MAX_PATH);
+
+        /* The GL mapping-layer share is provisioned after the copy loop. */
+        if (strcmp(si->share_name, "AppSandbox.GlLayers") == 0)
+            wcscpy_s(gl_dir, MAX_PATH, dest_wide);
 
         agent_log("GPU copy share %d/%d: %s -> %s%s%s",
                   i + 1, state->count, si->share_name, si->dest_path,
@@ -431,6 +512,13 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
         if (state->notify_sock != INVALID_SOCKET)
             send_line(state->notify_sock, msg);
     }
+
+    /* Provision the GL/CL/Vulkan mapping layers now — AFTER the GPU driver copy
+       but BEFORE the device disable/enable cycle, so the ICD configuration
+       (AppInit_DLLs + Khronos OpenCL/Vulkan keys + dxil.dll in System32) is in
+       place when the GPU device is restarted below. */
+    if (gl_dir[0])
+        gl_provision(gl_dir);
 
     /* If files were copied and vrd.inf has error 43, restart GPU + IDD devices
        and re-disable Hyper-V Video adapter. */

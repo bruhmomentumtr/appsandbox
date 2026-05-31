@@ -500,6 +500,25 @@ BOOL gpu_append_lxsslib_share(GpuDriverShareList *list)
     return TRUE;
 }
 
+BOOL gpu_append_gl_layers_share(GpuDriverShareList *list, const wchar_t *host_dir)
+{
+    GpuDriverShare *s;
+
+    if (!list || !host_dir || !host_dir[0]) return FALSE;
+    if (list->count >= MAX_GPU_SHARES) return FALSE;
+    if (GetFileAttributesW(host_dir) == INVALID_FILE_ATTRIBUTES) return FALSE;
+
+    s = &list->shares[list->count];
+    /* Recognised by name on both sides: disk_util skips it for build-time
+     * staging; the guest agent copies it last and then provisions it. */
+    wcscpy_s(s->share_name, 128, L"AppSandbox.GlLayers");
+    wcscpy_s(s->host_path, MAX_PATH, host_dir);
+    wcscpy_s(s->guest_path, MAX_PATH, L"C:\\Windows\\AppSandbox\\d3dlayers");
+    s->file_filter[0] = L'\0';
+    list->count++;
+    return TRUE;
+}
+
 BOOL gpu_get_default_driver_path(GpuList *list,
     wchar_t *out_path, int path_max,
     wchar_t *out_folder, int folder_max)
