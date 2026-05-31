@@ -1,0 +1,611 @@
+/*
+ * d3dlayers.c -- see d3dlayers.h.
+ *
+ * Pipeline (all on the host; mirrors tools/iso-patch/prefetch_repo.c idioms):
+ *   1. GET displaycatalog.mp.microsoft.com for product 9NQPSL29BFFF
+ *      -> parse the package's WuCategoryId (resolved live, never hardcoded).
+ *   2. Windows Update FE3 client protocol over WinHTTP (HTTPS):
+ *        GetCookie -> SyncUpdates(filtered by WuCategoryId)
+ *                  -> GetExtendedUpdateInfo2 -> time-limited CDN url.
+ *      The x64 package is located by identifier in the response, so version
+ *      changes / extra updates do not break resolution.
+ *   3. Download the .appx (a zip) from the Microsoft CDN.
+ *   4. Extract with the in-box tar.exe (libarchive handles zip natively).
+ *   5. Copy the mapping-layer files into <exe_dir>\d3dlayers\ (cached).
+ *
+ * Defensive throughout: any failure returns FALSE and VM creation continues
+ * without GL/CL/Vulkan acceleration.
+ */
+
+#include "d3dlayers.h"
+#include "fe3_templates.h"
+#include "ui.h"
+
+#include <winhttp.h>
+#include <rpc.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "rpcrt4.lib")
+
+#define DL_PRODUCT_ID       L"9NQPSL29BFFF"
+#define DL_FE3_HOST         L"fe3.delivery.mp.microsoft.com"
+#define DL_FE3_PATH         L"/ClientWebService/client.asmx"
+#define DL_FE3_PATH_SECURED L"/ClientWebService/client.asmx/secured"
+#define DL_SOAP_HEADERS     L"Content-Type: application/soap+xml; charset=utf-8\r\n"
+#define DL_CACHE_SUBDIR     L"d3dlayers"
+#define DL_APPX_NAME        L"D3DMappingLayers_x64.appx"
+#define DL_MAX_ROUNDS       5   /* FE3 faults intermittently; retry the chain */
+
+/* Files to extract: dest leaf name <- source path inside the .appx. */
+static const wchar_t *const DL_DST[] = {
+    L"OpenGLOn12.dll", L"dxil.dll", L"OpenCLOn12.dll",
+    L"clon12compiler.dll", L"vulkan_dzn.dll", L"dzn_icd.x64.json"
+};
+static const wchar_t *const DL_SRC[] = {
+    L"x64\\OpenGLOn12.dll", L"x64\\dxil.dll", L"x64\\OpenCLOn12.dll",
+    L"x64\\clon12compiler.dll", L"x64\\vulkan_dzn.dll", L"dzn_icd.x64.json"
+};
+#define DL_NFILES ((int)(sizeof(DL_DST)/sizeof(DL_DST[0])))
+
+/* ---- small helpers (local; backend_win has no shared util header) ---- */
+
+static void get_exe_dir(wchar_t *out, size_t cch)
+{
+    wchar_t *slash;
+    GetModuleFileNameW(NULL, out, (DWORD)cch);
+    slash = wcsrchr(out, L'\\');
+    if (slash) *slash = L'\0';
+}
+
+static void mkdir_p(const wchar_t *path)
+{
+    wchar_t buf[MAX_PATH];
+    wchar_t *p;
+    wcsncpy_s(buf, MAX_PATH, path, _TRUNCATE);
+    p = buf;
+    if (wcslen(buf) >= 3 && buf[1] == L':' && buf[2] == L'\\') p = buf + 3;
+    for (; *p; p++) {
+        if (*p == L'\\') { *p = 0; CreateDirectoryW(buf, NULL); *p = L'\\'; }
+    }
+    CreateDirectoryW(buf, NULL);
+}
+
+static int run_hidden(const wchar_t *cmdline)
+{
+    wchar_t mut[2048];
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+    DWORD ec = 1;
+    wcsncpy_s(mut, 2048, cmdline, _TRUNCATE);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    if (!CreateProcessW(NULL, mut, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) {
+        ui_log(L"d3dlayers: CreateProcess failed: %lu", GetLastError());
+        return -1;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &ec);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return (int)ec;
+}
+
+static BOOL file_exists(const wchar_t *path)
+{
+    return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+/* Fresh lowercase UUID (no braces) for the WS-Addressing MessageID. FE3
+ * rejects replayed message IDs, so every request must use a new one. */
+static void new_guid(char *out, size_t cch)
+{
+    UUID u;
+    RPC_CSTR s = NULL;
+    out[0] = 0;
+    if (UuidCreate(&u) != RPC_S_OK && UuidCreateSequential(&u) != RPC_S_OK) return;
+    if (UuidToStringA(&u, &s) == RPC_S_OK && s) {
+        strncpy_s(out, cch, (const char *)s, _TRUNCATE);
+        RpcStringFreeA(&s);
+    }
+}
+
+/* WS-Security timestamps: created = now (UTC), expires = now + 5 minutes. */
+static void iso_times(char *created, size_t ccch, char *expires, size_t ecch)
+{
+    SYSTEMTIME st, ex;
+    FILETIME ft;
+    ULARGE_INTEGER q;
+    GetSystemTime(&st);
+    sprintf_s(created, ccch, "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
+              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    SystemTimeToFileTime(&st, &ft);
+    q.LowPart = ft.dwLowDateTime; q.HighPart = ft.dwHighDateTime;
+    q.QuadPart += (ULONGLONG)5 * 60 * 10000000ULL;
+    ft.dwLowDateTime = q.LowPart; ft.dwHighDateTime = q.HighPart;
+    FileTimeToSystemTime(&ft, &ex);
+    sprintf_s(expires, ecch, "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
+              ex.wYear, ex.wMonth, ex.wDay, ex.wHour, ex.wMinute, ex.wSecond, ex.wMilliseconds);
+}
+
+/* Allocate a copy of src with every occurrence of tok replaced by val. */
+static char *str_replace_all(const char *src, const char *tok, const char *val)
+{
+    size_t tl = strlen(tok), vl = strlen(val), cnt = 0;
+    const char *p = src, *s;
+    char *out, *d;
+    while ((p = strstr(p, tok)) != NULL) { cnt++; p += tl; }
+    out = (char *)malloc(strlen(src) + cnt * vl + 1);
+    if (!out) return NULL;
+    d = out; s = src;
+    while (*s) {
+        if (strncmp(s, tok, tl) == 0) { memcpy(d, val, vl); d += vl; s += tl; }
+        else { *d++ = *s++; }
+    }
+    *d = 0;
+    return out;
+}
+
+/* In-place minimal XML entity decode (FE3 escapes the inner update XML once). */
+static void html_unescape(char *s)
+{
+    char *d = s, *p = s;
+    while (*p) {
+        if (*p == '&') {
+            if (!strncmp(p, "&lt;", 4))        { *d++ = '<';  p += 4; continue; }
+            if (!strncmp(p, "&gt;", 4))        { *d++ = '>';  p += 4; continue; }
+            if (!strncmp(p, "&quot;", 6))      { *d++ = '"';  p += 6; continue; }
+            if (!strncmp(p, "&apos;", 6))      { *d++ = '\''; p += 6; continue; }
+            if (!strncmp(p, "&#39;", 5))       { *d++ = '\''; p += 5; continue; }
+            if (!strncmp(p, "&amp;", 5))       { *d++ = '&';  p += 5; continue; }
+        }
+        *d++ = *p++;
+    }
+    *d = 0;
+}
+
+/* Copy text between a and b (after a, before next b) into out. */
+static BOOL between(const char *buf, const char *a, const char *b, char *out, size_t cch)
+{
+    const char *p = strstr(buf, a), *q;
+    size_t n;
+    if (!p) return FALSE;
+    p += strlen(a);
+    q = strstr(p, b);
+    if (!q) return FALSE;
+    n = (size_t)(q - p);
+    if (n >= cch) n = cch - 1;
+    memcpy(out, p, n);
+    out[n] = 0;
+    return TRUE;
+}
+
+/* Read an XML attribute value (attr="...") from a bounded tag string. */
+static BOOL attr_in(const char *tag, const char *attr, char *out, size_t cch)
+{
+    char needle[64];
+    sprintf_s(needle, sizeof(needle), "%s=\"", attr);
+    return between(tag, needle, "\"", out, cch);
+}
+
+/* Last occurrence of needle in buf[0..limit). */
+static const char *rfind(const char *buf, const char *limit, const char *needle)
+{
+    const char *best = NULL, *p = buf;
+    size_t nl = strlen(needle);
+    while ((p = strstr(p, needle)) != NULL && p < limit) { best = p; p += nl; }
+    return best;
+}
+
+/* ---- WinHTTP ---- */
+
+/* Perform a request; return the response body as a heap buffer (NUL-terminated)
+ * regardless of HTTP status (SOAP faults carry a body we may inspect). Caller
+ * frees. Returns NULL only on transport failure. */
+static char *http_body(BOOL secure, const wchar_t *host, INTERNET_PORT port,
+                       const wchar_t *verb, const wchar_t *path,
+                       const wchar_t *headers, const void *body, DWORD body_len)
+{
+    HINTERNET hS = NULL, hC = NULL, hR = NULL;
+    char *resp = NULL;
+    DWORD cap = 0, used = 0;
+
+    hS = WinHttpOpen(L"AppSandbox/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hS) goto done;
+    hC = WinHttpConnect(hS, host, port, 0);
+    if (!hC) goto done;
+    hR = WinHttpOpenRequest(hC, verb, path, NULL, WINHTTP_NO_REFERER,
+                            WINHTTP_DEFAULT_ACCEPT_TYPES,
+                            secure ? WINHTTP_FLAG_SECURE : 0);
+    if (!hR) goto done;
+    if (!WinHttpSendRequest(hR, headers ? headers : WINHTTP_NO_ADDITIONAL_HEADERS,
+                            headers ? (DWORD)-1L : 0,
+                            (LPVOID)body, body_len, body_len, 0)) goto done;
+    if (!WinHttpReceiveResponse(hR, NULL)) goto done;
+
+    for (;;) {
+        DWORD avail = 0, rd = 0;
+        if (!WinHttpQueryDataAvailable(hR, &avail)) break;
+        if (avail == 0) break;
+        if (used + avail + 1 > cap) {
+            DWORD nc = (used + avail + 1) * 2;
+            char *n = (char *)realloc(resp, nc);
+            if (!n) { free(resp); resp = NULL; goto done; }
+            resp = n; cap = nc;
+        }
+        if (!WinHttpReadData(hR, resp + used, avail, &rd)) break;
+        if (rd == 0) break;
+        used += rd;
+    }
+    if (resp) resp[used] = 0;
+
+done:
+    if (hR) WinHttpCloseHandle(hR);
+    if (hC) WinHttpCloseHandle(hC);
+    if (hS) WinHttpCloseHandle(hS);
+    return resp;
+}
+
+/* POST a SOAP envelope (UTF-8) to the FE3 service; returns the response body. */
+static char *fe3_post(const wchar_t *path, const char *envelope)
+{
+    return http_body(TRUE, DL_FE3_HOST, INTERNET_DEFAULT_HTTPS_PORT, L"POST",
+                     path, DL_SOAP_HEADERS, envelope, (DWORD)strlen(envelope));
+}
+
+/* GET a full URL and stream it to a file. Handles http/https and query string. */
+static int http_download(const wchar_t *url, const wchar_t *out_path)
+{
+    URL_COMPONENTS uc;
+    wchar_t host[256], upath[4096], extra[2048], fullpath[6144];
+    HINTERNET hS = NULL, hC = NULL, hR = NULL;
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    int rc = -1;
+    BOOL secure;
+    DWORD status = 0, slen = sizeof(status);
+    BYTE buf[65536];
+
+    ZeroMemory(&uc, sizeof(uc));
+    uc.dwStructSize = sizeof(uc);
+    uc.lpszHostName = host;    uc.dwHostNameLength = ARRAYSIZE(host);
+    uc.lpszUrlPath  = upath;   uc.dwUrlPathLength  = ARRAYSIZE(upath);
+    uc.lpszExtraInfo = extra;  uc.dwExtraInfoLength = ARRAYSIZE(extra);
+    if (!WinHttpCrackUrl(url, 0, 0, &uc)) return -1;
+    secure = (uc.nScheme == INTERNET_SCHEME_HTTPS);
+    swprintf_s(fullpath, ARRAYSIZE(fullpath), L"%s%s", upath, extra);
+
+    hS = WinHttpOpen(L"AppSandbox/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hS) goto done;
+    hC = WinHttpConnect(hS, host, uc.nPort, 0);
+    if (!hC) goto done;
+    hR = WinHttpOpenRequest(hC, L"GET", fullpath, NULL, WINHTTP_NO_REFERER,
+                            WINHTTP_DEFAULT_ACCEPT_TYPES,
+                            secure ? WINHTTP_FLAG_SECURE : 0);
+    if (!hR) goto done;
+    if (!WinHttpSendRequest(hR, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) goto done;
+    if (!WinHttpReceiveResponse(hR, NULL)) goto done;
+    WinHttpQueryHeaders(hR, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &status, &slen, WINHTTP_NO_HEADER_INDEX);
+    if (status / 100 != 2) { ui_log(L"d3dlayers: download HTTP %lu", status); goto done; }
+
+    hFile = CreateFileW(out_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) goto done;
+    for (;;) {
+        DWORD avail = 0, rd = 0, wr = 0;
+        if (!WinHttpQueryDataAvailable(hR, &avail)) goto done;
+        if (avail == 0) break;
+        if (avail > sizeof(buf)) avail = sizeof(buf);
+        if (!WinHttpReadData(hR, buf, avail, &rd)) goto done;
+        if (rd == 0) break;
+        if (!WriteFile(hFile, buf, rd, &wr, NULL) || wr != rd) goto done;
+    }
+    rc = 0;
+
+done:
+    if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+    if (hR) WinHttpCloseHandle(hR);
+    if (hC) WinHttpCloseHandle(hC);
+    if (hS) WinHttpCloseHandle(hS);
+    return rc;
+}
+
+/* ---- response parsing ---- */
+
+/* Find the x64 D3DMappingLayers .appx in a (decoded) SyncUpdates response and
+ * resolve its UpdateIdentity by joining the file's enclosing <Update> <ID> to
+ * the matching NewUpdates <UpdateInfo> <UpdateIdentity>. */
+static BOOL parse_x64_leaf(const char *buf, char *uid, size_t uid_cch,
+                           char *rev, size_t rev_cch, char *digest, size_t dig_cch)
+{
+    const char *p = buf;
+    while ((p = strstr(p, "<File ")) != NULL) {
+        const char *gt = strchr(p, '>');
+        char tag[1024], fn[260], isi[260];
+        const char *idp, *idend, *idtok_pos, *uip;
+        char idtok[64], idnum[32];
+        size_t taglen;
+        if (!gt) break;
+        taglen = (size_t)(gt - p);
+        if (taglen >= sizeof(tag)) { p = gt + 1; continue; }
+        memcpy(tag, p, taglen); tag[taglen] = 0;
+
+        if (!attr_in(tag, "FileName", fn, sizeof(fn)) ||
+            !attr_in(tag, "InstallerSpecificIdentifier", isi, sizeof(isi))) {
+            p = gt + 1; continue;
+        }
+        if (!strstr(isi, "D3DMappingLayers") || !strstr(isi, "_x64_") ||
+            !strstr(fn, ".appx")) {
+            p = gt + 1; continue;
+        }
+        /* matched the x64 package file */
+        attr_in(tag, "Digest", digest, dig_cch);
+
+        /* nearest <ID>N</ID> before this <File> = the ExtendedUpdateInfo id */
+        idp = rfind(buf, p, "<ID>");
+        if (!idp) return FALSE;
+        idp += 4;
+        idend = strstr(idp, "</ID>");
+        if (!idend || (size_t)(idend - idp) >= sizeof(idnum)) return FALSE;
+        memcpy(idnum, idp, (size_t)(idend - idp));
+        idnum[idend - idp] = 0;
+
+        /* first <ID>N</ID> in the buffer is the NewUpdates entry; the
+         * UpdateIdentity follows it. */
+        sprintf_s(idtok, sizeof(idtok), "<ID>%s</ID>", idnum);
+        idtok_pos = strstr(buf, idtok);
+        if (!idtok_pos) return FALSE;
+        uip = strstr(idtok_pos, "<UpdateIdentity UpdateID=\"");
+        if (!uip) return FALSE;
+        if (!between(uip, "UpdateID=\"", "\"", uid, uid_cch)) return FALSE;
+        if (!between(uip, "RevisionNumber=\"", "\"", rev, rev_cch))
+            strcpy_s(rev, rev_cch, "1");
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* From a (decoded) GetExtendedUpdateInfo2 response, pick the CDN url for the
+ * file whose <FileDigest> matches `digest`; fall back to the first delivery
+ * CDN url. */
+static BOOL parse_file_url(const char *buf, const char *digest,
+                           wchar_t *out, size_t out_cch)
+{
+    char urla[4096];
+    const char *p;
+
+    if (digest && digest[0]) {
+        const char *d = strstr(buf, digest);
+        if (d) {
+            const char *u = strstr(d, "<Url>");
+            if (u && between(u, "<Url>", "</Url>", urla, sizeof(urla))) {
+                MultiByteToWideChar(CP_UTF8, 0, urla, -1, out, (int)out_cch);
+                return TRUE;
+            }
+        }
+    }
+    /* fallback: first delivery.mp CDN url */
+    p = buf;
+    while ((p = strstr(p, "<Url>")) != NULL) {
+        if (between(p, "<Url>", "</Url>", urla, sizeof(urla))) {
+            if (strstr(urla, "delivery.mp.microsoft.com")) {
+                MultiByteToWideChar(CP_UTF8, 0, urla, -1, out, (int)out_cch);
+                return TRUE;
+            }
+        }
+        p += 5;
+    }
+    return FALSE;
+}
+
+/* Resolve the x64 package CDN url from Microsoft. Returns 0 on success. */
+static int resolve_url(const char *wucatid, wchar_t *url_out, size_t url_cch)
+{
+    int round, rc = -1;
+    for (round = 0; round < DL_MAX_ROUNDS && rc != 0; round++) {
+        char msgid[40], created[40], expires[40];
+        char *t1, *cookie_req = NULL, *cookie_resp = NULL;
+        char cookie[8192];
+        char *sync_req = NULL, *sync_resp = NULL;
+        char uid[128] = {0}, rev[32] = {0}, digest[256] = {0};
+        char *ext_req = NULL, *ext_resp = NULL;
+
+        new_guid(msgid, sizeof(msgid));
+        iso_times(created, sizeof(created), expires, sizeof(expires));
+
+        /* GetCookie */
+        t1 = str_replace_all(FE3_TPL_GETCOOKIE, "%MSGID%", msgid);
+        if (t1) { cookie_req = str_replace_all(t1, "%CREATED%", created); free(t1); }
+        if (cookie_req) { t1 = str_replace_all(cookie_req, "%EXPIRES%", expires); free(cookie_req); cookie_req = t1; }
+        if (cookie_req) { cookie_resp = fe3_post(DL_FE3_PATH, cookie_req); free(cookie_req); }
+        if (!cookie_resp || !between(cookie_resp, "EncryptedData>", "</", cookie, sizeof(cookie))) {
+            free(cookie_resp); Sleep(1500); continue;
+        }
+        free(cookie_resp);
+
+        /* SyncUpdates */
+        new_guid(msgid, sizeof(msgid));
+        t1 = str_replace_all(FE3_TPL_SYNCUPDATES, "%MSGID%", msgid);
+        if (t1) { sync_req = str_replace_all(t1, "%CREATED%", created); free(t1); t1 = sync_req; }
+        if (t1) { sync_req = str_replace_all(t1, "%EXPIRES%", expires); free(t1); t1 = sync_req; }
+        if (t1) { sync_req = str_replace_all(t1, "%COOKIE%", cookie); free(t1); t1 = sync_req; }
+        if (t1) { sync_req = str_replace_all(t1, "%CATID%", wucatid); free(t1); }
+        if (sync_req) { sync_resp = fe3_post(DL_FE3_PATH, sync_req); free(sync_req); }
+        if (sync_resp) html_unescape(sync_resp);
+        if (!sync_resp || !parse_x64_leaf(sync_resp, uid, sizeof(uid), rev, sizeof(rev),
+                                          digest, sizeof(digest))) {
+            free(sync_resp); Sleep(1500); continue;
+        }
+        free(sync_resp);
+
+        /* GetExtendedUpdateInfo2 */
+        new_guid(msgid, sizeof(msgid));
+        t1 = str_replace_all(FE3_TPL_GETEXTENDEDINFO2, "%MSGID%", msgid);
+        if (t1) { ext_req = str_replace_all(t1, "%CREATED%", created); free(t1); t1 = ext_req; }
+        if (t1) { ext_req = str_replace_all(t1, "%EXPIRES%", expires); free(t1); t1 = ext_req; }
+        if (t1) { ext_req = str_replace_all(t1, "%UPDATEID%", uid); free(t1); t1 = ext_req; }
+        if (t1) { ext_req = str_replace_all(t1, "%REVISION%", rev); free(t1); }
+        if (ext_req) { ext_resp = fe3_post(DL_FE3_PATH_SECURED, ext_req); free(ext_req); }
+        if (ext_resp) html_unescape(ext_resp);
+        if (ext_resp && parse_file_url(ext_resp, digest, url_out, url_cch))
+            rc = 0;
+        else
+            Sleep(1500);
+        free(ext_resp);
+    }
+    return rc;
+}
+
+/* The shipped dzn_icd.x64.json gives library_path as "x64\vulkan_dzn.dll",
+ * relative to the manifest. The layers are staged into one flat directory, so
+ * point library_path at the DLL's fully-qualified location in the guest.
+ *
+ * The path must be absolute: the Vulkan loader resolves an ICD via
+ * LoadLibraryW(), falling back to LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_*),
+ * and LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR requires a fully-qualified path. The
+ * path must match the GL-layers share guest_path in gpu_enum.c
+ * (gpu_append_gl_layers_share). */
+static void rewrite_dzn_json(const wchar_t *dir)
+{
+    wchar_t path[MAX_PATH];
+    FILE *f = NULL;
+    long sz;
+    char *buf, *fixed;
+    size_t rd;
+
+    swprintf_s(path, MAX_PATH, L"%s\\dzn_icd.x64.json", dir);
+    if (_wfopen_s(&f, path, L"rb") != 0 || !f) return;
+    fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 65536) { fclose(f); return; }
+    buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return; }
+    rd = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[rd] = 0;
+
+    /* On disk the JSON value is the 18 bytes  x64\\vulkan_dzn.dll  (two
+     * backslash characters, JSON-escaped). Match that exactly and replace it
+     * with the absolute guest path (each backslash JSON-escaped). */
+    fixed = str_replace_all(buf, "x64\\\\vulkan_dzn.dll",
+                            "C:\\\\Windows\\\\AppSandbox\\\\d3dlayers\\\\vulkan_dzn.dll");
+    free(buf);
+    if (!fixed) return;
+    if (_wfopen_s(&f, path, L"wb") == 0 && f) {
+        fwrite(fixed, 1, strlen(fixed), f);
+        fclose(f);
+    }
+    free(fixed);
+}
+
+/* ---- public API ---- */
+
+BOOL d3dlayers_ensure_cached(wchar_t *out_dir, int out_max)
+{
+    wchar_t exe_dir[MAX_PATH], cache[MAX_PATH], tmp[MAX_PATH], appx[MAX_PATH];
+    wchar_t sysdir[MAX_PATH], cmd[2048];
+    char *catalog = NULL, wucatid_a[64] = {0};
+    char wucatid[64] = {0};
+    wchar_t url[6144];
+    int i, present = 0;
+
+    get_exe_dir(exe_dir, MAX_PATH);
+    swprintf_s(cache, MAX_PATH, L"%s\\%s", exe_dir, DL_CACHE_SUBDIR);
+
+    /* Already cached? */
+    for (i = 0; i < DL_NFILES; i++) {
+        wchar_t f[MAX_PATH];
+        swprintf_s(f, MAX_PATH, L"%s\\%s", cache, DL_DST[i]);
+        if (file_exists(f)) present++;
+    }
+    if (present == DL_NFILES) {
+        wcsncpy_s(out_dir, out_max, cache, _TRUNCATE);
+        ui_log(L"d3dlayers: using cached layers at %s", cache);
+        return TRUE;
+    }
+    mkdir_p(cache);
+
+    /* 1. WuCategoryId from the Microsoft display catalog. */
+    catalog = http_body(TRUE, L"displaycatalog.mp.microsoft.com",
+                        INTERNET_DEFAULT_HTTPS_PORT, L"GET",
+                        L"/v7.0/products/" DL_PRODUCT_ID
+                        L"?languages=en-us&market=US&fieldsTemplate=Details",
+                        NULL, NULL, 0);
+    if (!catalog || !between(catalog, "\"WuCategoryId\":\"", "\"",
+                             wucatid_a, sizeof(wucatid_a))) {
+        ui_log(L"d3dlayers: could not resolve WuCategoryId from displaycatalog");
+        free(catalog);
+        return FALSE;
+    }
+    free(catalog);
+    strcpy_s(wucatid, sizeof(wucatid), wucatid_a);
+    {
+        wchar_t w[64];
+        MultiByteToWideChar(CP_UTF8, 0, wucatid, -1, w, 64);
+        ui_log(L"d3dlayers: WuCategoryId=%s", w);
+    }
+
+    /* 2. FE3 chain -> CDN url. */
+    if (resolve_url(wucatid, url, ARRAYSIZE(url)) != 0) {
+        ui_log(L"d3dlayers: FE3 did not return a download url (after %d rounds)", DL_MAX_ROUNDS);
+        return FALSE;
+    }
+
+    /* 3. Download the .appx. */
+    swprintf_s(appx, MAX_PATH, L"%s\\%s", cache, DL_APPX_NAME);
+    ui_log(L"d3dlayers: downloading D3DMappingLayers package...");
+    if (http_download(url, appx) != 0) {
+        ui_log(L"d3dlayers: package download failed");
+        return FALSE;
+    }
+
+    /* 4. Extract with in-box tar.exe (libarchive reads zip/.appx). */
+    swprintf_s(tmp, MAX_PATH, L"%s\\_extract", cache);
+    swprintf_s(cmd, ARRAYSIZE(cmd), L"cmd.exe /c rd /s /q \"%s\" 2>nul", tmp);
+    run_hidden(cmd);
+    mkdir_p(tmp);
+    GetSystemDirectoryW(sysdir, MAX_PATH);
+    swprintf_s(cmd, ARRAYSIZE(cmd), L"\"%s\\tar.exe\" -xf \"%s\" -C \"%s\"", sysdir, appx, tmp);
+    if (run_hidden(cmd) != 0) {
+        ui_log(L"d3dlayers: tar extraction failed");
+        return FALSE;
+    }
+
+    /* 5. Copy the mapping-layer files into the cache root. */
+    for (i = 0; i < DL_NFILES; i++) {
+        wchar_t src[MAX_PATH], dst[MAX_PATH];
+        swprintf_s(src, MAX_PATH, L"%s\\%s", tmp, DL_SRC[i]);
+        swprintf_s(dst, MAX_PATH, L"%s\\%s", cache, DL_DST[i]);
+        if (!CopyFileW(src, dst, FALSE))
+            ui_log(L"d3dlayers: copy %s failed: %lu", DL_DST[i], GetLastError());
+    }
+
+    /* Make the Vulkan ICD manifest point at the DLL beside it (flat layout). */
+    rewrite_dzn_json(cache);
+
+    /* Clean up the extracted tree and the .appx (keep only the DLLs). */
+    swprintf_s(cmd, ARRAYSIZE(cmd), L"cmd.exe /c rd /s /q \"%s\" 2>nul", tmp);
+    run_hidden(cmd);
+    DeleteFileW(appx);
+
+    /* Verify the files we actually need are present. */
+    present = 0;
+    for (i = 0; i < DL_NFILES; i++) {
+        wchar_t f[MAX_PATH];
+        swprintf_s(f, MAX_PATH, L"%s\\%s", cache, DL_DST[i]);
+        if (file_exists(f)) present++;
+    }
+    if (present != DL_NFILES) {
+        ui_log(L"d3dlayers: only %d/%d layer files present after extract", present, DL_NFILES);
+        return FALSE;
+    }
+
+    wcsncpy_s(out_dir, out_max, cache, _TRUNCATE);
+    ui_log(L"d3dlayers: staged %d mapping-layer files to %s", DL_NFILES, cache);
+    return TRUE;
+}

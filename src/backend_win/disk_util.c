@@ -1837,6 +1837,11 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
             const wchar_t *rel_guest = ds->guest_path;
             if (GetFileAttributesW(ds->host_path) == INVALID_FILE_ATTRIBUTES)
                 continue;
+            /* The GL/CL/Vulkan mapping-layer share is delivered by the guest
+               agent over Plan9 at runtime (after the GPU driver copy), not baked
+               into the image — skip it here. */
+            if (_wcsicmp(ds->share_name, L"AppSandbox.GlLayers") == 0)
+                continue;
             /* Strip "C:" or any drive prefix — keep the leading backslash */
             if (rel_guest[0] != L'\0' && rel_guest[1] == L':')
                 rel_guest += 2;
