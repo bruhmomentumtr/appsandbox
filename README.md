@@ -3,6 +3,8 @@
 Isolated, GPU-accelerated sandboxes (virtual machines) on Windows and macOS.
   
 <img width="1691" height="562" alt="App Sandbox" src="https://github.com/user-attachments/assets/d77e9d01-0bd9-48c6-9231-f35ff05b340b" />  
+
+
   
 App Sandbox creates isolated app sandboxes with GPU access and a built-in display, agent, clipboard, and SSH tunnel. On Windows, sandboxes share the host GPU through GPU Paravirtualization (GPU-PV) and are created from a standard Windows 11 or Ubuntu 26.04LTS ISO. On macOS, sandboxes run macOS guests on Apple Silicon using the Virtualization framework and are created from an Apple restore image (.ipsw). On Windows, the entire setup is unattended — the sandbox boots to a usable desktop without manual configuration. On macOS, the install is automated but macOS Setup Assistant still requires a few interactive steps (Apple ID, FileVault, etc.) on first boot before reaching the desktop.  
   
