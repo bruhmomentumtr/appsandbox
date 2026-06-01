@@ -4,11 +4,11 @@ Isolated, GPU-accelerated sandboxes (virtual machines) on Windows and macOS.
 
 <img width="1691" height="562" alt="App Sandbox" src="https://github.com/user-attachments/assets/d77e9d01-0bd9-48c6-9231-f35ff05b340b" />
 
-App Sandbox creates isolated app sandboxes with GPU access and a built-in display, agent, clipboard, and SSH tunnel. On Windows, sandboxes share the host GPU through GPU Paravirtualization (GPU-PV) and are created from a standard Windows ISO. On macOS, sandboxes run macOS guests on Apple Silicon using the Virtualization framework and are created from an Apple restore image (.ipsw). On Windows, the entire setup is unattended — the sandbox boots to a usable desktop without manual configuration. On macOS, the install is automated but macOS Setup Assistant still requires a few interactive steps (Apple ID, FileVault, etc.) on first boot before reaching the desktop.
+App Sandbox creates isolated app sandboxes with GPU access and a built-in display, agent, clipboard, and SSH tunnel. On Windows, sandboxes share the host GPU through GPU Paravirtualization (GPU-PV) and are created from a standard Windows 11 or Ubuntu 26.04LTS ISO. On macOS, sandboxes run macOS guests on Apple Silicon using the Virtualization framework and are created from an Apple restore image (.ipsw). On Windows, the entire setup is unattended — the sandbox boots to a usable desktop without manual configuration. On macOS, the install is automated but macOS Setup Assistant still requires a few interactive steps (Apple ID, FileVault, etc.) on first boot before reaching the desktop.
 
 The primary use case is running software that shouldn't have access to your real machine — AI agents, untrusted executables, anything you wouldn't want having access to your personal data. Each sandbox is disposable. Snapshot it, let it run, roll back if needed.
 
-On Windows, the sandbox does not require an internet connection to function. Display, input, clipboard, and agent communication all use Hyper-V sockets, which are point-to-point between the host and sandbox and do not traverse your network. On macOS, agent, clipboard, and SSH communication use virtio-vsock, which is likewise host-to-guest only. Network connectivity is optional on both platforms and only needed if the software inside the sandbox requires internet access.
+The VM sandbox does not require an internet connection to function. Display, input, clipboard, and agent communication all use Hyper-V sockets, which are point-to-point between the host and sandbox and do not traverse your network. On macOS, agent, clipboard, and SSH communication use virtio-vsock, which is likewise host-to-guest only. Network connectivity is optional on both platforms and only needed if the software inside the sandbox requires internet access.
 
 ## Background
 
@@ -21,7 +21,7 @@ The macOS port uses Apple's Virtualization framework to run macOS guests on Appl
 ### Windows
 - Windows 11 (any edition)
 - Administrator privileges
-- A Windows 11 ISO
+- A Windows 11 or Ubuntu 26.04 LTS ISO
 
 ### macOS
 - Apple Silicon Mac (M1 or later)
