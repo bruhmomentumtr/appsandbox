@@ -1,51 +1,51 @@
 # App Sandbox
-
+  
 Isolated, GPU-accelerated sandboxes (virtual machines) on Windows and macOS.
-
-<img width="1691" height="562" alt="App Sandbox" src="https://github.com/user-attachments/assets/d77e9d01-0bd9-48c6-9231-f35ff05b340b" />
-
-App Sandbox creates isolated app sandboxes with GPU access and a built-in display, agent, clipboard, and SSH tunnel. On Windows, sandboxes share the host GPU through GPU Paravirtualization (GPU-PV) and are created from a standard Windows 11 or Ubuntu 26.04LTS ISO. On macOS, sandboxes run macOS guests on Apple Silicon using the Virtualization framework and are created from an Apple restore image (.ipsw). On Windows, the entire setup is unattended — the sandbox boots to a usable desktop without manual configuration. On macOS, the install is automated but macOS Setup Assistant still requires a few interactive steps (Apple ID, FileVault, etc.) on first boot before reaching the desktop.
-
-The primary use case is running software that shouldn't have access to your real machine — AI agents, untrusted executables, anything you wouldn't want having access to your personal data. Each sandbox is disposable. Snapshot it, let it run, roll back if needed.
-
-The VM sandbox does not require an internet connection to function. Display, input, clipboard, and agent communication all use Hyper-V sockets, which are point-to-point between the host and sandbox and do not traverse your network. On macOS, agent, clipboard, and SSH communication use virtio-vsock, which is likewise host-to-guest only. Network connectivity is optional on both platforms and only needed if the software inside the sandbox requires internet access.
-
+  
+<img width="1691" height="562" alt="App Sandbox" src="https://github.com/user-attachments/assets/d77e9d01-0bd9-48c6-9231-f35ff05b340b" />  
+  
+App Sandbox creates isolated app sandboxes with GPU access and a built-in display, agent, clipboard, and SSH tunnel. On Windows, sandboxes share the host GPU through GPU Paravirtualization (GPU-PV) and are created from a standard Windows 11 or Ubuntu 26.04LTS ISO. On macOS, sandboxes run macOS guests on Apple Silicon using the Virtualization framework and are created from an Apple restore image (.ipsw). On Windows, the entire setup is unattended — the sandbox boots to a usable desktop without manual configuration. On macOS, the install is automated but macOS Setup Assistant still requires a few interactive steps (Apple ID, FileVault, etc.) on first boot before reaching the desktop.  
+  
+The primary use case is running software that shouldn't have access to your real machine — AI agents, untrusted executables, anything you wouldn't want having access to your personal data. Each sandbox is disposable. Snapshot it, let it run, roll back if needed.  
+  
+The VM sandbox does not require an internet connection to function. Display, input, clipboard, and agent communication all use Hyper-V sockets, which are point-to-point between the host and sandbox and do not traverse your network. On macOS, agent, clipboard, and SSH communication use virtio-vsock, which is likewise host-to-guest only. Network connectivity is optional on both platforms and only needed if the software inside the sandbox requires internet access.  
+  
 ## Background
 
 App Sandbox is the successor to [Easy-GPU-PV](https://github.com/jamesstringerparsec/Easy-GPU-PV). Easy-GPU-PV was a set of PowerShell scripts that relied on Hyper-V (Windows 11 Pro only) and required the user to connect via RDP or third-party remote desktop tools. App Sandbox replaces all of that with a native application, built-in display and input over Hyper-V sockets, automated setup, and runs on the Host Compute System (HCS) — the same backend behind WSL2 and Docker containers. HCS only requires the **Virtual Machine Platform** optional Windows feature, which is available on all Windows 11 editions including Home.
-
+  
 The macOS port uses Apple's Virtualization framework to run macOS guests on Apple Silicon Macs. It shares the same web UI as Windows and follows the same architecture: an in-memory sandbox array, INI-style config persistence, and a guest agent for lifecycle management.
-
+  
 ## Requirements
-
+  
 ### Windows
 - Windows 11 (any edition)
 - Administrator privileges
 - A Windows 11 or Ubuntu 26.04 LTS ISO
-
+  
 ### macOS
 - Apple Silicon Mac (M1 or later)
 - macOS 26 Tahoe or later
 - Administrator privileges
-
+  
 ## Setup
-
+  
 ### Windows
-
+  
 1. Run `AppSandbox.exe` as Administrator. The app checks for the **Virtual Machine Platform** Windows feature and enables it automatically if needed, prompting for a reboot.
 2. Create a sandbox — select your ISO, configure RAM, CPU, and GPU settings.
 3. The application builds a VHDX from the ISO, boots the sandbox, and runs Windows setup automatically.
 4. The display window opens when the guest agent comes online.
-
+  
 ### macOS
-
+  
 1. Build and run the Xcode project (`AppSandbox.xcodeproj`).
 2. Create a sandbox — the app fetches the latest macOS restore image from Apple (or select a local .ipsw), configure RAM, CPU, and disk settings.
 3. The application installs macOS, stages the guest agent into the disk image, and marks the sandbox ready.
 4. Start the sandbox. The display window opens and the guest agent connects over virtio-vsock.
-
+  
 ## Features
-
+  
 - **Display** — on Windows, a custom Indirect Display Driver (IDD) in the guest streams the framebuffer to the host over Hyper-V sockets; only dirty rectangles are transmitted and the host renders with D3D11. On macOS, the Virtualization framework provides native display via VZVirtualMachineView with automatic resolution tracking.
 - **Audio** — on Windows, a virtual speaker device (AppSandboxVAD) streams audio to the host. On macOS, the Virtualization framework provides VirtIO sound with host audio input/output. Audio is muted when the display window is closed or minimized.
 - **Clipboard** — bidirectional clipboard sharing supporting text, files, images, and other formats. Uses Hyper-V sockets on Windows and virtio-vsock on macOS with the same delayed-rendering protocol.
@@ -55,13 +55,13 @@ The macOS port uses Apple's Virtualization framework to run macOS guests on Appl
 - **GPU acceleration** — the host GPU is shared with the sandbox. On Windows, this uses GPU Paravirtualization (GPU-PV) with DirectX and CUDA support. On macOS, the Virtualization framework provides GPU acceleration automatically.
 - **Snapshots** (Windows) — save sandbox state and create differencing disks. Snapshots support branching — multiple independent working copies from the same point.
 - **Templates** (Windows) — mark a sandbox as a template at creation time. Windows installs, syspreps, and shuts down automatically. New sandboxes created from that template skip the image extraction phase and start from OOBE, reducing setup time.
-
+  
 ## Architecture
-
+  
 The codebase is split into platform-specific backends behind a shared web UI (`web/app.js` + `web/index.html`). Both platforms use an in-memory sandbox array persisted to `vms.cfg` in INI format.
-
+  
 ### Windows
-
+  
 Written in C. Compiled with Visual Studio 2022. Uses only Windows APIs — no third-party dependencies.
 
 ```
@@ -77,7 +77,7 @@ AppSandbox.exe              UI (WebView2, display windows, tray)
 All system DLLs are loaded dynamically at runtime.
 
 ### macOS
-
+  
 Written in Objective-C. Built with Xcode. Uses Apple's Virtualization framework — no third-party dependencies.
 
 ```
