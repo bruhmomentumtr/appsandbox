@@ -561,7 +561,7 @@ function openCreateModal() {
     document.getElementById('admin-user').value = 'user';
     document.getElementById('admin-pass').value = 'test123';
     document.getElementById('admin-confirm').value = 'test123';
-    document.getElementById('test-mode').checked = true;
+    document.getElementById('test-mode').checked = false;
     document.getElementById('ssh-enabled').checked = false;
     /* Reset OS type to Windows on each open (skip on macOS host — it's locked) */
     if (!hostBridge.isMac) document.getElementById('os-type').value = 'Windows';

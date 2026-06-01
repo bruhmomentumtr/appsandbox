@@ -421,3 +421,12 @@ FodyWeavers.xsd
 
 # Local-only planning and notes — kept on disk for context, not pushed.
 /docs/
+
+# Local signing / Hardware-API submission secrets — never committed
+tools/sign/*.local.*
+/secrets/
+
+# makecab byproducts written during driver cab building (now redirected into bin\, but
+# guard the repo root in case a cab is ever built from here)
+/setup.inf
+/setup.rpt

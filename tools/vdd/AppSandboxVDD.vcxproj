@@ -26,7 +26,9 @@
     <ClInclude Include="Trace.h" />
   </ItemGroup>
   <ItemGroup>
-    <Inf Include="AppSandboxVDD.inf" />
+    <Inf Include="AppSandboxVDD.inf">
+      <TimeStamp>$(AsbVersion)</TimeStamp>
+    </Inf>
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{E1F2A3B4-C5D6-7890-ABCD-EF1234567890}</ProjectGuid>
@@ -35,6 +37,7 @@
     <Configuration>Debug</Configuration>
     <Platform Condition="'$(Platform)' == ''">x64</Platform>
     <RootNamespace>AppSandboxVDD</RootNamespace>
+    <AsbEmbedVersion>false</AsbEmbedVersion>
   </PropertyGroup>
   <PropertyGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
     <PlatformToolset>WindowsUserModeDriver10.0</PlatformToolset>

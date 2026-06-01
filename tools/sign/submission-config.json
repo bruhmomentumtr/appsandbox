@@ -1,0 +1,45 @@
+{
+  "_comment": "AppSandbox driver attestation-submission config. Committable (no secrets). Creds live in partner-center.local.json (git-ignored). Tune requestedSignatures / selectedProductTypes / paths as needed.",
+
+  "evCertThumbprint": "",
+  "timestampUrl": "http://ts.ssl.com",
+
+  "workDir": "..\\..\\bin\\Release\\_attest",
+  "outDir":  "..\\..\\bin\\Release\\drivers-signed",
+  "symbolDir": "..\\..\\x64\\Release",
+
+  "deviceType": "internal",
+  "inf2catOs": "10_CO_X64",
+
+  "requestedSignatures": [
+    "WINDOWS_v100_X64_CO_FULL",
+    "WINDOWS_v100_X64_NI_FULL",
+    "WINDOWS_v100_X64_GE_FULL",
+    "WINDOWS_v100_X64_25H2_FULL"
+  ],
+  "selectedProductTypes": {
+    "Windows_v100_CO": "Unclassified",
+    "Windows_v100_NI": "Unclassified",
+    "Windows_v100_GE": "Unclassified",
+    "Windows_v100_25H2": "Unclassified"
+  },
+
+  "drivers": [
+    {
+      "productName": "App Sandbox Virtual Display Driver",
+      "cabFolder": "AppSandboxVDD",
+      "cabName": "AppSandboxVDD.cab",
+      "sourceDir": "..\\..\\bin\\Release\\drivers",
+      "required": [ "AppSandboxVDD.dll", "AppSandboxVDD.inf", "AppSandboxVDD.cat" ],
+      "optional": [ "AppSandboxVDD.pdb" ]
+    },
+    {
+      "productName": "App Sandbox Virtual Audio Driver",
+      "cabFolder": "AppSandboxVAD",
+      "cabName": "AppSandboxVAD.cab",
+      "sourceDir": "..\\..\\bin\\Release\\drivers",
+      "required": [ "AppSandboxVAD.sys", "AppSandboxVAD.inf", "AppSandboxVAD.cat" ],
+      "optional": [ "AppSandboxVAD.pdb" ]
+    }
+  ]
+}

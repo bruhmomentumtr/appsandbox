@@ -1,0 +1,223 @@
+# AppSandbox — Code Signing & Release Packaging
+
+How to produce a fully-signed AppSandbox release: every binary we build is
+**EV Authenticode-signed**, the two drivers are **Microsoft attestation-signed**,
+and the result is zipped for distribution.
+
+This is written so anyone with **(a)** an EV code-signing certificate on a hardware
+token and **(b)** a Microsoft Partner Center *Hardware* account can reproduce it.
+
+> **Golden rule:** signing + driver attestation + ZIP only happen when the EV token
+> is plugged in. On any machine without it, the build still works and produces a
+> normal **test-signed** dev build — nothing is signed or zipped.
+
+---
+
+## 1. What gets signed, and how
+
+| Artifact | Signing | Tool |
+| --- | --- | --- |
+| `AppSandbox.exe`, `appsandbox_core.dll`, `appsandbox_gl_shim.dll`, `iso-patch.exe`, the 6 `appsandbox-*.exe` (host + the guest copies under `resources\`) | **EV Authenticode** (your cert) | `signtool` |
+| `AppSandboxVDD.{dll,inf,cat}`, `AppSandboxVAD.{sys,inf,cat}` | **EV-signed** (binary + catalog) **then Microsoft attestation** — you EV-sign the `.sys`/`.dll`, regenerate + EV-sign the `.cat`, EV-sign the CAB; Microsoft returns the package with the **catalog MS-signed** (the binary keeps your EV signature) | `signtool` + `inf2cat` + `makecab` + Hardware API |
+| `WebView2Loader.dll` | already Microsoft-signed — **not** re-signed | — |
+
+Two different signatures because kernel-mode / UMDF drivers will not load on retail
+Windows from a self/EV signature alone — they need Microsoft's signature, obtained
+via attestation through Partner Center.
+
+---
+
+## 2. Prerequisites (one-time)
+
+1. **EV code-signing certificate on a hardware token** (e.g. a YubiKey). When the
+   token is inserted, the cert appears in `Cert:\CurrentUser\My` with a private key.
+   Signing prompts for the token PIN.
+2. **Microsoft Partner Center — Hardware program** account, with your **EV cert
+   associated** to it (Partner Center adds the cert under the hardware account).
+3. **Azure AD (Entra) app** for the Hardware submission API (below).
+4. Windows SDK + WDK installed (`signtool.exe`, `infverif.exe`, `makecab.exe`).
+
+### 2a. Create the Entra app (for the submission API)
+
+1. Azure portal → **Microsoft Entra ID → App registrations → New registration**
+   (single tenant). Copy the **Application (client) ID** and **Directory (tenant) ID**.
+2. **Certificates & secrets → New client secret** → copy the **Value** (shown once).
+3. *Do not* add API permissions or admin consent — the Hardware API authorizes via
+   Partner Center roles, not Entra permissions.
+
+### 2b. Authorize the app in Partner Center
+
+1. Partner Center → ⚙ **Account settings → User management → Microsoft Entra ID
+   applications → Add** → your app → assign the **Manager** role.
+2. ⚙ **Developer settings → Users → Microsoft Entra ID applications →** your app →
+   **Roles → Hardware** → check **Driver Submitter** + **Shipping Label owner**
+   (+ **Shipping Label promoter** if shown).
+
+> Associating the app requires a **Global Administrator** of the Entra tenant.
+
+### 2c. Create the credentials file (git-ignored)
+
+The driver-signing scripts read the Entra app secrets from
+`tools/sign/partner-center.local.json`. **This file is not in the repo — you must
+create it** (driver attestation fails without it), holding the three values from §2a:
+```json
+{ "tenantId": "...", "clientId": "...", "clientSecret": "..." }
+```
+This file matches `tools/sign/*.local.*` in `.gitignore` — **never commit it**.
+Validate it (run in your own terminal, paste nothing secret):
+```powershell
+tools\sign\test-hardware-api.ps1
+# expect:  AUTH: PASS ...   PRODUCTS GET: PASS (HTTP 200) ...
+```
+
+---
+
+## 3. Files in `tools/sign/`
+
+| File | Committed? | Purpose |
+| --- | --- | --- |
+| `partner-center.local.json` | **no** (git-ignored) | Entra API creds (tenant/client/secret) |
+| `submission-config.json` | yes | Product names, OS signature targets, driver→cab mapping, timestamp URL, optional `evCertThumbprint` |
+| `test-hardware-api.ps1` | yes | Validate creds + Hardware roles |
+| `sign-drivers.ps1` | yes | EV-sign drivers (binary + catalog + cab) → attestation submit (both in parallel) → download MS-signed |
+| `make-release.ps1` | yes | Build → (if YubiKey) sign all binaries + driver-attest + ZIP; else skip |
+| `AppSandboxPackage.vcxproj` | yes | Utility project; runs `make-release.ps1 -NoBuild` after a successful `Release|x64` VS build |
+| `SIGNING.md` | yes | This document |
+
+Versioning lives at the **repo root**: `Directory.Build.props` (the version numbers + the
+non-VS `InfVerif` skip), `Directory.Build.targets` (auto-injects VERSIONINFO), `build\version.rc`
+(the shared resource). See §8.
+
+Secrets live only in `*.local.json` (git-ignored) and on the token (the PIN). The EV
+cert's identity (org name, thumbprint) is **public** on any shipped signed binary —
+that is inherent to EV signing — so the goal is "keep it out of source," not secret.
+
+---
+
+## 4. Running it
+
+### From Visual Studio (the usual path)
+**Build Solution** in **Release|x64**. The `AppSandboxPackage` project depends on every
+other project, so Visual Studio builds it **last** and — via its `AfterTargets="Build"`
+step — runs `make-release.ps1 -NoBuild`, **but only if every project built successfully**
+(a failed build skips it, so no signing/packaging on a broken build). With no EV YubiKey
+it no-ops (build only); with the token in it signs + attestation-signs + zips. Debug
+builds and Release|ARM64 never trigger it.
+
+### Normal release (the one command)
+```powershell
+tools\sign\make-release.ps1
+```
+- Builds `Release|x64`.
+- **If the EV YubiKey is in:** EV-signs all binaries — app `.exe`/`.dll` **and** driver
+  `.sys`/`.dll` — in one call (**PIN 1**); then `sign-drivers.ps1` regenerates + EV-signs the
+  catalogs (**PIN 2**) and EV-signs the cabs (**PIN 3**), submits both drivers to Microsoft,
+  waits, and downloads the MS-signed drivers; then writes `bin\Release\AppSandbox-<ver>-x64.zip`
+  (no `.pdb`/intermediates, MS-signed drivers swapped in, test `.cer` dropped). **Three PINs
+  total.** (If `bin\Release\drivers-signed\` already exists it's reused — no resubmit.)
+- **If the YubiKey is out:** stops after the build — no signing, no ZIP.
+
+Switches: `-NoBuild`, `-SkipDrivers`, `-ForceDriverSign`, `-Version <v>`. The version comes
+from `Directory.Build.props` unless `-Version` overrides it.
+
+### Driver attestation only (when a driver changes)
+```powershell
+tools\sign\sign-drivers.ps1
+```
+Per driver: EV-signs the `.sys`/`.dll` (skipped if `make-release.ps1` already signed them),
+regenerates + EV-signs the catalog, builds the CAB, then EV-signs all CABs — up to **three
+PINs** (binaries, catalogs, cabs). Submits **both drivers in parallel** to the Hardware API,
+waits (no timeout; `-Resume` re-attaches to in-flight submissions), and extracts each MS-signed
+package into `bin\Release\drivers-signed\<DriverName>\`. Re-run only when a driver binary
+changes; `make-release.ps1` reuses the cached output otherwise.
+
+---
+
+## 5. The EV signing routine (reference)
+
+```
+signtool sign /sha1 <THUMBPRINT> /fd SHA256 /tr <timestamp-url> /td SHA256 /v <files...>
+signtool verify /pa /v <file>
+```
+- `/sha1 <thumbprint>` selects the cert; the scripts **auto-detect** it (the one
+  CA-issued code-signing cert with a private key in `CurrentUser\My`) or use
+  `evCertThumbprint` from `submission-config.json`.
+- Always SHA-256 (`/fd`,`/td`) and RFC-3161 timestamped (`/tr`) so signatures outlive
+  cert expiry. Pass many files to one `sign` call → **one PIN** for the batch.
+
+---
+
+## 6. Driver attestation details
+
+**The CAB is only the submission envelope — it is never shipped.** Everything inside it is
+**EV-signed first**, so the package we submit already carries our identity: the `.sys`/`.dll`
+is EV-signed, the catalog is regenerated with `inf2cat` (so it hashes the EV-signed binary)
+and then EV-signed, and the CAB itself is EV-signed (that signature authenticates the
+submission). Microsoft returns the same shape with the **catalog re-signed by Microsoft**; the
+binary keeps our EV embedded signature. `make-release.ps1` swaps that package into the zip.
+
+CAB rules (`sign-drivers.ps1` handles these): each driver in its **own subfolder**, no files
+at the cab root, include the **`.pdb`** (Microsoft's crash analysis wants it).
+
+API flow (`https://manage.devcenter.microsoft.com/v2.0/my/hardware`): token →
+`POST /products` (`testHarness:"Attestation"`) → `POST …/submissions` (returns a SAS upload
+URL) → PUT the signed CAB → `POST …/commit` → poll `workflowStatus.state` until `completed` →
+download `downloads.items[type=="signedPackage"]`. Both drivers run **in parallel**.
+
+**One product per version.** A product accepts exactly **one** submission (a second returns
+`"Initial submission already exists"`), so each release is its own product — the version is
+baked into the product name (e.g. `App Sandbox Virtual Display Driver 0.1.0`) so the dashboard
+reads as a version history. Products **cannot be deleted** via the API (only renamed, via
+`PATCH /products/{id}`), so retire old ones by renaming, not removal.
+
+**OS targets** are set in `submission-config.json` → `requestedSignatures`. Current
+codes are listed in Microsoft's *Get product data* doc; Windows 11 x64:
+`WINDOWS_v100_X64_CO_FULL` (21H2), `_NI_FULL` (22H2), `_GE_FULL` (24H2),
+`_25H2_FULL` (25H2).
+
+**INF verification** (`infverif /h`, required by Partner Center since Apr 2025) runs at
+**build time inside Visual Studio**. Command-line / CI builds skip the build-time task
+(`SkipPackageVerification` in `Directory.Build.props` — the WDK task can't load `InfVerif.dll`
+outside the VS environment), and Microsoft re-runs full INF validation on submission. To check
+an INF by hand:
+```
+"C:\Program Files (x86)\Windows Kits\10\bin\<ver>\x64\infverif.exe" /h <built-inf>
+```
+
+---
+
+## 7. Install implication (TODO when drivers are MS-signed)
+
+The guest install scripts in `src\backend_win\disk_util.c` currently do
+`bcdedit /set testsigning on` + `certutil -addstore Root/TrustedPublisher <cer>` +
+`devcon install <inf>` — required for **test-signed** drivers. Once the shipped
+drivers are **Microsoft-signed**, the `testsigning` and `certutil`/`.cer` steps are
+no longer needed (the MS signature is trusted by retail Windows); only
+`devcon install <inf>` remains. That change spans three near-identical script
+generators (`iso_create_resources`, `iso_create_instance_resources`,
+`generate_vhdx_setupcomplete`) plus the `.cer` staging in `stage_agent_and_setup`
+and `generate_vhdx_manifest` — best gated on a "test-signed vs MS-signed" build flag.
+
+---
+
+## 8. Versioning (reference)
+
+**One source of truth: `Directory.Build.props` at the repo root.** Edit the four numbers
+(`AsbVersionMajor/Minor/Patch/Revision`) and the next build flows them everywhere:
+
+- **App binaries** (every `.exe`/`.dll`) get a `VERSIONINFO` resource — FileVersion +
+  ProductVersion + `ProductName` "App Sandbox" + per-binary `OriginalFilename` — from
+  `build\version.rc`, which `Directory.Build.targets` auto-injects into each project (no
+  per-project edits; it derives each binary's identity from MSBuild properties). It carries
+  **no CompanyName / LegalCopyright** on purpose, so a third-party build makes no false claim —
+  the publisher identity comes only from the EV signature on official builds.
+- **Drivers** stamp `DriverVer` from `$(AsbVersion)` via the `<TimeStamp>` metadata on the
+  `<Inf>` item in each driver `.vcxproj` (WDK StampInf). They opt out of the binary VERSIONINFO
+  via `<AsbEmbedVersion>false</AsbEmbedVersion>`.
+- **Zip name** (`make-release.ps1`) and **Partner Center product/submission names**
+  (`sign-drivers.ps1`) read `Directory.Build.props` too.
+
+Current value: **`0.1.0.0`**. The drivers are **Windows 11+ only** (the VDD references the
+inbox `WudfRd.inf`, which is Win11+).
+
+`Directory.Build.props` also sets `SkipPackageVerification=true` for **non-VS** builds (see §6).
