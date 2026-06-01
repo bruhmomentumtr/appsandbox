@@ -134,6 +134,7 @@ typedef struct InputPacket {
 
 #define WM_VM_DISPLAY_CLOSED    (WM_APP + 5)
 #define WM_IDD_FRAME_READY      (WM_USER + 100)
+#define WM_IDD_FOCUS            (WM_USER + 101)
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
@@ -287,6 +288,7 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 /* System menu command IDs — must be < 0xF000 and have low 4 bits clear */
 #define IDM_AUDIO_MUTE     0x1000
 #define IDM_XMIT_HOTKEYS   0x1010
+#define IDM_SHOW_LOG       0x1020
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 
@@ -1855,13 +1857,14 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         DwmSetWindowAttribute(d->hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
     }
 
-    /* Add toggles to the system menu (right-click title bar) */
+    /* Add options to the system menu (right-click title bar) */
     {
         HMENU sysmenu = GetSystemMenu(d->hwnd, FALSE);
         if (sysmenu) {
             AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
+            AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
         }
@@ -1890,9 +1893,10 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         HFONT font;
         swprintf_s(log_title, 300, L"%s - IDD Log", d->vm_name);
 
+        /* Created hidden — shown on demand via the "Show Log" system-menu item. */
         d->log_hwnd = CreateWindowExW(
             0, L"AppSandboxIddLog", log_title,
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_VSCROLL,
+            WS_OVERLAPPEDWINDOW | WS_VSCROLL,
             CW_USEDEFAULT, CW_USEDEFAULT, LOG_WINDOW_W, LOG_WINDOW_H,
             NULL, NULL, d->hInstance, NULL);
 
@@ -2015,6 +2019,20 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             idd_log(d, d->transmit_hotkeys
                         ? L"Transmit Keyboard Hotkeys: ON."
                         : L"Transmit Keyboard Hotkeys: OFF.");
+            return 0;
+        }
+        if (d && (wp & 0xFFF0) == IDM_SHOW_LOG) {
+            /* Reveal the log window (hidden by default). Closing it via its
+               own [X] just hides it again (see idd_log_proc WM_CLOSE), so
+               this item can re-open it any number of times. */
+            if (d->log_hwnd && IsWindow(d->log_hwnd)) {
+                if (IsIconic(d->log_hwnd))
+                    ShowWindow(d->log_hwnd, SW_RESTORE);
+                else
+                    ShowWindow(d->log_hwnd, SW_SHOW);
+                BringWindowToTop(d->log_hwnd);
+                SetForegroundWindow(d->log_hwnd);
+            }
             return 0;
         }
         break;
@@ -2151,6 +2169,18 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d && d->clipboard) {
             vm_clipboard_on_reader_apply(d->clipboard);
         }
+        return 0;
+
+    /* Posted by vm_display_idd_focus() from another thread to raise an
+       already-open window. Runs on the window's own thread. Restores from
+       minimized (the creation path never had to handle that) then brings
+       the window forward; SetForegroundWindow succeeds because the user
+       just clicked our foreground main window to trigger this. */
+    case WM_IDD_FOCUS:
+        if (IsIconic(hwnd))
+            ShowWindow(hwnd, SW_RESTORE);
+        BringWindowToTop(hwnd);
+        SetForegroundWindow(hwnd);
         return 0;
 
     case WM_SETFOCUS:
@@ -2407,4 +2437,14 @@ BOOL vm_display_idd_is_open(VmDisplayIdd *display)
 {
     if (!display) return FALSE;
     return display->open && display->hwnd && IsWindow(display->hwnd);
+}
+
+void vm_display_idd_focus(VmDisplayIdd *display)
+{
+    if (!display || !display->open ||
+        !display->hwnd || !IsWindow(display->hwnd))
+        return;
+    /* Marshal to the window thread; that thread owns the window and runs
+       the activation (restore-if-minimized + foreground) in WM_IDD_FOCUS. */
+    PostMessageW(display->hwnd, WM_IDD_FOCUS, 0, 0);
 }
