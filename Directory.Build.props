@@ -1,0 +1,36 @@
+<Project>
+  <!--
+    SINGLE SOURCE OF TRUTH for the App Sandbox version.
+
+    Edit the four numbers below and nothing else. Everything derives from them at build time:
+      * every app binary's FileVersion / ProductVersion  (via build\version.rc, wired in
+        Directory.Build.targets)
+      * both drivers' DriverVer                          (<TimeStamp> in the driver .vcxproj)
+      * the release zip name                             (make-release.ps1)
+      * the Microsoft submission + product name          (sign-drivers.ps1)
+
+    MSBuild auto-imports this file into every project in the tree, so no <Import> is needed.
+  -->
+  <PropertyGroup>
+    <AsbVersionMajor>0</AsbVersionMajor>
+    <AsbVersionMinor>1</AsbVersionMinor>
+    <AsbVersionPatch>0</AsbVersionPatch>
+    <AsbVersionRevision>0</AsbVersionRevision>
+
+    <!-- Derived forms - do not edit. -->
+    <AsbVersion>$(AsbVersionMajor).$(AsbVersionMinor).$(AsbVersionPatch).$(AsbVersionRevision)</AsbVersion>
+    <AsbVersionComma>$(AsbVersionMajor),$(AsbVersionMinor),$(AsbVersionPatch),$(AsbVersionRevision)</AsbVersionComma>
+    <AsbVersionShort>$(AsbVersionMajor).$(AsbVersionMinor).$(AsbVersionPatch)</AsbVersionShort>
+  </PropertyGroup>
+
+  <!--
+    The WDK's build-time INF verifier (DPVerifierTask) can't load x86\InfVerif.dll outside the
+    Visual Studio build environment, so command-line / CI builds error on it (HRESULT 0x8007007E).
+    Skip it there ONLY - VS GUI builds still run it, and the INF is re-verified by Microsoft on
+    every submission. $(BuildingInsideVisualStudio) is set to 'true' by the IDE and is empty for
+    command-line msbuild.
+  -->
+  <PropertyGroup Condition="'$(BuildingInsideVisualStudio)' != 'true'">
+    <SkipPackageVerification>true</SkipPackageVerification>
+  </PropertyGroup>
+</Project>

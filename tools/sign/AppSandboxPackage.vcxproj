@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AppSandboxPackage — a Utility project that runs tools\sign\make-release.ps1 -NoBuild
+  AFTER the solution builds, but ONLY for Release|x64.
+
+  In AppSandbox.sln this project is set to depend on every other project, so Visual
+  Studio builds it LAST and SKIPS it entirely if any project failed to build — i.e.
+  if a binary fails to compile, no signing or packaging is attempted.
+
+  make-release.ps1 itself only signs/packages when the App Sandbox LLC EV YubiKey is
+  present; with no token it returns immediately (build only, no zip).
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|ARM64">
+      <Configuration>Debug</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|ARM64">
+      <Configuration>Release</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{0FA17E55-9C3D-4B21-AE60-5D7C1B2E3F40}</ProjectGuid>
+    <RootNamespace>AppSandboxPackage</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
+    <ConfigurationType>Utility</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <ConfigurationType>Utility</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)obj\package\$(Configuration)-$(Platform)\</OutDir>
+    <IntDir>$(SolutionDir)obj\package\$(Configuration)-$(Platform)\</IntDir>
+    <!-- Always run on a Release build (no stale up-to-date skip). -->
+    <DisableFastUpToDateCheck>true</DisableFastUpToDateCheck>
+  </PropertyGroup>
+  <Target Name="AppSandboxSignAndPackage" AfterTargets="Build"
+          Condition="'$(Configuration)|$(Platform)'=='Release|x64' And '$(ASB_SKIP_PACKAGE_PROJECT)' != '1'">
+    <Message Importance="high" Text="==== AppSandbox: make-release.ps1 -NoBuild (sign + package) ====" />
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(SolutionDir)tools\sign\make-release.ps1&quot; -NoBuild" />
+  </Target>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

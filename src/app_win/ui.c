@@ -564,7 +564,8 @@ static void do_connect_idd(int idx)
     v = asb_vm_instance(asb_vm_get(idx));
     if (!v || !v->running) { ui_log(L"VM \"%s\" is not running.", v ? v->name : L"?"); return; }
     if (g_idd_displays[idx] && vm_display_idd_is_open(g_idd_displays[idx])) {
-        ui_log(L"IDD display already open."); return;
+        vm_display_idd_focus(g_idd_displays[idx]);
+        return;
     }
     safe_destroy_idd(idx);
     ui_log(L"Opening IDD display for \"%s\"...", v->name);

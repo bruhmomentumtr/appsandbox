@@ -1,0 +1,60 @@
+// Shared VERSIONINFO resource for every App Sandbox binary.
+//
+// The version + per-binary identity are supplied as preprocessor defines by
+// Directory.Build.targets (which derives them from Directory.Build.props and each project's
+// own MSBuild properties). Defines arrive UNQUOTED and are stringized here, so building this
+// .rc standalone (without the defines) still produces a valid 0.0.0.0 resource.
+
+#include <windows.h>
+
+#define ASB_STR2(x) #x
+#define ASB_STR(x)  ASB_STR2(x)
+
+#ifndef ASB_VERSION_COMMA
+#define ASB_VERSION_COMMA 0,0,0,0
+#endif
+#ifndef ASB_VERSION_STR
+#define ASB_VERSION_STR 0.0.0.0
+#endif
+#ifndef ASB_FILE_TYPE
+#define ASB_FILE_TYPE VFT_APP
+#endif
+#ifndef ASB_ORIG_FILENAME
+#define ASB_ORIG_FILENAME unknown
+#endif
+#ifndef ASB_INTERNAL_NAME
+#define ASB_INTERNAL_NAME unknown
+#endif
+#ifndef ASB_FILE_DESC
+#define ASB_FILE_DESC ASB_INTERNAL_NAME
+#endif
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    ASB_VERSION_COMMA
+ PRODUCTVERSION ASB_VERSION_COMMA
+ FILEFLAGSMASK  0x3fL
+ FILEFLAGS      0x0L
+ FILEOS         VOS__WINDOWS32
+ FILETYPE       ASB_FILE_TYPE
+ FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            // No CompanyName / LegalCopyright: the publisher identity comes from the EV
+            // signature (present only on official signed builds), so a third-party build
+            // makes no false claim. Version + product name are generic to the product.
+            VALUE "FileDescription",  ASB_STR(ASB_FILE_DESC)
+            VALUE "FileVersion",      ASB_STR(ASB_VERSION_STR)
+            VALUE "InternalName",     ASB_STR(ASB_INTERNAL_NAME)
+            VALUE "OriginalFilename", ASB_STR(ASB_ORIG_FILENAME)
+            VALUE "ProductName",      "App Sandbox"
+            VALUE "ProductVersion",   ASB_STR(ASB_VERSION_STR)
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

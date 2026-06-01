@@ -1,0 +1,35 @@
+<Project>
+  <!--
+    Auto-embed a VERSIONINFO resource (driven by Directory.Build.props) into every EXE/DLL we
+    build, so FileVersion / ProductVersion / CompanyName come from the single source. Each
+    binary's OriginalFilename / InternalName / FILETYPE are derived from its own MSBuild
+    properties, so individual projects need no edits.
+
+    Opt-out: a project that sets <AsbEmbedVersion>false</AsbEmbedVersion> is skipped (the
+    drivers do this - they version via DriverVer/StampInf, not a binary VERSIONINFO). Utility
+    projects are skipped automatically by ConfigurationType.
+
+    This file is imported AFTER each project's body, so $(TargetName)/$(TargetFileName)/
+    $(ConfigurationType) are already resolved here.
+  -->
+  <PropertyGroup Condition="'$(AsbEmbedVersion)' == '' And ('$(ConfigurationType)' == 'Application' Or '$(ConfigurationType)' == 'DynamicLibrary')">
+    <AsbEmbedVersion>true</AsbEmbedVersion>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(AsbEmbedVersion)' == 'true'">
+    <AsbFileType Condition="'$(ConfigurationType)' == 'DynamicLibrary'">VFT_DLL</AsbFileType>
+    <AsbFileType Condition="'$(AsbFileType)' == ''">VFT_APP</AsbFileType>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(AsbEmbedVersion)' == 'true'">
+    <ResourceCompile Include="$(MSBuildThisFileDirectory)build\version.rc" />
+  </ItemGroup>
+
+  <!-- Values are passed UNQUOTED and stringized inside version.rc (avoids quote-escaping
+       through MSBuild -> rc.exe). Filenames/versions contain no spaces, so this is safe. -->
+  <ItemDefinitionGroup Condition="'$(AsbEmbedVersion)' == 'true'">
+    <ResourceCompile>
+      <PreprocessorDefinitions>ASB_VERSION_COMMA=$(AsbVersionComma);ASB_VERSION_STR=$(AsbVersion);ASB_ORIG_FILENAME=$(TargetFileName);ASB_INTERNAL_NAME=$(TargetName);ASB_FILE_TYPE=$(AsbFileType);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ResourceCompile>
+  </ItemDefinitionGroup>
+</Project>
