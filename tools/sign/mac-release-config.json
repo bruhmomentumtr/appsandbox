@@ -7,9 +7,11 @@
 
   "appPath": "bin/Release/AppSandbox.app",
 
-  "_packaging": "The final public deliverable is written to packageDir/zipName and nothing else goes in that folder. packageDir is wiped and recreated each run so it only ever contains files we intend to ship.",
+  "_packaging": "The final public deliverable is written to packageDir as <productName>-<version>-<os>-<platform>.zip (e.g. AppSandbox-0.1.0-mac-arm64.zip), matching the Windows make-release.ps1 naming. version is derived from Directory.Build.props (via version.xcconfig); nothing else goes in packageDir, which is wiped and recreated each run.",
   "packageDir": "bin/Release/release_package",
-  "zipName": "AppSandbox.zip",
+  "productName": "AppSandbox",
+  "os": "mac",
+  "platform": "arm64",
 
   "expectedIdentity": "Developer ID Application"
 }

@@ -23,6 +23,7 @@
 param(
   [string]$Configuration = 'Release',
   [string]$Platform      = 'x64',
+  [string]$OS            = 'win',   # OS token in the zip name; not passed to MSBuild
   [string]$Version       = '',     # empty => read from Directory.Build.props (single source)
   [switch]$NoBuild,
   [switch]$BuildOnly,
@@ -359,7 +360,7 @@ $files | ForEach-Object { Write-Host ("  " + $_.FullName.Substring($stage.Length
 $mb = [math]::Round((($files | Measure-Object Length -Sum).Sum) / 1MB, 1)
 Write-Host ("--- {0} files, {1} MB ---`n" -f $files.Count, $mb)
 
-$zip = Join-Path $bin ("AppSandbox-{0}-{1}.zip" -f $Version, $Platform)
+$zip = Join-Path $bin ("AppSandbox-{0}-{1}-{2}.zip" -f $Version, $OS, $Platform)
 if (Test-Path $zip) { Remove-Item $zip -Force }
 # Flat layout: the items sit at the zip root (file.zip\AppSandbox.exe, file.zip\drivers\...),
 # with the drivers\ / resources\ / web\ subfolders preserved - no extra parent folder.

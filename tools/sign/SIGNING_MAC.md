@@ -236,10 +236,13 @@ This script runs the full pipeline:
 6. **Staple** the ticket to the `.app` (`stapler staple`) so it verifies offline.
 7. **Gatekeeper check** (`spctl`) — expects `accepted / Notarized Developer ID`.
 8. **Package** — wipe and recreate `packageDir` (default
-   `bin/Release/release_package/`) and write only the stapled
-   `AppSandbox.zip` into it. That folder is the public deliverable and contains
-   **nothing else** — no dSYMs, no loose binaries, no build scratch. The working
-   submission zip is deleted.
+   `bin/Release/release_package/`) and write only the stapled zip into it, named
+   `<productName>-<version>-<os>-<platform>.zip` (e.g.
+   `AppSandbox-0.1.0-mac-arm64.zip`), matching the Windows
+   `make-release.ps1` convention (`AppSandbox-0.1.0-win-x64.zip`). The version
+   comes from `Directory.Build.props`. That folder is the public deliverable and
+   contains **nothing else** — no dSYMs, no loose binaries, no build scratch. The
+   working submission zip is deleted.
 
 For a quick local Developer ID build without contacting Apple:
 
