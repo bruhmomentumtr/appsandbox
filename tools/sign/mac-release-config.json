@@ -1,0 +1,15 @@
+{
+  "_comment": "macOS release build config. Committable (no secrets). Private notarization details live in mac-signing.local.json (git-ignored, matches tools/sign/*.local.*). Build-time signing identity/team come from src/app_mac/xcconfig/LocalUser.xcconfig.",
+
+  "project": "AppSandbox.xcodeproj",
+  "scheme": "AppSandbox",
+  "configuration": "Release",
+
+  "appPath": "bin/Release/AppSandbox.app",
+
+  "_packaging": "The final public deliverable is written to packageDir/zipName and nothing else goes in that folder. packageDir is wiped and recreated each run so it only ever contains files we intend to ship.",
+  "packageDir": "bin/Release/release_package",
+  "zipName": "AppSandbox.zip",
+
+  "expectedIdentity": "Developer ID Application"
+}

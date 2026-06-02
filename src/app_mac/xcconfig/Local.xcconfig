@@ -1,0 +1,8 @@
+// App version, derived from Directory.Build.props by tools/sign/sync-mac-version.sh
+// (the same single source of truth Windows uses via build/version.rc).
+#include "version.xcconfig"
+
+// Optional per-developer signing overrides. Create LocalUser.xcconfig
+// next to this file with settings like DEVELOPMENT_TEAM = ABCDEFG123 to
+// override; that file is gitignored.
+#include? "LocalUser.xcconfig"
