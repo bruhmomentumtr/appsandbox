@@ -63,7 +63,9 @@ SCHEME="$(jget "$CONFIG" scheme)"
 CONFIGURATION="$(jget "$CONFIG" configuration)"
 APP_PATH="$(jget "$CONFIG" appPath)"
 PACKAGE_DIR="$(jget "$CONFIG" packageDir)"
-ZIP_NAME="$(jget "$CONFIG" zipName)"
+PRODUCT_NAME="$(jget "$CONFIG" productName)"
+OS_TAG="$(jget "$CONFIG" os)"
+PLATFORM="$(jget "$CONFIG" platform)"
 EXPECTED_IDENTITY="$(jget "$CONFIG" expectedIdentity)"
 
 PROFILE="$(jget "$LOCAL" notaryKeychainProfile)"
@@ -71,12 +73,14 @@ APPLE_ID="$(jget "$LOCAL" appleId)"
 TEAM_ID="$(jget "$LOCAL" teamId)"
 APP_PW="$(jget "$LOCAL" appSpecificPassword)"
 
-[[ -n "$PROJECT" && -n "$SCHEME" && -n "$CONFIGURATION" && -n "$APP_PATH" && -n "$PACKAGE_DIR" && -n "$ZIP_NAME" ]] \
+[[ -n "$PROJECT" && -n "$SCHEME" && -n "$CONFIGURATION" && -n "$APP_PATH" \
+   && -n "$PACKAGE_DIR" && -n "$PRODUCT_NAME" && -n "$OS_TAG" && -n "$PLATFORM" ]] \
     || die "mac-release-config.json missing required keys"
 
-PKG_ZIP="$PACKAGE_DIR/$ZIP_NAME"
 # Working zip used only for notarization submission; never shipped.
 SUBMIT_ZIP="$(dirname "$APP_PATH")/.notarize-submit.zip"
+# PKG_ZIP is set after the version sync (it embeds the version in the name).
+PKG_ZIP=""
 
 # Publish ONLY the final zip into a clean package dir — nothing else (no dSYMs,
 # no loose products, no build scratch) ever lands there. This is a production
@@ -91,6 +95,13 @@ publish_package() {
 # --- 1. build ---
 step "Syncing version from Directory.Build.props"
 "$SCRIPT_DIR/sync-mac-version.sh"
+
+# Compose the public zip name to match the Windows convention:
+#   <productName>-<version>-<os>-<platform>.zip   e.g. AppSandbox-0.1.0-mac-arm64.zip
+# Version is MARKETING_VERSION from the just-generated version.xcconfig.
+VERSION="$(grep -E '^MARKETING_VERSION' "$ROOT/src/app_mac/xcconfig/version.xcconfig" | sed 's/.*=[[:space:]]*//' | tr -d '[:space:]')"
+[[ -n "$VERSION" ]] || die "could not read MARKETING_VERSION from version.xcconfig"
+PKG_ZIP="$PACKAGE_DIR/${PRODUCT_NAME}-${VERSION}-${OS_TAG}-${PLATFORM}.zip"
 
 step "Building $SCHEME ($CONFIGURATION)"
 xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration "$CONFIGURATION" clean >/dev/null

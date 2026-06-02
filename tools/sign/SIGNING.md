@@ -112,7 +112,7 @@ tools\sign\make-release.ps1
 - **If the EV YubiKey is in:** EV-signs all binaries — app `.exe`/`.dll` **and** driver
   `.sys`/`.dll` — in one call (**PIN 1**); then `sign-drivers.ps1` regenerates + EV-signs the
   catalogs (**PIN 2**) and EV-signs the cabs (**PIN 3**), submits both drivers to Microsoft,
-  waits, and downloads the MS-signed drivers; then writes `bin\Release\AppSandbox-<ver>-x64.zip`
+  waits, and downloads the MS-signed drivers; then writes `bin\Release\AppSandbox-<ver>-win-x64.zip`
   (no `.pdb`/intermediates, MS-signed drivers swapped in, test `.cer` dropped). **Three PINs
   total.** (If `bin\Release\drivers-signed\` already exists it's reused — no resubmit.)
 - **If the YubiKey is out:** stops after the build — no signing, no ZIP.
