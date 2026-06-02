@@ -430,3 +430,7 @@ tools/sign/*.local.*
 # guard the repo root in case a cab is ever built from here)
 /setup.inf
 /setup.rpt
+
+# Per-developer macOS signing overrides (DEVELOPMENT_TEAM, Developer ID identity, etc).
+# Pulled in by Local.xcconfig via #include? when present.
+src/app_mac/xcconfig/LocalUser.xcconfig
