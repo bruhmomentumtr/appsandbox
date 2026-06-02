@@ -404,6 +404,7 @@
 				A004000000000000000000BB /* Embed Frameworks */,
 				A022000000000000000000CC /* Embed iso-patch-mac */,
 				A032000000000000000000DD /* Embed agent_mac */,
+				A008000000000000000000AA /* Stamp version */,
 			);
 			buildRules = (
 			);
@@ -472,6 +473,7 @@
 				A010000000000000000000BB /* Headers */,
 				A011000000000000000000BB /* Sources */,
 				A012000000000000000000BB /* Frameworks */,
+				A013000000000000000000BB /* Stamp version */,
 			);
 			buildRules = (
 			);
@@ -549,6 +551,36 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "# Xcode's clean only deletes directories it created itself (marked\n# with com.apple.xcode.CreatedByBuildSystem). Since SYMROOT=$SRCROOT/bin\n# is a source-tree path that may pre-exist, we tag it here so Product >\n# Clean Build Folder can remove it cleanly.\nif [ -d \"$SYMROOT\" ]; then\n  xattr -w com.apple.xcode.CreatedByBuildSystem true \"$SYMROOT\" 2>/dev/null || true\nfi\n";
+		};
+		A008000000000000000000AA /* Stamp version */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+			);
+			name = "Stamp version from Directory.Build.props";
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${SRCROOT}/tools/sign/stamp-version.sh\"\n";
+		};
+		A013000000000000000000BB /* Stamp version */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+			);
+			name = "Stamp version from Directory.Build.props";
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${SRCROOT}/tools/sign/stamp-version.sh\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

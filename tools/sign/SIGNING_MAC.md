@@ -223,23 +223,22 @@ tools/sign/make-release-mac.sh
 
 This script runs the full pipeline:
 
-1. **Sync version** — runs `sync-mac-version.sh` (see §6) so the build's version
-   matches `Directory.Build.props`.
-2. **Build** Release (`xcodebuild`, signing from `LocalUser.xcconfig`).
-3. **Verify** the signature (`codesign --verify --deep --strict`) and check the
+1. **Build** Release (`xcodebuild`, signing from `LocalUser.xcconfig`). The build
+   itself stamps the version from `Directory.Build.props` into the bundle (see §6).
+2. **Verify** the signature (`codesign --verify --deep --strict`) and check the
    identity matches `expectedIdentity`.
-4. **Zip** a working copy (`.notarize-submit.zip`) for submission — not shipped.
-5. **Notarize** via `notarytool submit --wait`. This is **recursive**: Apple
+3. **Zip** a working copy (`.notarize-submit.zip`) for submission — not shipped.
+4. **Notarize** via `notarytool submit --wait`. This is **recursive**: Apple
    validates every nested Mach-O in the bundle in one submission — the framework
    plus the `iso-patch-mac`, `appsandbox-agent`, and `appsandbox-clipboard`
    helpers. They are not (and cannot be) notarized separately (see §5).
-6. **Staple** the ticket to the `.app` (`stapler staple`) so it verifies offline.
-7. **Gatekeeper check** (`spctl`) — expects `accepted / Notarized Developer ID`.
-8. **Package** — wipe and recreate `packageDir` (default
+5. **Staple** the ticket to the `.app` (`stapler staple`) so it verifies offline.
+6. **Gatekeeper check** (`spctl`) — expects `accepted / Notarized Developer ID`.
+7. **Package** — wipe and recreate `packageDir` (default
    `bin/Release/release_package/`) and write only the stapled zip into it, named
    `<productName>-<version>-<os>-<platform>.zip` (e.g.
-   `AppSandbox-0.1.0-mac-arm64.zip`), matching the Windows
-   `make-release.ps1` convention (`AppSandbox-0.1.0-win-x64.zip`). The version
+   `AppSandbox-0.1.1-mac-arm64.zip`), matching the Windows
+   `make-release.ps1` convention (`AppSandbox-0.1.1-win-x64.zip`). The version
    comes from `Directory.Build.props`. That folder is the public deliverable and
    contains **nothing else** — no dSYMs, no loose binaries, no build scratch. The
    working submission zip is deleted.
@@ -329,28 +328,30 @@ container** (`.app`, `.dmg`, `.pkg`), never to an individual nested executable:
 
 ### Version (single source of truth)
 
-The app version comes from the **same source the Windows build uses**:
-`Directory.Build.props` (the four `AsbVersion*` numbers). The macOS build derives
-it like this:
+`Directory.Build.props` (the four `AsbVersion*` numbers) is the **only** place a
+version is ever set — the same source the Windows build uses. The macOS build
+stamps it in automatically at build time:
 
 ```
-Directory.Build.props
-   └─ tools/sign/sync-mac-version.sh   (parses the 4 numbers)
-        └─ src/app_mac/xcconfig/version.xcconfig   (generated, committed)
-             MARKETING_VERSION       = <major.minor.patch>
-             CURRENT_PROJECT_VERSION = <major.minor.patch.revision>
-                └─ #include'd by Local.xcconfig → both Info.plists use
-                   $(MARKETING_VERSION) / $(CURRENT_PROJECT_VERSION)
+Directory.Build.props   (AsbVersionMajor/Minor/Patch/Revision)
+   └─ "Stamp version" build phase (tools/sign/stamp-version.sh, every target,
+      every build — GUI, xcodebuild, and Archive) reads the numbers via
+      tools/sign/asb-version.sh and writes them into the BUILT bundle's Info.plist:
+         CFBundleShortVersionString = <major.minor.patch>
+         CFBundleVersion            = <major.minor.patch.revision>
 ```
 
-This mirrors how `build/version.rc` derives the Windows binary version from the
-same file. `project.pbxproj` deliberately sets no `MARKETING_VERSION` /
-`CURRENT_PROJECT_VERSION` so the xcconfig supplies them.
+A build phase (not an xcconfig) is used deliberately: an xcconfig is read
+*before* build phases run, so a generated-xcconfig approach couldn't update the
+current build. Stamping the built `Info.plist` in a phase runs on every build
+and needs nothing committed but `Directory.Build.props`. `project.pbxproj` sets
+no `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION`; the source `Info.plist`s leave
+those keys as `$(…)` placeholders that the stamp overwrites.
 
-**To bump the version:** edit the four numbers in `Directory.Build.props`, then
-run `tools/sign/sync-mac-version.sh` (or just run `make-release-mac.sh`, which
-syncs first). `version.xcconfig` is a generated file committed so fresh clones
-and Xcode GUI builds get the right version without running the script.
+**To bump the version:** edit the four numbers in `Directory.Build.props` — and
+nothing else. The next build (Xcode GUI or `make-release-mac.sh`) stamps it in.
+`tools/sign/asb-version.sh [short|full]` prints the current version (the release
+script uses it to name the zip).
 
 ### Project-wide build settings
 
@@ -412,8 +413,8 @@ tools/sign/make-release-mac.sh
 # Maintainer — local Developer ID build only (no notarization)
 tools/sign/make-release-mac.sh --no-notarize
 
-# Bump version (both platforms): edit Directory.Build.props, then
-tools/sign/sync-mac-version.sh
+# Bump version (both platforms): edit Directory.Build.props — that's it.
+# The next build stamps it in. (tools/sign/asb-version.sh prints the version.)
 ```
 
 ---
@@ -428,9 +429,9 @@ tools/sign/sync-mac-version.sh
 | `Directory.Build.props` | committed | version source of truth | yes |
 | `src/app_mac/AppSandbox.entitlements` | committed | app + framework signature | yes |
 | `tools/iso-patch-mac/iso-patch-mac.entitlements` | committed | helper signature | yes |
-| `src/app_mac/xcconfig/Local.xcconfig` | committed | xcconfig include hook | yes |
-| `src/app_mac/xcconfig/version.xcconfig` | committed (generated) | app version | yes |
-| `tools/sign/sync-mac-version.sh` | committed | regenerate version.xcconfig | yes |
+| `src/app_mac/xcconfig/Local.xcconfig` | committed | optional-include hook for signing overrides | yes |
+| `tools/sign/asb-version.sh` | committed | reads version from Directory.Build.props | yes |
+| `tools/sign/stamp-version.sh` | committed | build phase that stamps the bundle version | yes |
 | `tools/sign/make-release-mac.sh` | committed | release pipeline | yes |
 | `tools/sign/mac-release-config.json` | committed | release script settings (no secrets) | yes |
 | `src/app_mac/xcconfig/LocalUser.xcconfig` | **maintainer creates** (gitignored) | production identity/team | **no — create for Release** |

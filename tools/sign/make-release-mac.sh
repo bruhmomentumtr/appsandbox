@@ -93,14 +93,12 @@ publish_package() {
 }
 
 # --- 1. build ---
-step "Syncing version from Directory.Build.props"
-"$SCRIPT_DIR/sync-mac-version.sh"
-
-# Compose the public zip name to match the Windows convention:
-#   <productName>-<version>-<os>-<platform>.zip   e.g. AppSandbox-0.1.0-mac-arm64.zip
-# Version is MARKETING_VERSION from the just-generated version.xcconfig.
-VERSION="$(grep -E '^MARKETING_VERSION' "$ROOT/src/app_mac/xcconfig/version.xcconfig" | sed 's/.*=[[:space:]]*//' | tr -d '[:space:]')"
-[[ -n "$VERSION" ]] || die "could not read MARKETING_VERSION from version.xcconfig"
+# The build itself stamps the version into the bundle (the "Stamp version" build
+# phase reads Directory.Build.props). Here we only need the version string to
+# compose the public zip name, matching the Windows convention:
+#   <productName>-<version>-<os>-<platform>.zip   e.g. AppSandbox-0.1.1-mac-arm64.zip
+VERSION="$("$SCRIPT_DIR/asb-version.sh" short)"
+[[ -n "$VERSION" ]] || die "could not read version from Directory.Build.props"
 PKG_ZIP="$PACKAGE_DIR/${PRODUCT_NAME}-${VERSION}-${OS_TAG}-${PLATFORM}.zip"
 
 step "Building $SCHEME ($CONFIGURATION)"
