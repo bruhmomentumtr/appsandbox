@@ -43,6 +43,8 @@ typedef HRESULT (WINAPI *PFN_HcsCreateEmptyGuestStateFile)(PCWSTR path);
 typedef HRESULT (WINAPI *PFN_HcsCreateEmptyRuntimeStateFile)(PCWSTR path);
 typedef HRESULT (WINAPI *PFN_HcsEnumerateComputeSystems)(
     PCWSTR query, HCS_OPERATION op);
+typedef HRESULT (WINAPI *PFN_HcsGetServiceProperties)(
+    PCWSTR propertyQuery, PWSTR *result);
 
 /* HCS V1 callback API.
    HcsRegisterComputeSystemCallback / HcsUnregisterComputeSystemCallback */
@@ -115,6 +117,7 @@ static PFN_HcsGrantVmAccess           pfnGrantAccess;
 static PFN_HcsCreateEmptyGuestStateFile   pfnCreateVmgs;
 static PFN_HcsCreateEmptyRuntimeStateFile pfnCreateVmrs;
 static PFN_HcsEnumerateComputeSystems     pfnEnumSystems;
+static PFN_HcsGetServiceProperties        pfnGetServiceProps;
 static PFN_HcsRegisterComputeSystemCallback pfnRegisterCallback;
 static PFN_HcsUnregisterComputeSystemCallback pfnUnregisterCallback;
 static PFN_HcsSetComputeSystemCallback    pfnSetCallback;  /* V2 fallback */
@@ -671,6 +674,7 @@ BOOL hcs_init(void)
     pfnCreateVmgs  = (PFN_HcsCreateEmptyGuestStateFile)GetProcAddress(g_hcs_dll, "HcsCreateEmptyGuestStateFile");
     pfnCreateVmrs  = (PFN_HcsCreateEmptyRuntimeStateFile)GetProcAddress(g_hcs_dll, "HcsCreateEmptyRuntimeStateFile");
     pfnEnumSystems = (PFN_HcsEnumerateComputeSystems)GetProcAddress(g_hcs_dll, "HcsEnumerateComputeSystems");
+    pfnGetServiceProps = (PFN_HcsGetServiceProperties)GetProcAddress(g_hcs_dll, "HcsGetServiceProperties");
     pfnRegisterCallback = (PFN_HcsRegisterComputeSystemCallback)GetProcAddress(g_hcs_dll, "HcsRegisterComputeSystemCallback");
     pfnUnregisterCallback = (PFN_HcsUnregisterComputeSystemCallback)GetProcAddress(g_hcs_dll, "HcsUnregisterComputeSystemCallback");
     pfnSetCallback = (PFN_HcsSetComputeSystemCallback)GetProcAddress(g_hcs_dll, "HcsSetComputeSystemCallback");
@@ -831,6 +835,46 @@ static BOOL wait_for_file_available(const wchar_t *path, int timeout_ms)
     return FALSE;
 }
 
+/* Nested virtualization (ExposeVirtualizationExtensions) host-capability gate.
+   Mirrors WSL2 (WslCoreVm.cpp / hcs.cpp): query the host's ProcessorCapabilities
+   via HcsGetServiceProperties and look for the "NestedVirt" feature string. Only
+   when the host advertises it is ExposeVirtualizationExtensions safe to set — on
+   ARM64, older CPUs, or hosts without nesting support the feature is absent and
+   HcsCreateComputeSystem would otherwise reject the document. Probed once and
+   cached: -1 = not probed, 0 = unsupported, 1 = supported. */
+static int g_nested_virt = -1;
+
+static BOOL hcs_nested_virt_supported(void)
+{
+    HRESULT hr;
+    PWSTR result_doc = NULL;
+
+    if (g_nested_virt >= 0)
+        return g_nested_virt == 1;
+
+    g_nested_virt = 0; /* assume unsupported until the host says otherwise */
+
+    if (!pfnGetServiceProps) {
+        ui_log(L"Nested virt: HcsGetServiceProperties unavailable; disabling.");
+        return FALSE;
+    }
+
+    hr = pfnGetServiceProps(
+        L"{\"PropertyQueries\":{\"ProcessorCapabilities\":{}}}", &result_doc);
+    if (SUCCEEDED(hr) && result_doc) {
+        if (wcsstr(result_doc, L"\"NestedVirt\"") != NULL)
+            g_nested_virt = 1;
+        ui_log(L"Nested virt: host %s (ProcessorCapabilities probed).",
+               g_nested_virt ? L"supported" : L"NOT supported");
+    } else {
+        ui_log(L"Nested virt: ProcessorCapabilities query failed (0x%08X); disabling.",
+               hr);
+    }
+    if (result_doc) LocalFree(result_doc);
+
+    return g_nested_virt == 1;
+}
+
 BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                        wchar_t *json_out, size_t json_out_chars)
 {
@@ -843,6 +887,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     wchar_t res_section[512];
     wchar_t net_section[512];
     wchar_t secureboot_section[512];
+    wchar_t nested_section[128];
     wchar_t security_section[512];
     wchar_t guest_state_section[1024];
     wchar_t video_section[2048];
@@ -1072,6 +1117,14 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         }
     }
 
+    /* Nested virtualization — default ON, gated on host capability exactly like
+       WSL2. Probed once via HcsGetServiceProperties (ProcessorCapabilities ->
+       "NestedVirt"); emitted only when the host supports it so VM creation never
+       fails on hardware that can't nest. */
+    nested_section[0] = L'\0';
+    if (hcs_nested_virt_supported())
+        wcscpy_s(nested_section, 128, L",\"ExposeVirtualizationExtensions\":true");
+
     written = swprintf_s(json_out, json_out_chars,
         L"{"
         L"\"SchemaVersion\":{\"Major\":2,\"Minor\":1},"
@@ -1087,10 +1140,13 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             L"\"ComputeTopology\":{"
                 L"\"Memory\":{"
                     L"\"SizeInMB\":%lu,"
-                    L"\"AllowOvercommit\":true"
+                    L"\"AllowOvercommit\":true,"
+                    L"\"EnableDeferredCommit\":true,"
+                    L"\"EnableColdDiscardHint\":true"
                 L"},"
                 L"\"Processor\":{"
                     L"\"Count\":%lu"
+                    L"%s"
                 L"}"
             L"},"
             L"\"Devices\":{"
@@ -1121,6 +1177,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         secureboot_section,
         config->ram_mb,
         config->cpu_cores,
+        nested_section,
         vhdx_esc,
         iso_section,
         res_section,
