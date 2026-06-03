@@ -792,6 +792,11 @@ CVadWaveMiniport::PropertyHandlerProposedFormat
 
     kspPin = CONTAINING_RECORD(PropertyRequest->Instance, KSP_PIN, PinId);
 
+    if (kspPin->PinId >= m_pMiniportPair->WaveDescriptor->PinCount)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     if (IsSystemRenderPin(kspPin->PinId))
     {
         ntStatus = STATUS_SUCCESS;
