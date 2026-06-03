@@ -298,8 +298,10 @@ static void cursor_init(int fd, struct cursor_state *cur)
             cur->prop_hotspot_x = hx;
             cur->prop_hotspot_y = hy;
             drmModeFreePlane(p);
+            /* Log the cached cur->plane_id, not p->plane_id: p was just freed
+               above, so reading p->plane_id here was a use-after-free (L12). */
             agent_log("cursor plane %u (CRTC_X=%u CRTC_Y=%u HOTSPOT_X=%u HOTSPOT_Y=%u)",
-                      p->plane_id, cx, cy, hx, hy);
+                      cur->plane_id, cx, cy, hx, hy);
             break;
         }
         drmModeFreePlane(p);

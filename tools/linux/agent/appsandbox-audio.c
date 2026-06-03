@@ -250,7 +250,10 @@ static void serve(int client_fd)
     int eio_warned = 0;
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
-    const long packet_ns = 10L * 1000 * 1000;       /* 10 ms */
+    /* Pace at the packet's true duration. The hardcoded 10 ms was shorter than
+       the ~21.3 ms a FRAMES_PER_PACKET packet represents, so idle silence was
+       sent at ~2x realtime and overflowed the host render ring (L13). */
+    const long packet_ns = (long)FRAMES_PER_PACKET * 1000000000L / SAMPLE_RATE; /* ~21.33 ms */
 
     while (!g_stop) {
         snd_pcm_sframes_t n = snd_pcm_readn(pcm, channel_bufs, FRAMES_PER_PACKET);
