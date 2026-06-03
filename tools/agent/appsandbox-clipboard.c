@@ -587,6 +587,11 @@ static DWORD WINAPI recv_thread_proc(LPVOID param)
                 UINT32 name_len = *(UINT32 *)(buf + off); off += 4;
                 UINT local_id = fmt_id;
 
+                /* off is in [8, data_size] here; reject a name_len that runs
+                   past the buffer (or whose signed cast would corrupt off)
+                   before the unconditional `off += name_len` advance below. */
+                if (name_len > (UINT32)((int)hdr.data_size - off)) break;
+
                 if (name_len > 0 && name_len < 256 && off + (int)name_len <= (int)hdr.data_size) {
                     char name[256];
                     memcpy(name, buf + off, name_len);

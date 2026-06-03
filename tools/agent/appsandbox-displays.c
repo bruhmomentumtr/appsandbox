@@ -44,8 +44,17 @@ int main(void)
                 buf[off++] = ',';
                 buf[off] = '\0';
             }
-            off += snprintf(buf + off, sizeof(buf) - off, "%lux%lu",
-                            dm.dmPelsWidth, dm.dmPelsHeight);
+            if (off < (int)sizeof(buf) - 1) {
+                int n = snprintf(buf + off, sizeof(buf) - (size_t)off, "%lux%lu",
+                                 dm.dmPelsWidth, dm.dmPelsHeight);
+                if (n < 0) break;
+                off += n;
+                if (off >= (int)sizeof(buf)) {
+                    off = (int)sizeof(buf) - 1;
+                    buf[off] = '\0';
+                    break;
+                }
+            }
         }
         count++;
 

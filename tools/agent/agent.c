@@ -485,7 +485,13 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
         int files = 0;
         int rc;
 
-        MultiByteToWideChar(CP_UTF8, 0, si->dest_path, -1, dest_wide, MAX_PATH);
+        dest_wide[0] = 0;
+        if (MultiByteToWideChar(CP_UTF8, 0, si->dest_path, -1, dest_wide, MAX_PATH) == 0) {
+            agent_log("GPU copy share '%s': dest path conversion failed (%lu), skipping.",
+                      si->share_name, GetLastError());
+            failed_shares++;
+            continue;
+        }
 
         /* The GL mapping-layer share is provisioned after the copy loop. */
         if (strcmp(si->share_name, "AppSandbox.GlLayers") == 0)
@@ -825,6 +831,12 @@ static void stop_input_monitor(void)
 
 /* ---- Clipboard helper process (same pattern as input helper) ---- */
 
+/* Protects the clipboard helper/reader process globals below.  Both the SCM
+   control handler thread (SESSIONCHANGE LOGON/UNLOCK) and the clipboard
+   monitor threads mutate these globals (kill/spawn plus the test-then-close),
+   so without serialization the same HANDLE can be closed twice. */
+static CRITICAL_SECTION g_clip_proc_cs;
+
 static HANDLE g_clipboard_process = NULL;
 static DWORD  g_clipboard_session = 0xFFFFFFFF;
 static volatile BOOL g_clipboard_monitor_running = FALSE;
@@ -832,12 +844,18 @@ static HANDLE g_clipboard_monitor_thread = NULL;
 
 static void kill_clipboard_helper(void)
 {
-    if (g_clipboard_process) {
-        TerminateProcess(g_clipboard_process, 0);
-        WaitForSingleObject(g_clipboard_process, 3000);
-        CloseHandle(g_clipboard_process);
-        g_clipboard_process = NULL;
-        g_clipboard_session = 0xFFFFFFFF;
+    HANDLE proc;
+
+    EnterCriticalSection(&g_clip_proc_cs);
+    proc = g_clipboard_process;
+    g_clipboard_process = NULL;
+    g_clipboard_session = 0xFFFFFFFF;
+    LeaveCriticalSection(&g_clip_proc_cs);
+
+    if (proc) {
+        TerminateProcess(proc, 0);
+        WaitForSingleObject(proc, 3000);
+        CloseHandle(proc);
     }
 }
 
@@ -888,8 +906,10 @@ static BOOL spawn_clipboard_in_session(DWORD session_id)
 
     agent_log("Clipboard helper: spawned PID %lu in session %lu (as user).",
                pi.dwProcessId, session_id);
+    EnterCriticalSection(&g_clip_proc_cs);
     g_clipboard_process = pi.hProcess;
     g_clipboard_session = session_id;
+    LeaveCriticalSection(&g_clip_proc_cs);
     CloseHandle(pi.hThread);
     if (env) DestroyEnvironmentBlock(env);
     CloseHandle(user_token);
@@ -905,21 +925,32 @@ static DWORD WINAPI clipboard_monitor_thread(LPVOID param)
         DWORD cur_session = WTSGetActiveConsoleSessionId();
 
         if (cur_session != 0xFFFFFFFF) {
-            BOOL helper_alive = g_clipboard_process &&
-                WaitForSingleObject(g_clipboard_process, 0) != WAIT_OBJECT_0;
+            HANDLE proc_snap;
+            DWORD  sess_snap;
+            BOOL helper_alive;
 
-            if (cur_session != g_clipboard_session) {
+            EnterCriticalSection(&g_clip_proc_cs);
+            proc_snap = g_clipboard_process;
+            sess_snap = g_clipboard_session;
+            LeaveCriticalSection(&g_clip_proc_cs);
+
+            helper_alive = proc_snap &&
+                WaitForSingleObject(proc_snap, 0) != WAIT_OBJECT_0;
+
+            if (cur_session != sess_snap) {
                 if (helper_alive) {
                     agent_log("Clipboard monitor: console session changed %lu -> %lu, respawning.",
-                               g_clipboard_session, cur_session);
+                               sess_snap, cur_session);
                     kill_clipboard_helper();
                 }
                 spawn_clipboard_in_session(cur_session);
             } else if (!helper_alive) {
-                if (g_clipboard_process) {
-                    CloseHandle(g_clipboard_process);
-                    g_clipboard_process = NULL;
-                }
+                HANDLE dead;
+                EnterCriticalSection(&g_clip_proc_cs);
+                dead = g_clipboard_process;
+                g_clipboard_process = NULL;
+                LeaveCriticalSection(&g_clip_proc_cs);
+                if (dead) CloseHandle(dead);
                 agent_log("Clipboard monitor: helper died, respawning in session %lu.", cur_session);
                 spawn_clipboard_in_session(cur_session);
             }
@@ -962,12 +993,18 @@ static HANDLE g_clipboard_reader_monitor_thread = NULL;
 
 static void kill_clipboard_reader(void)
 {
-    if (g_clipboard_reader_process) {
-        TerminateProcess(g_clipboard_reader_process, 0);
-        WaitForSingleObject(g_clipboard_reader_process, 3000);
-        CloseHandle(g_clipboard_reader_process);
-        g_clipboard_reader_process = NULL;
-        g_clipboard_reader_session = 0xFFFFFFFF;
+    HANDLE proc;
+
+    EnterCriticalSection(&g_clip_proc_cs);
+    proc = g_clipboard_reader_process;
+    g_clipboard_reader_process = NULL;
+    g_clipboard_reader_session = 0xFFFFFFFF;
+    LeaveCriticalSection(&g_clip_proc_cs);
+
+    if (proc) {
+        TerminateProcess(proc, 0);
+        WaitForSingleObject(proc, 3000);
+        CloseHandle(proc);
     }
 }
 
@@ -1021,8 +1058,10 @@ static BOOL spawn_clipboard_reader_in_session(DWORD session_id)
 
     agent_log("Clipboard reader: spawned PID %lu in session %lu (as user).",
                pi.dwProcessId, session_id);
+    EnterCriticalSection(&g_clip_proc_cs);
     g_clipboard_reader_process = pi.hProcess;
     g_clipboard_reader_session = session_id;
+    LeaveCriticalSection(&g_clip_proc_cs);
     CloseHandle(pi.hThread);
     if (env) DestroyEnvironmentBlock(env);
     CloseHandle(user_token);
@@ -1038,21 +1077,32 @@ static DWORD WINAPI clipboard_reader_monitor_thread(LPVOID param)
         DWORD cur_session = WTSGetActiveConsoleSessionId();
 
         if (cur_session != 0xFFFFFFFF) {
-            BOOL helper_alive = g_clipboard_reader_process &&
-                WaitForSingleObject(g_clipboard_reader_process, 0) != WAIT_OBJECT_0;
+            HANDLE proc_snap;
+            DWORD  sess_snap;
+            BOOL helper_alive;
 
-            if (cur_session != g_clipboard_reader_session) {
+            EnterCriticalSection(&g_clip_proc_cs);
+            proc_snap = g_clipboard_reader_process;
+            sess_snap = g_clipboard_reader_session;
+            LeaveCriticalSection(&g_clip_proc_cs);
+
+            helper_alive = proc_snap &&
+                WaitForSingleObject(proc_snap, 0) != WAIT_OBJECT_0;
+
+            if (cur_session != sess_snap) {
                 if (helper_alive) {
                     agent_log("Clipboard reader monitor: console session changed %lu -> %lu, respawning.",
-                               g_clipboard_reader_session, cur_session);
+                               sess_snap, cur_session);
                     kill_clipboard_reader();
                 }
                 spawn_clipboard_reader_in_session(cur_session);
             } else if (!helper_alive) {
-                if (g_clipboard_reader_process) {
-                    CloseHandle(g_clipboard_reader_process);
-                    g_clipboard_reader_process = NULL;
-                }
+                HANDLE dead;
+                EnterCriticalSection(&g_clip_proc_cs);
+                dead = g_clipboard_reader_process;
+                g_clipboard_reader_process = NULL;
+                LeaveCriticalSection(&g_clip_proc_cs);
+                if (dead) CloseHandle(dead);
                 agent_log("Clipboard reader monitor: helper died, respawning in session %lu.", cur_session);
                 spawn_clipboard_reader_in_session(cur_session);
             }
@@ -2360,6 +2410,10 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     g_status_handle = RegisterServiceCtrlHandlerExA(SERVICE_NAME, service_ctrl_ex, NULL);
     if (!g_status_handle) return;
 
+    /* Init before accepting SESSIONCHANGE so the control handler and the
+       clipboard monitor threads share this lock for the helper-process globals. */
+    InitializeCriticalSection(&g_clip_proc_cs);
+
     g_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     g_status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE;
     set_service_status(SERVICE_START_PENDING, 0);
@@ -2423,6 +2477,7 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
         agent_log("Listener thread exited.");
     }
     CloseHandle(g_stop_event);
+    DeleteCriticalSection(&g_clip_proc_cs);
     DeleteCriticalSection(&g_send_cs);
 
     agent_log("Service stopped.");
@@ -2549,9 +2604,11 @@ int main(int argc, char *argv[])
             printf("Running in console mode (Ctrl+C to stop)...\n");
             p9_set_log(p9copy_log);
             InitializeCriticalSection(&g_send_cs);
+            InitializeCriticalSection(&g_clip_proc_cs);
             g_stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
             listener_thread(NULL);
             CloseHandle(g_stop_event);
+            DeleteCriticalSection(&g_clip_proc_cs);
             DeleteCriticalSection(&g_send_cs);
         }
     }
