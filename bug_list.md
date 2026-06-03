@@ -81,10 +81,28 @@ Each fix below was re-traced line-by-line against `main` and applied to the work
 (`src/backend_mac/*.m`, `src/app_mac/AppDelegate.m`, `tools/agent_mac/*.m`, `tools/iso-patch-mac/iso-patch-mac.m`).
 The per-finding **Fix** text below is the proposed change; apply and `xcodebuild` on macOS before committing.
 
-**⚠ NOT applied — require a Linux host to apply & build-verify:**
-**C10, L11, L12, L13**
-(`tools/linux/agent/appsandbox-clipboard.c`, `appsandbox-display.c`, `appsandbox-audio.c`).
-Apply and compile on Linux before committing.
+**✅ Linux fixes — applied, built, deployed to a live test VM, validated & committed to `bug-bash`:**
+**C10, L11** (`appsandbox-clipboard.c`), **L12** (`appsandbox-display.c`), **L13** (`appsandbox-audio.c`),
+plus **L18 (folder copy host→guest flattened — found during testing, below)**.
+Built in-VM with `make` and installed to `/usr/local/bin` exactly as the firstboot script does; daemons
+restarted. Folder/sub-item paste verified working; audio/display/clipboard daemons healthy after redeploy.
+
+**Known limitation (pre-existing, NOT fixed — confirmed during testing, not a regression):**
+Guest→host clipboard **images only transfer as `image/bmp`**; Linux screenshot tools put **`image/png`** on
+the clipboard, which the daemon has no decoder for (`kFormats` maps `image/bmp`↔`CF_DIB` only — the
+long-standing libpng TODO), so a VM screenshot can't be pasted into a host bitmap app. Host→guest BMP images
+do work. A fix is a feature (a self-contained zlib-based PNG→`CF_DIB` decoder, ~150–250 lines, since
+`libpng-dev` isn't installable on the VM), deliberately left out of this bug-fix pass.
+
+> **L18 — clipboard: host→guest folder paste flattens (files dumped at the target, no folder created).**
+> Pre-existing in `main` (our C10/L11 edits don't touch this path; verified via `git show main:`). In
+> `appsandbox-clipboard.c`'s `CLIP_MSG_FILE_DATA` handler the host→guest `text/uri-list` builder called
+> `hdrop_add_uri` for **every received file** (its full nested path) and for **no** directory, so the URI
+> list handed to the file manager was the nested files — not the dropped folder — and paste copied them flat.
+> The host side correctly streams the whole tree (dir entry + `MyFolder/child…`); only the guest's URI-list
+> construction was wrong. **Fix:** list **top-level items only** — a top-level directory contributes its own
+> `file://…/MyFolder` URI (file manager copies it recursively) and nested entries contribute none; loose
+> top-level files unchanged. Deployed and **confirmed working** — folders and sub-items paste with structure intact.
 
 I deliberately made **no edits** to any `.m` or `tools/linux/*` file, since they cannot be compiled on
 this Windows host and the user requires every fix to be build-tested.
