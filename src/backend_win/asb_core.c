@@ -938,6 +938,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
 typedef struct {
     VmConfig config;
     int      vm_index;
+    UINT64   vm_unique_id;   /* stable id; survives g_vms[] compaction (H13) */
     wchar_t  vhdx_dir[MAX_PATH];
     wchar_t  endpoint_guid[64];
     GUID     network_id;
@@ -1073,12 +1074,18 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
                         } else if (strncmp(line, "PROGRESS:", 9) == 0) {
                             int pct = atoi(line + 9);
                             BOOL is_staging = (strstr(line + 9, "Staging") != NULL);
-                            if (args->vm_index >= 0 && args->vm_index < g_vm_count) {
-                                g_vms[args->vm_index].vhdx_progress = pct;
-                                g_vms[args->vm_index].vhdx_staging = is_staging;
+                            /* Resolve by stable id under g_cs: g_vms[] may
+                               have been compacted while we were building (H13). */
+                            VmInstance *pvm;
+                            EnterCriticalSection(&g_cs);
+                            pvm = asb_find_vm_by_id(args->vm_unique_id);
+                            if (pvm) {
+                                pvm->vhdx_progress = pct;
+                                pvm->vhdx_staging = is_staging;
                             }
-                            if (g_progress_cb && args->vm_index >= 0 && args->vm_index < g_vm_count)
-                                g_progress_cb(vm_handle(&g_vms[args->vm_index]), pct, is_staging, g_progress_ud);
+                            LeaveCriticalSection(&g_cs);
+                            if (g_progress_cb && pvm)
+                                g_progress_cb(vm_handle(pvm), pct, is_staging, g_progress_ud);
                         } else if (strncmp(line, "ERROR:", 6) == 0) {
                             if (args->error_msg[0] == L'\0')
                                 MultiByteToWideChar(CP_ACP, 0, line + 6, -1, args->error_msg, 512);
@@ -1237,11 +1244,16 @@ done:
 
     /* ---- Completion: update globals ---- */
     {
-        int idx = args->vm_index;
-        if (idx >= 0 && idx < g_vm_count) {
-            VmInstance *inst = &g_vms[idx];
+        VmInstance *inst;
+        int idx;
 
-            EnterCriticalSection(&g_cs);
+        /* Resolve by stable id under g_cs: g_vms[] may have been compacted
+           (entries shifted down) while we were building, so the cached
+           vm_index can now point at a different VM or be out of range (H13). */
+        EnterCriticalSection(&g_cs);
+        inst = asb_find_vm_by_id(args->vm_unique_id);
+        idx = inst ? (int)(inst - g_vms) : -1;
+        if (inst) {
             inst->building_vhdx = FALSE;
 
             if (SUCCEEDED(args->result)) {
@@ -1255,6 +1267,7 @@ done:
                     inst->network_id = args->network_id;
                     inst->endpoint_id = args->endpoint_id;
                     HeapFree(GetProcessHeap(), 0, heap_inst);
+                    args->vm_inst = NULL;
                     hcs_register_vm_callback(inst);
                 }
                 LeaveCriticalSection(&g_cs);
@@ -1296,6 +1309,16 @@ done:
 
             if (g_state_cb)
                 g_state_cb(vm_handle(inst), inst->running, g_state_ud);
+        } else {
+            /* VM was deleted while building: don't leak the started HCS
+               handle copy, and don't write into a stale slot. */
+            LeaveCriticalSection(&g_cs);
+            if (args->vm_inst) {
+                hcs_unregister_vm_callback(args->vm_inst);
+                hcs_close_vm(args->vm_inst);
+                HeapFree(GetProcessHeap(), 0, args->vm_inst);
+                args->vm_inst = NULL;
+            }
         }
     }
 
@@ -1925,7 +1948,7 @@ static HRESULT run_iso_patch_ubuntu(const wchar_t *iso_path,
                                      const wchar_t *vhdx_path,
                                      ULONG hdd_gb,
                                      const wchar_t *manifest_path,
-                                     int vm_index,
+                                     UINT64 vm_unique_id,
                                      wchar_t *error_msg, size_t error_msg_cap)
 {
     wchar_t exe_dir[MAX_PATH], cmdline[2048];
@@ -1999,12 +2022,18 @@ static HRESULT run_iso_patch_ubuntu(const wchar_t *iso_path,
                                "Staging grub modules") and ext4/squashfs
                                progress lines do not. */
                             BOOL is_staging = (strstr(line + 9, "Staging") != NULL);
-                            if (vm_index >= 0 && vm_index < g_vm_count) {
-                                g_vms[vm_index].vhdx_progress = pct;
-                                g_vms[vm_index].vhdx_staging = is_staging;
+                            /* Resolve by stable id under g_cs: g_vms[] may
+                               have been compacted while we were building (H13). */
+                            VmInstance *pvm;
+                            EnterCriticalSection(&g_cs);
+                            pvm = asb_find_vm_by_id(vm_unique_id);
+                            if (pvm) {
+                                pvm->vhdx_progress = pct;
+                                pvm->vhdx_staging = is_staging;
                             }
-                            if (g_progress_cb && vm_index >= 0 && vm_index < g_vm_count)
-                                g_progress_cb(vm_handle(&g_vms[vm_index]), pct, is_staging, g_progress_ud);
+                            LeaveCriticalSection(&g_cs);
+                            if (g_progress_cb && pvm)
+                                g_progress_cb(vm_handle(pvm), pct, is_staging, g_progress_ud);
                         } else if (strncmp(line, "ERROR:", 6) == 0) {
                             if (error_msg && error_msg[0] == L'\0')
                                 MultiByteToWideChar(CP_ACP, 0, line + 6, -1, error_msg, (int)error_msg_cap);
@@ -2050,6 +2079,7 @@ static HRESULT run_iso_patch_ubuntu(const wchar_t *iso_path,
 typedef struct {
     VmConfig    config;
     int         vm_index;
+    UINT64      vm_unique_id;  /* stable id; survives g_vms[] compaction (H13) */
     wchar_t     vhdx_dir[MAX_PATH];
     wchar_t     endpoint_guid[64];
     GUID        network_id;
@@ -2184,7 +2214,7 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
     hr = run_iso_patch_ubuntu(args->config.image_path, args->config.vhdx_path,
                               args->config.hdd_gb,
                               n_staged > 0 ? manifest : NULL,
-                              args->vm_index, args->error_msg, 512);
+                              args->vm_unique_id, args->error_msg, 512);
     if (FAILED(hr)) {
         args->result = hr;
         if (args->error_msg[0] == L'\0')
@@ -2282,11 +2312,16 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
 done:
     /* ---- Completion (same as vhdx_create_thread:1206). ---- */
     {
-        int idx = args->vm_index;
-        if (idx >= 0 && idx < g_vm_count) {
-            VmInstance *inst = &g_vms[idx];
+        VmInstance *inst;
+        int idx;
 
-            EnterCriticalSection(&g_cs);
+        /* Resolve by stable id under g_cs: g_vms[] may have been compacted
+           (entries shifted down) while we were building, so the cached
+           vm_index can now point at a different VM or be out of range (H13). */
+        EnterCriticalSection(&g_cs);
+        inst = asb_find_vm_by_id(args->vm_unique_id);
+        idx = inst ? (int)(inst - g_vms) : -1;
+        if (inst) {
             inst->building_vhdx = FALSE;
 
             if (SUCCEEDED(args->result)) {
@@ -2300,6 +2335,7 @@ done:
                     inst->network_id = args->network_id;
                     inst->endpoint_id = args->endpoint_id;
                     HeapFree(GetProcessHeap(), 0, heap_inst);
+                    args->vm_inst = NULL;
                     hcs_register_vm_callback(inst);
                 }
                 LeaveCriticalSection(&g_cs);
@@ -2335,6 +2371,16 @@ done:
 
             if (g_state_cb)
                 g_state_cb(vm_handle(inst), inst->running, g_state_ud);
+        } else {
+            /* VM was deleted while building: don't leak the started HCS
+               handle copy, and don't write into a stale slot. */
+            LeaveCriticalSection(&g_cs);
+            if (args->vm_inst) {
+                hcs_unregister_vm_callback(args->vm_inst);
+                hcs_close_vm(args->vm_inst);
+                HeapFree(GetProcessHeap(), 0, args->vm_inst);
+                args->vm_inst = NULL;
+            }
         }
     }
 
@@ -2678,6 +2724,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             }
             memcpy(&args->config, &cfg, sizeof(VmConfig));
             args->vm_index = g_vm_count - 1;
+            args->vm_unique_id = inst->unique_id;
             wcscpy_s(args->vhdx_dir, MAX_PATH, vhdx_dir);
             wcscpy_s(args->net_adapter, 256, inst->net_adapter);
 
@@ -2742,6 +2789,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             }
             memcpy(&args->config, &cfg, sizeof(VmConfig));
             args->vm_index = g_vm_count - 1;
+            args->vm_unique_id = inst->unique_id;
             wcscpy_s(args->vhdx_dir, MAX_PATH, vhdx_dir);
             wcscpy_s(args->net_adapter, 256, inst->net_adapter);
 
@@ -3357,7 +3405,9 @@ ASB_API HRESULT asb_snap_delete_branch(AsbVm vm, int snap_idx, int branch_idx)
     if (idx < 0) return E_INVALIDARG;
 
     asb_log(L"Deleting branch %d of %s...", branch_idx,
-            snap_idx == -2 ? L"base" : g_snap_trees[idx].nodes[snap_idx].name);
+            snap_idx == -2 ? L"base"
+              : (snap_idx >= 0 && snap_idx < g_snap_trees[idx].count
+                   ? g_snap_trees[idx].nodes[snap_idx].name : L"?"));
     hr = snapshot_delete_branch(&g_snap_trees[idx], &g_vms[idx], snap_idx, branch_idx);
     if (FAILED(hr)) asb_log(L"Error: Failed to delete branch (0x%08X)", hr);
     else asb_log(L"Branch deleted.");
@@ -3493,7 +3543,7 @@ ASB_API HRESULT asb_vm_wait_running(AsbVm vm, DWORD timeout_ms)
     ULONGLONG start;
     if (!inst) return E_INVALIDARG;
     start = GetTickCount64();
-    while (!inst->running && !inst->building_vhdx == FALSE) {
+    while (!inst->running && !inst->building_vhdx) {
         if (GetTickCount64() - start > timeout_ms) return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
         Sleep(200);
         /* Check if VM was removed from list */

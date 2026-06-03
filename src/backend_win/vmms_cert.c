@@ -196,7 +196,8 @@ BOOL vmms_cert_ensure(void)
 
     /* ---- Subject ---- */
 
-    GetComputerNameW(computer, &cn_size);
+    if (!GetComputerNameW(computer, &cn_size))
+        wcscpy_s(computer, 256, L"unknown");
     swprintf_s(subject_str, 512, L"CN=AppSandbox-%s", computer);
 
     subject_size = sizeof(subject_enc);

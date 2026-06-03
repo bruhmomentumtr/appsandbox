@@ -458,14 +458,22 @@ static HRESULT write_stream_to_file(IStream *stream, const wchar_t *path)
     zero.QuadPart = 0;
     stream->lpVtbl->Seek(stream, zero, STREAM_SEEK_SET, NULL);
 
+    hr = S_OK;
     for (;;) {
         hr = stream->lpVtbl->Read(stream, buf, sizeof(buf), &bytes_read);
-        if (FAILED(hr) || bytes_read == 0) break;
-        WriteFile(hFile, buf, bytes_read, &bytes_written, NULL);
+        if (FAILED(hr)) break;                        /* propagate Read failure */
+        if (bytes_read == 0) { hr = S_OK; break; }    /* clean end of stream */
+        if (!WriteFile(hFile, buf, bytes_read, &bytes_written, NULL) ||
+            bytes_written != bytes_read) {
+            DWORD err = GetLastError();
+            hr = (err != ERROR_SUCCESS) ? HRESULT_FROM_WIN32(err)
+                                        : HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
+            break;
+        }
     }
 
     CloseHandle(hFile);
-    return S_OK;
+    return hr;
 }
 
 /* Build an ISO9660+Joliet image from a staging directory using IMAPI2 */

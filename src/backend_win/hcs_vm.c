@@ -483,6 +483,11 @@ static DWORD WINAPI vm_monitor_thread_proc(LPVOID param)
                 pfnCloseOp(op);
 
                 if (FAILED(hr)) {
+                    /* HcsWaitForOperationResult may allocate an error
+                     * document even on a failure HRESULT; free it here so
+                     * the polling loop does not leak one buffer per failed
+                     * query while the VM is unhealthy. */
+                    if (result_doc) { LocalFree(result_doc); result_doc = NULL; }
                     hcs_cb_log(L"Monitor: props query failed 0x%08X for \"%s\"",
                                hr, inst->name);
                     /* If callbacks are dead and query fails, VM is likely gone */
@@ -642,8 +647,10 @@ static void cache_runtime_id(VmInstance *instance)
                    instance->runtime_id.Data2,
                    instance->runtime_id.Data3);
         }
-        LocalFree(result_doc);
     }
+    /* HcsWaitForOperationResult may allocate an error document even on a
+     * failure HRESULT; free unconditionally on non-NULL to avoid a leak. */
+    if (result_doc) LocalFree(result_doc);
 }
 
 /* ---- Public API ---- */

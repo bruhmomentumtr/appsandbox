@@ -290,15 +290,20 @@ bound:
         LeaveCriticalSection(&proxy->cs);
     }
 
-    /* Clean up relay threads */
+    /* Clean up relay threads.
+       The relay thread is the sole closer of its own tcp_sock/hv_sock (it does
+       so on exit without holding proxy->cs, so closing them here too would race
+       into a double-close of a possibly recycled handle). We only signal stop
+       and shutdown() to unblock a stalled send/recv, then wait for the thread
+       to close its own sockets and exit. */
     EnterCriticalSection(&proxy->cs);
     for (i = 0; i < MAX_SSH_RELAYS; i++) {
         if (proxy->relays[i].thread) {
             proxy->relays[i].stop = TRUE;
             if (proxy->relays[i].tcp_sock != INVALID_SOCKET)
-                closesocket(proxy->relays[i].tcp_sock);
+                shutdown(proxy->relays[i].tcp_sock, SD_BOTH);
             if (proxy->relays[i].hv_sock != INVALID_SOCKET)
-                closesocket(proxy->relays[i].hv_sock);
+                shutdown(proxy->relays[i].hv_sock, SD_BOTH);
             WaitForSingleObject(proxy->relays[i].thread, 3000);
             CloseHandle(proxy->relays[i].thread);
             proxy->relays[i].thread   = NULL;
@@ -400,7 +405,12 @@ void vm_ssh_proxy_stop(VmInstance *instance)
         closesocket(proxy->listen_sock);
 
     if (proxy->thread) {
-        WaitForSingleObject(proxy->thread, 5000);
+        /* Wait for the listener thread to fully exit before freeing proxy. Its
+           relay-cleanup loop is bounded (MAX_SSH_RELAYS * 3000 ms), so this
+           cannot hang; a shorter timeout would let the listener keep running
+           inside the freed proxy (use-after-free + DeleteCriticalSection on an
+           in-use CS). */
+        WaitForSingleObject(proxy->thread, INFINITE);
         CloseHandle(proxy->thread);
     }
 

@@ -261,6 +261,7 @@ static int collect_inuse_subnets(SubnetInfo *out, int cap)
             SOCKADDR_IN *sin;
             if (!u->Address.lpSockaddr) continue;
             if (u->Address.lpSockaddr->sa_family != AF_INET) continue;
+            if (u->OnLinkPrefixLength > 32) continue;
             sin = (SOCKADDR_IN *)u->Address.lpSockaddr;
             out[n].network    = ntohl(sin->sin_addr.s_addr);
             out[n].prefix_len = u->OnLinkPrefixLength;

@@ -496,8 +496,22 @@ static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT3
     ret = send(s, (const char *)&pkt, (int)sizeof(pkt), 0);
     if (ret == SOCKET_ERROR) {
         int err = WSAGetLastError();
+        if (err == WSAEWOULDBLOCK) {
+            /* Send buffer full: drop this packet (as the comment intends)
+               without tearing down the socket. */
+            return;
+        }
         idd_log(d, L"INPUT SEND ERR %d - flagging for reconnect.", err);
         /* Mark dead — recv thread owns the socket and will close + reconnect */
+        d->input_socket = INVALID_SOCKET;
+        return;
+    }
+    if (ret != (int)sizeof(pkt)) {
+        /* Partial send on a stream socket: the guest reads fixed-size 20-byte
+           InputPackets, so a truncated packet permanently misaligns the wire.
+           Flag for reconnect so the channel resynchronises. */
+        idd_log(d, L"INPUT SEND short (%d/%d) - flagging for reconnect.",
+                ret, (int)sizeof(pkt));
         d->input_socket = INVALID_SOCKET;
         return;
     }
@@ -1294,6 +1308,7 @@ static void d3d_cleanup(VmDisplayIdd *d)
 static HCURSOR create_cursor_from_bitmap(UINT width, UINT height,
                                           UINT xhot, UINT yhot,
                                           UINT cursor_type, UINT pitch,
+                                          UINT shape_data_size,
                                           const BYTE *shape_data)
 {
     HCURSOR result = NULL;
@@ -1303,6 +1318,13 @@ static HCURSOR create_cursor_from_bitmap(UINT width, UINT height,
     HDC hdc;
 
     if (width == 0 || height == 0 || width > 256 || height > 256)
+        return NULL;
+
+    /* shape_data holds exactly shape_data_size bytes; both copy paths read up
+       to (height-1)*pitch + width*4 bytes. Require the stride to cover a row
+       and the total to cover all rows, else a tiny buffer with large
+       width/height/pitch would over-read. */
+    if (pitch < width * 4 || (UINT64)pitch * height > (UINT64)shape_data_size)
         return NULL;
 
     hdc = GetDC(NULL);
@@ -1609,7 +1631,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     {
                         HCURSOR new_cursor = create_cursor_from_bitmap(
                             chdr.width, chdr.height, chdr.xhot, chdr.yhot,
-                            chdr.cursor_type, chdr.pitch, cursor_buf);
+                            chdr.cursor_type, chdr.pitch,
+                            chdr.shape_data_size, cursor_buf);
                         if (new_cursor) {
                             HCURSOR old = d->guest_cursor;
                             d->guest_cursor = new_cursor;
@@ -1705,10 +1728,15 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 UINT row;
                 UINT copy_w = hdr.width * 4;
                 BYTE *src = recv_buf;
+                /* Bound source rows by the bytes actually received: width/height/
+                   stride and data_size are independent guest-controlled fields, so
+                   only data_size/stride rows of recv_buf hold valid pixels. */
+                UINT src_rows = hdr.stride ? (UINT)(data_size / hdr.stride) : 0;
                 if (copy_w > d->frame_stride) copy_w = d->frame_stride;
                 if (copy_w > hdr.stride)      copy_w = hdr.stride;
 
-                for (row = 0; row < hdr.height && row < d->frame_height; row++) {
+                for (row = 0; row < hdr.height && row < d->frame_height &&
+                              row < src_rows; row++) {
                     memcpy(d->frame_buf + row * d->frame_stride,
                            src + row * hdr.stride,
                            copy_w);
@@ -1734,6 +1762,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     rect_w = (UINT)(right - left);
                     rect_h = (UINT)(bottom - top);
                     rect_row_bytes = rect_w * 4;
+
+                    /* Refuse to read past the bytes actually received into recv_buf. */
+                    if ((size_t)(src - recv_buf) + (size_t)rect_row_bytes * rect_h >
+                        (size_t)data_size)
+                        break;
 
                     for (row = 0; row < rect_h; row++) {
                         UINT dst_y = (UINT)top + row;
