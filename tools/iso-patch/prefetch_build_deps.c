@@ -623,7 +623,10 @@ static int write_synth_packages(pkg_table_t *t,
                     size_t blen = (size_t)(fnp + r->filename_len - bp);
                     int n = snprintf(buf, sizeof(buf), "Filename: ./%.*s\n",
                                      (int)blen, bp);
-                    WriteFile(h, buf, n, &wr, NULL);
+                    DWORD wlen = (n < 0) ? 0u :
+                                 (n >= (int)sizeof(buf) ? (DWORD)(sizeof(buf) - 1)
+                                                        : (DWORD)n);
+                    WriteFile(h, buf, wlen, &wr, NULL);
                 } else if (orig_llen > 0) {
                     WriteFile(h, line, (DWORD)orig_llen, &wr, NULL);
                     WriteFile(h, "\n", 1, &wr, NULL);
@@ -654,7 +657,9 @@ static int write_closure_json(pkg_table_t *t,
     int n = snprintf(buf, sizeof(buf),
         "{\n  \"codename\": \"%s\",\n  \"kernel_version\": \"%s\",\n  \"closure\": [\n",
         codename_utf8, kver_utf8);
-    WriteFile(h, buf, n, &wr, NULL);
+    DWORD wlen = (n < 0) ? 0u :
+                 (n >= (int)sizeof(buf) ? (DWORD)(sizeof(buf) - 1) : (DWORD)n);
+    WriteFile(h, buf, wlen, &wr, NULL);
     int first = 1;
     for (size_t i = 0; i < t->n_records; i++) {
         pkg_record_t *r = &t->records[i];
@@ -663,7 +668,9 @@ static int write_closure_json(pkg_table_t *t,
             "%s    {\"name\": \"%.*s\"}",
             first ? "" : ",\n",
             (int)r->name_len, r->name);
-        WriteFile(h, buf, n, &wr, NULL);
+        wlen = (n < 0) ? 0u :
+               (n >= (int)sizeof(buf) ? (DWORD)(sizeof(buf) - 1) : (DWORD)n);
+        WriteFile(h, buf, wlen, &wr, NULL);
         first = 0;
     }
     WriteFile(h, "\n  ]\n}\n", 7, &wr, NULL);
@@ -776,6 +783,11 @@ int do_prefetch_build_deps(const wchar_t *codename,
 
         /* Compose URL + local path. */
         char fn_utf8[1024], sha_utf8[128];
+        if (r->filename_len >= sizeof(fn_utf8)) {
+            log_err(L"prefetch: Filename too long (%zu) for %.*hs",
+                    r->filename_len, (int)r->name_len, r->name);
+            return -1;
+        }
         memcpy(fn_utf8, r->filename, r->filename_len);  fn_utf8[r->filename_len] = 0;
         if (r->sha256_hex && r->sha256_len < sizeof(sha_utf8)) {
             memcpy(sha_utf8, r->sha256_hex, r->sha256_len); sha_utf8[r->sha256_len] = 0;

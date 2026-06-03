@@ -376,7 +376,11 @@ static HRESULT write_stream_to_file(IStream *stream, const wchar_t *path)
 
     for (;;) {
         hr = stream->lpVtbl->Read(stream, buf, sizeof(buf), &bytes_read);
-        if (FAILED(hr) || bytes_read == 0) break;
+        if (FAILED(hr)) {
+            CloseHandle(hFile);
+            return hr;
+        }
+        if (bytes_read == 0) break;
         if (!WriteFile(hFile, buf, bytes_read, &bytes_written, NULL)) {
             hr = HRESULT_FROM_WIN32(GetLastError());
             CloseHandle(hFile);
@@ -2074,7 +2078,17 @@ static HRESULT qcow2_to_raw(const wchar_t *src_path, const wchar_t *dst_path)
     total_clusters = (virtual_size + cluster_size - 1) / cluster_size;
 
     {
-        DWORD l1_bytes = l1_size * 8;
+        ULONGLONG need_l1 = (total_clusters + l2_entries - 1) / l2_entries;
+        DWORD l1_bytes;
+        /* l1_size is attacker-controlled (header). Reject an undersized table
+           (would under-read against the cluster loop) and an oversized one
+           (l1_size * 8 must not overflow the 32-bit allocation/read length;
+           0x1FFFFFFF keeps l1_size*8 <= 0xFFFFFFF8). */
+        if (l1_size < need_l1 || l1_size > 0x1FFFFFFFu) {
+            log_err(L"qcow2_to_raw: invalid l1_size %lu (need %llu)", l1_size, need_l1);
+            goto cleanup;
+        }
+        l1_bytes = (DWORD)((SIZE_T)l1_size * 8);
         l1_table = (BYTE *)HeapAlloc(GetProcessHeap(), 0, l1_bytes);
         if (!l1_table) { hr = E_OUTOFMEMORY; goto cleanup; }
         if (!pread_full(hSrc, l1_table_offset, l1_table, l1_bytes)) {
