@@ -219,7 +219,14 @@ The Xcode project builds the main app (which embeds the core framework) and the 
 
 ## License
 
-MIT
+AppSandbox is licensed under the [MIT License](LICENSE) — Copyright (c) 2026 James Stringer.
+
+It bundles third-party components that are **not** covered by the MIT license and
+retain their own terms — most notably the Microsoft WSL2 `dxgkrnl` GPU driver
+(GPL-2.0) and the embedded XZ decoder (0BSD). See
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the full list. AppSandbox's
+own Linux DRM kernel module (`tools/linux/asb_drm/`) is dual-licensed MIT OR
+GPL-2.0 so it can resolve the kernel's GPL-only symbols.
 
 ## Acknowledgements
 
