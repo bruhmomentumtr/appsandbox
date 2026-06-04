@@ -548,6 +548,8 @@ static void finish_install(int idx, NSError *error) {
     NSString *agentDir = agent_resource_directory();
     if (!agentDir) {
         post_log("[%s] Agent resources not found; skipping agent stage", g_vms[idx].name);
+        /* Wipe the plaintext admin password from memory before returning. */
+        memset(g_vms[idx].admin_pass, 0, sizeof(g_vms[idx].admin_pass));
         g_vms[idx].install_complete = YES;
         save_vm_list();
         post_event(CORE_VM_EVENT_INSTALL_STATUS, g_vms[idx].name, 100, "Install complete");
@@ -687,6 +689,11 @@ int asb_mac_vm_create(const char *name, const char *os_type,
     if (![VmDir ensureDirectoryFor:nsName error:&dirErr]) {
         post_alert(name, "Failed to create VM directory: %s",
                    dirErr.localizedDescription.UTF8String);
+        /* Roll back the slot we appended + persisted (idx == g_vm_count - 1). */
+        g_vm_count--;
+        memset(&g_vms[idx], 0, sizeof(g_vms[idx]));
+        save_vm_list();
+        post_list_changed();
         return BACKEND_ERR_FAILED;
     }
 

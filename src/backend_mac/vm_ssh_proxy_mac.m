@@ -16,6 +16,8 @@ typedef struct {
     int vsock_fd;
     pthread_t thread;
     volatile int stop;
+    pthread_mutex_t *lock;   /* -> owner's _relaysLock; the relay takes it to
+                              * close+clear its own fds. */
 } SshRelay;
 
 @interface VmSshProxyMac () {
@@ -86,20 +88,29 @@ typedef struct {
         close(s);
     }
 
+    /* Signal each relay and shutdown() its sockets to unblock a stuck
+     * recv/send — but do NOT close them here; the relay thread is the sole
+     * closer of its own fds (it closes under _relaysLock on exit). Then join
+     * the threads so no relay is still running once we return. */
+    pthread_t threads[MAX_RELAYS];
+    int nthreads = 0;
     pthread_mutex_lock(&_relaysLock);
     for (int i = 0; i < MAX_RELAYS; i++) {
         _relays[i].stop = 1;
-        if (_relays[i].tcp_fd   >= 0) { shutdown(_relays[i].tcp_fd,   SHUT_RDWR); close(_relays[i].tcp_fd);   _relays[i].tcp_fd   = -1; }
-        if (_relays[i].vsock_fd >= 0) { shutdown(_relays[i].vsock_fd, SHUT_RDWR); close(_relays[i].vsock_fd); _relays[i].vsock_fd = -1; }
-    }
-    /* Detach rather than join — relay threads exit naturally on socket close. */
-    for (int i = 0; i < MAX_RELAYS; i++) {
+        if (_relays[i].tcp_fd   >= 0) shutdown(_relays[i].tcp_fd,   SHUT_RDWR);
+        if (_relays[i].vsock_fd >= 0) shutdown(_relays[i].vsock_fd, SHUT_RDWR);
         if (_relays[i].thread) {
-            pthread_detach(_relays[i].thread);
+            threads[nthreads++] = _relays[i].thread;
             _relays[i].thread = 0;
         }
     }
     pthread_mutex_unlock(&_relaysLock);
+
+    /* Join outside the lock; an exiting relay needs _relaysLock to close its
+     * own fds. */
+    for (int i = 0; i < nthreads; i++) {
+        pthread_join(threads[i], NULL);
+    }
 }
 
 #pragma mark - Accept loop
@@ -181,6 +192,7 @@ bound:
 - (int)connectVsock {
     if (!self.socketDevice) return -1;
     __block int fd = -1;
+    __block BOOL claimed = NO;   /* set once the waiter gives up; late handler then owns its dup */
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
 
     /* VZ APIs must be called on main queue. */
@@ -188,11 +200,28 @@ bound:
         [self.socketDevice connectToPort:VM_SSH_PROXY_VSOCK_PORT
                         completionHandler:^(VZVirtioSocketConnection * _Nullable c,
                                             NSError * _Nullable err) {
-            if (c && !err) fd = dup(c.fileDescriptor);
+            int newfd = (c && !err) ? dup(c.fileDescriptor) : -1;
+            @synchronized (self) {
+                if (claimed) {
+                    /* Waiter timed out already; close our dup. */
+                    if (newfd >= 0) close(newfd);
+                } else {
+                    fd = newfd;
+                }
+            }
             dispatch_semaphore_signal(sem);
         }];
     });
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+    /* dispatch_semaphore_wait returns 0 when signaled, non-zero on timeout. */
+    long timed_out = dispatch_semaphore_wait(sem,
+        dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+    @synchronized (self) {
+        claimed = YES;
+        if (timed_out != 0 && fd >= 0) {
+            close(fd);
+            fd = -1;
+        }
+    }
     return fd;
 }
 
@@ -209,6 +238,12 @@ bound:
 
 - (void)startRelayTcp:(int)tcp_fd vsock:(int)vsock_fd {
     pthread_mutex_lock(&_relaysLock);
+    if (!self.running) {
+        /* Stopping: don't spawn a relay that -stop already walked past. */
+        pthread_mutex_unlock(&_relaysLock);
+        close(tcp_fd); close(vsock_fd);
+        return;
+    }
     int slot = [self allocateRelaySlot];
     if (slot < 0) {
         pthread_mutex_unlock(&_relaysLock);
@@ -216,14 +251,22 @@ bound:
         close(tcp_fd); close(vsock_fd);
         return;
     }
+    /* The slot may carry a joinable thread from a previous relay that already
+     * exited; reap it before reusing the slot. It has released the lock and is
+     * terminating, so this join returns promptly. */
+    if (_relays[slot].thread) {
+        pthread_join(_relays[slot].thread, NULL);
+        _relays[slot].thread = 0;
+    }
     _relays[slot].tcp_fd   = tcp_fd;
     _relays[slot].vsock_fd = vsock_fd;
     _relays[slot].stop     = 0;
+    _relays[slot].lock     = &_relaysLock;
 
-    /* Thread arg is a pointer to our _relays[slot] — stays valid as long as
-     * self is alive. The thread clears tcp_fd/vsock_fd before exiting. */
+    /* Thread arg points at our inline _relays[slot]; it stays valid because
+     * -stop joins every relay before the object is torn down. Keep the thread
+     * joinable (no detach) so -stop / slot-reuse can join it. */
     pthread_create(&_relays[slot].thread, NULL, relay_main, &_relays[slot]);
-    pthread_detach(_relays[slot].thread);
     pthread_mutex_unlock(&_relaysLock);
 }
 
@@ -254,9 +297,14 @@ static void *relay_main(void *arg) {
         }
     }
 
+    /* Sole closer of our own fds. Take the owner's lock so -stop (which reads
+     * these fds under the same lock to shutdown() them) and slot-reuse see
+     * consistent state. Leave r->thread set: -stop or the next startRelayTcp
+     * on this slot joins us. */
+    pthread_mutex_lock(r->lock);
     if (r->tcp_fd   >= 0) { close(r->tcp_fd);   r->tcp_fd   = -1; }
     if (r->vsock_fd >= 0) { close(r->vsock_fd); r->vsock_fd = -1; }
-    r->thread = 0;
+    pthread_mutex_unlock(r->lock);
     return NULL;
 }
 
