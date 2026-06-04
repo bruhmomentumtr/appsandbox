@@ -36,6 +36,8 @@ via attestation through Partner Center.
    associated** to it (Partner Center adds the cert under the hardware account).
 3. **Azure AD (Entra) app** for the Hardware submission API (below).
 4. Windows SDK + WDK installed (`signtool.exe`, `infverif.exe`, `makecab.exe`).
+5. For **ARM64** releases: the **ARM64 MSVC + WDK build tools** (cross-building from an x64
+   host is fully supported — no ARM device is needed to build, sign, or submit).
 
 ### 2a. Create the Entra app (for the submission API)
 
@@ -77,11 +79,11 @@ tools\sign\test-hardware-api.ps1
 | File | Committed? | Purpose |
 | --- | --- | --- |
 | `partner-center.local.json` | **no** (git-ignored) | Entra API creds (tenant/client/secret) |
-| `submission-config.json` | yes | Product names, OS signature targets, driver→cab mapping, timestamp URL, optional `evCertThumbprint` |
+| `submission-config.json` | yes | Product names, OS signature targets, driver→cab mapping, timestamp URL, optional `evCertThumbprint` (x64 values; `sign-drivers.ps1 -Platform ARM64` derives the ARM64 equivalents at sign time) |
 | `test-hardware-api.ps1` | yes | Validate creds + Hardware roles |
 | `sign-drivers.ps1` | yes | EV-sign drivers (binary + catalog + cab) → attestation submit (both in parallel) → download MS-signed |
 | `make-release.ps1` | yes | Build → (if YubiKey) sign all binaries + driver-attest + ZIP; else skip |
-| `AppSandboxPackage.vcxproj` | yes | Utility project; runs `make-release.ps1 -NoBuild` after a successful `Release|x64` VS build |
+| `AppSandboxPackage.vcxproj` | yes | Utility project; runs `make-release.ps1 -NoBuild -Platform $(Platform)` after a successful `Release|x64` **or** `Release|ARM64` VS build |
 | `SIGNING.md` | yes | This document |
 
 Versioning lives at the **repo root**: `Directory.Build.props` (the version numbers + the
@@ -97,18 +99,20 @@ that is inherent to EV signing — so the goal is "keep it out of source," not s
 ## 4. Running it
 
 ### From Visual Studio (the usual path)
-**Build Solution** in **Release|x64**. The `AppSandboxPackage` project depends on every
-other project, so Visual Studio builds it **last** and — via its `AfterTargets="Build"`
-step — runs `make-release.ps1 -NoBuild`, **but only if every project built successfully**
-(a failed build skips it, so no signing/packaging on a broken build). With no EV YubiKey
-it no-ops (build only); with the token in it signs + attestation-signs + zips. Debug
-builds and Release|ARM64 never trigger it.
+**Build Solution** in **Release|x64** or **Release|ARM64**. The `AppSandboxPackage` project
+depends on every other project, so Visual Studio builds it **last** and — via its
+`AfterTargets="Build"` step — runs `make-release.ps1 -NoBuild -Platform $(Platform)`, **but
+only if every project built successfully** (a failed build skips it, so no signing/packaging
+on a broken build). With no EV YubiKey it no-ops (build only); with the token in it signs +
+attestation-signs + zips (ARM64 outputs to `bin\Release-ARM64`, with its ARM64 attestation
+profile and `-win-arm64.zip`). Debug builds never trigger it.
 
 ### Normal release (the one command)
 ```powershell
-tools\sign\make-release.ps1
+tools\sign\make-release.ps1                  # x64
+tools\sign\make-release.ps1 -Platform ARM64  # Windows on ARM
 ```
-- Builds `Release|x64`.
+- Builds `Release|x64` (or `Release|ARM64` with `-Platform ARM64`; output under `bin\Release-ARM64\`).
 - **If the EV YubiKey is in:** EV-signs all binaries — app `.exe`/`.dll` **and** driver
   `.sys`/`.dll` — in one call (**PIN 1**); then `sign-drivers.ps1` regenerates + EV-signs the
   catalogs (**PIN 2**) and EV-signs the cabs (**PIN 3**), submits both drivers to Microsoft,
@@ -164,16 +168,34 @@ API flow (`https://manage.devcenter.microsoft.com/v2.0/my/hardware`): token →
 URL) → PUT the signed CAB → `POST …/commit` → poll `workflowStatus.state` until `completed` →
 download `downloads.items[type=="signedPackage"]`. Both drivers run **in parallel**.
 
-**One product per version.** A product accepts exactly **one** submission (a second returns
-`"Initial submission already exists"`), so each release is its own product — the version is
-baked into the product name (e.g. `App Sandbox Virtual Display Driver 0.1.0`) so the dashboard
-reads as a version history. Products **cannot be deleted** via the API (only renamed, via
+**One product per version per architecture.** A product accepts exactly **one** submission (a
+second returns `"Initial submission already exists"`), so each release is its own product — the
+version **and architecture** are baked into the product name (e.g. `App Sandbox Virtual Display
+Driver x64 0.1.0` / `… ARM64 0.1.0`) so the dashboard reads as a per-arch version history.
+Products **cannot be deleted** via the API (only renamed, via
 `PATCH /products/{id}`), so retire old ones by renaming, not removal.
 
-**OS targets** are set in `submission-config.json` → `requestedSignatures`. Current
-codes are listed in Microsoft's *Get product data* doc; Windows 11 x64:
-`WINDOWS_v100_X64_CO_FULL` (21H2), `_NI_FULL` (22H2), `_GE_FULL` (24H2),
-`_25H2_FULL` (25H2).
+**OS targets** are set in `submission-config.json` → `requestedSignatures`. Current codes
+are listed in Microsoft's *Get product data* doc; Windows 11 x64: `WINDOWS_v100_X64_CO_FULL`
+(21H2), `_NI_FULL` (22H2), `_GE_FULL` (24H2), `_25H2_FULL` (25H2). For an ARM64 build,
+`sign-drivers.ps1 -Platform ARM64` rewrites these to the `ARM64` codes (and uses `inf2cat
+/os:10_CO_ARM64`) at sign time, so the committed config stays x64.
+
+**x64 and ARM64 are submitted separately.** `sign-drivers.ps1 -Platform <arch>` (driven by
+`make-release.ps1 -Platform <arch>`) builds the cab from that arch's driver output,
+regenerates the catalog with `inf2cat /os:10_CO_<ARCH>`, and creates its **own** product.
+The **architecture is in the product/submission name** (`… x64 <ver>` / `… ARM64 <ver>`)
+so the two are easy to tell apart in the Partner Center dashboard. (A single combined
+multi-arch submission is technically possible but would need both arches built before
+signing, which breaks the per-platform "build one config → auto sign+zip" automation —
+hence separate per-arch submissions.)
+
+**ARM64 ApiValidator** (the Universal-DDI check the WDK forces on ARM64 drivers) is **disabled
+for ARM64 cross-builds from a non-ARM64 host** (`ApiValidator_Enable=false` in
+`Directory.Build.props`, gated on `Platform==ARM64` + host≠ARM64). The WDK defaults it to the x86
+ApiExtractor, which can't read an ARM64 PE and fails with exit 193; native ARM64 hosts and all x64
+builds still run it, and Microsoft re-runs API validation on submission. Same rationale as the
+InfVerif skip below.
 
 **INF verification** (`infverif /h`, required by Partner Center since Apr 2025) runs at
 **build time inside Visual Studio**. Command-line / CI builds skip the build-time task

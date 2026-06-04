@@ -7,8 +7,8 @@
  *   2. Windows Update FE3 client protocol over WinHTTP (HTTPS):
  *        GetCookie -> SyncUpdates(filtered by WuCategoryId)
  *                  -> GetExtendedUpdateInfo2 -> time-limited CDN url.
- *      The x64 package is located by identifier in the response, so version
- *      changes / extra updates do not break resolution.
+ *      The package for the build architecture is located by identifier in the
+ *      response, so version changes / extra updates do not break resolution.
  *   3. Download the .appx (a zip) from the Microsoft CDN.
  *   4. Extract with the in-box tar.exe (libarchive handles zip natively).
  *   5. Copy the mapping-layer files into <exe_dir>\d3dlayers\ (cached).
@@ -36,17 +36,33 @@
 #define DL_FE3_PATH_SECURED L"/ClientWebService/client.asmx/secured"
 #define DL_SOAP_HEADERS     L"Content-Type: application/soap+xml; charset=utf-8\r\n"
 #define DL_CACHE_SUBDIR     L"d3dlayers"
-#define DL_APPX_NAME        L"D3DMappingLayers_x64.appx"
+/* The D3D Mapping Layers Store package ships a per-architecture .appx; pick the
+   one matching the guest (= build) architecture. The host downloads it, so on
+   the ARM64 build we fetch and stage the arm64 layers for the arm64 guest. */
+#if defined(_M_ARM64)
+#  define DL_ARCH        L"arm64"
+#  define DL_ARCH_A       "arm64"
+#else
+#  define DL_ARCH        L"x64"
+#  define DL_ARCH_A       "x64"
+#endif
+#define DL_APPX_NAME    L"D3DMappingLayers_" DL_ARCH L".appx"
+/* Substring identifying the package file in the SyncUpdates response — the
+   InstallerSpecificIdentifier contains e.g. "..._x64_..." / "..._arm64_...". */
+#define DL_ISI_ARCH      "_" DL_ARCH_A "_"
 #define DL_MAX_ROUNDS       5   /* FE3 faults intermittently; retry the chain */
 
-/* Files to extract: dest leaf name <- source path inside the .appx. */
+/* Files to extract: dest leaf name <- source path inside the .appx. The arch
+   subfolder inside the package (x64\ / arm64\) is selected by DL_ARCH; the
+   Vulkan ICD manifest is staged under the arch-neutral name dzn_icd.json so the
+   guest agent references one fixed filename regardless of architecture. */
 static const wchar_t *const DL_DST[] = {
     L"OpenGLOn12.dll", L"dxil.dll", L"OpenCLOn12.dll",
-    L"clon12compiler.dll", L"vulkan_dzn.dll", L"dzn_icd.x64.json"
+    L"clon12compiler.dll", L"vulkan_dzn.dll", L"dzn_icd.json"
 };
 static const wchar_t *const DL_SRC[] = {
-    L"x64\\OpenGLOn12.dll", L"x64\\dxil.dll", L"x64\\OpenCLOn12.dll",
-    L"x64\\clon12compiler.dll", L"x64\\vulkan_dzn.dll", L"dzn_icd.x64.json"
+    DL_ARCH L"\\OpenGLOn12.dll", DL_ARCH L"\\dxil.dll", DL_ARCH L"\\OpenCLOn12.dll",
+    DL_ARCH L"\\clon12compiler.dll", DL_ARCH L"\\vulkan_dzn.dll", L"dzn_icd." DL_ARCH L".json"
 };
 #define DL_NFILES ((int)(sizeof(DL_DST)/sizeof(DL_DST[0])))
 
@@ -318,10 +334,10 @@ done:
 
 /* ---- response parsing ---- */
 
-/* Find the x64 D3DMappingLayers .appx in a (decoded) SyncUpdates response and
- * resolve its UpdateIdentity by joining the file's enclosing <Update> <ID> to
- * the matching NewUpdates <UpdateInfo> <UpdateIdentity>. */
-static BOOL parse_x64_leaf(const char *buf, char *uid, size_t uid_cch,
+/* Find the D3DMappingLayers .appx matching the build architecture in a
+ * (decoded) SyncUpdates response and resolve its UpdateIdentity by joining the
+ * file's enclosing <Update> <ID> to the matching NewUpdates <UpdateIdentity>. */
+static BOOL parse_leaf(const char *buf, char *uid, size_t uid_cch,
                            char *rev, size_t rev_cch, char *digest, size_t dig_cch)
 {
     const char *p = buf;
@@ -340,11 +356,11 @@ static BOOL parse_x64_leaf(const char *buf, char *uid, size_t uid_cch,
             !attr_in(tag, "InstallerSpecificIdentifier", isi, sizeof(isi))) {
             p = gt + 1; continue;
         }
-        if (!strstr(isi, "D3DMappingLayers") || !strstr(isi, "_x64_") ||
+        if (!strstr(isi, "D3DMappingLayers") || !strstr(isi, DL_ISI_ARCH) ||
             !strstr(fn, ".appx")) {
             p = gt + 1; continue;
         }
-        /* matched the x64 package file */
+        /* matched the package file for this architecture */
         attr_in(tag, "Digest", digest, dig_cch);
 
         /* nearest <ID>N</ID> before this <File> = the ExtendedUpdateInfo id */
@@ -404,7 +420,7 @@ static BOOL parse_file_url(const char *buf, const char *digest,
     return FALSE;
 }
 
-/* Resolve the x64 package CDN url from Microsoft. Returns 0 on success. */
+/* Resolve the (build-architecture) package CDN url from Microsoft. Returns 0 on success. */
 static int resolve_url(const char *wucatid, wchar_t *url_out, size_t url_cch)
 {
     int round, rc = -1;
@@ -438,8 +454,8 @@ static int resolve_url(const char *wucatid, wchar_t *url_out, size_t url_cch)
         if (t1) { sync_req = str_replace_all(t1, "%CATID%", wucatid); free(t1); }
         if (sync_req) { sync_resp = fe3_post(DL_FE3_PATH, sync_req); free(sync_req); }
         if (sync_resp) html_unescape(sync_resp);
-        if (!sync_resp || !parse_x64_leaf(sync_resp, uid, sizeof(uid), rev, sizeof(rev),
-                                          digest, sizeof(digest))) {
+        if (!sync_resp || !parse_leaf(sync_resp, uid, sizeof(uid), rev, sizeof(rev),
+                                      digest, sizeof(digest))) {
             free(sync_resp); Sleep(1500); continue;
         }
         free(sync_resp);
@@ -462,7 +478,7 @@ static int resolve_url(const char *wucatid, wchar_t *url_out, size_t url_cch)
     return rc;
 }
 
-/* The shipped dzn_icd.x64.json gives library_path as "x64\vulkan_dzn.dll",
+/* The shipped dzn_icd.<arch>.json gives library_path as "<arch>\vulkan_dzn.dll",
  * relative to the manifest. The layers are staged into one flat directory, so
  * point library_path at the DLL's fully-qualified location in the guest.
  *
@@ -479,7 +495,7 @@ static void rewrite_dzn_json(const wchar_t *dir)
     char *buf, *fixed;
     size_t rd;
 
-    swprintf_s(path, MAX_PATH, L"%s\\dzn_icd.x64.json", dir);
+    swprintf_s(path, MAX_PATH, L"%s\\dzn_icd.json", dir);
     if (_wfopen_s(&f, path, L"rb") != 0 || !f) return;
     fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
     if (sz <= 0 || sz > 65536) { fclose(f); return; }
@@ -489,10 +505,10 @@ static void rewrite_dzn_json(const wchar_t *dir)
     fclose(f);
     buf[rd] = 0;
 
-    /* On disk the JSON value is the 18 bytes  x64\\vulkan_dzn.dll  (two
-     * backslash characters, JSON-escaped). Match that exactly and replace it
-     * with the absolute guest path (each backslash JSON-escaped). */
-    fixed = str_replace_all(buf, "x64\\\\vulkan_dzn.dll",
+    /* On disk the JSON value is  <arch>\\vulkan_dzn.dll  (two backslash
+     * characters, JSON-escaped). Match that exactly and replace it with the
+     * absolute guest path (each backslash JSON-escaped). */
+    fixed = str_replace_all(buf, DL_ARCH_A "\\\\vulkan_dzn.dll",
                             "C:\\\\Windows\\\\AppSandbox\\\\d3dlayers\\\\vulkan_dzn.dll");
     free(buf);
     if (!fixed) return;

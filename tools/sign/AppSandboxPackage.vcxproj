@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   AppSandboxPackage — a Utility project that runs tools\sign\make-release.ps1 -NoBuild
-  AFTER the solution builds, but ONLY for Release|x64.
+  -Platform $(Platform) AFTER the solution builds, for Release|x64 or Release|ARM64.
 
   In AppSandbox.sln this project is set to depend on every other project, so Visual
   Studio builds it LAST and SKIPS it entirely if any project failed to build — i.e.
@@ -54,9 +54,9 @@
     <DisableFastUpToDateCheck>true</DisableFastUpToDateCheck>
   </PropertyGroup>
   <Target Name="AppSandboxSignAndPackage" AfterTargets="Build"
-          Condition="'$(Configuration)|$(Platform)'=='Release|x64' And '$(ASB_SKIP_PACKAGE_PROJECT)' != '1'">
-    <Message Importance="high" Text="==== AppSandbox: make-release.ps1 -NoBuild (sign + package) ====" />
-    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(SolutionDir)tools\sign\make-release.ps1&quot; -NoBuild" />
+          Condition="'$(Configuration)'=='Release' And ('$(Platform)'=='x64' Or '$(Platform)'=='ARM64') And '$(ASB_SKIP_PACKAGE_PROJECT)' != '1'">
+    <Message Importance="high" Text="==== AppSandbox: make-release.ps1 -NoBuild -Platform $(Platform) (sign + package) ====" />
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(SolutionDir)tools\sign\make-release.ps1&quot; -NoBuild -Platform $(Platform)" />
   </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

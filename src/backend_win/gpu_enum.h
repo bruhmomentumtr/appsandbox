@@ -61,7 +61,7 @@ BOOL gpu_append_lxsslib_share(GpuDriverShareList *list);
 
 /* Append a synthetic Plan9 share (name "AppSandbox.GlLayers") exposing the
    host directory that holds the D3D mapping layers (OpenGLOn12/dxil/OpenCLOn12/
-   clon12compiler/vulkan_dzn + dzn_icd.x64.json) and the OpenGL ICD shim. The
+   clon12compiler/vulkan_dzn + dzn_icd.json) and the OpenGL ICD shim. The
    Windows guest agent copies this share AFTER the GPU driver shares and then
    provisions it (stages dxil to System32, sets AppInit_DLLs + the Khronos
    OpenCL/Vulkan ICD registry keys). guest_path is C:\Windows\AppSandbox\d3dlayers.

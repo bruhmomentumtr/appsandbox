@@ -3,6 +3,19 @@
 
 #include <windows.h>
 
+/* Target architecture, resolved at compile time. The supported pairing is
+   x64 build -> x64 host -> x64 guest, and ARM64 build -> ARM host -> ARM guest
+   (no cross-arch installs), so build arch == host arch == guest arch and a
+   single compile-time flag drives every architecture decision: the HCS
+   SecuritySettings (ARM Windows HCS has no vTPM / guest-state isolation), the
+   autounattend processorArchitecture token + Win11 TPM-check bypass, the
+   OpenSSH MSI variant, and the GPU-PV D3D mapping-layer package. */
+#if defined(_M_ARM64)
+#  define ASB_IS_ARM64 1
+#else
+#  define ASB_IS_ARM64 0
+#endif
+
 /* Create a new dynamically-expanding VHDX file.
    size_gb: maximum virtual size in gigabytes. */
 HRESULT vhdx_create(const wchar_t *path, ULONGLONG size_gb);

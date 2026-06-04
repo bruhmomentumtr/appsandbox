@@ -38,6 +38,7 @@
 param(
   [string]$ConfigPath   = (Join-Path $PSScriptRoot 'submission-config.json'),
   [string]$CredPath     = (Join-Path $PSScriptRoot 'partner-center.local.json'),
+  [ValidateSet('x64','ARM64')][string]$Platform = 'x64',   # build target arch
   [switch]$NoCab,
   [switch]$NoSign,
   [switch]$SkipSubmit,
@@ -87,6 +88,11 @@ function Invoke-EvSign([string[]]$files, [string]$what) {
 #                         returns an error (never UI) when the specific card bearing it is absent.
 #                         This is what tells our token apart from some unrelated card the user inserted.
 if (-not ([System.Management.Automation.PSTypeName]'AsbScReader').Type) {
+    # Add-Type shells out to the .NET Framework C# compiler, which reads the LIB environment
+    # variable and fails the compile (CS1668, warning-as-error) on any entry that does not exist.
+    # The VS ARM64 build pushes a non-existent ...\atlmfc\lib\ARM64 onto LIB (the ATL/MFC ARM64
+    # libs aren't installed); csc needs nothing from LIB here, so drop missing entries first.
+    if ($env:LIB) { $env:LIB = (($env:LIB -split ';') | Where-Object { $_ -and (Test-Path $_) }) -join ';' }
     Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -401,6 +407,18 @@ function New-DriverCab($d, [string]$workDir) {
 
 if (-not (Test-Path $ConfigPath)) { throw "Config not found: $ConfigPath" }
 $cfg            = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+
+# The config holds the x64 defaults. For an ARM64 build target, rewrite the
+# arch-specific values (output dirs, inf2cat OS, requested signatures); on x64
+# the config is used as-is.
+if ($Platform -eq 'ARM64') {
+    $cfg.workDir   = $cfg.workDir   -replace 'bin\\Release(?=\\)', 'bin\Release-ARM64'
+    $cfg.outDir    = $cfg.outDir    -replace 'bin\\Release(?=\\)', 'bin\Release-ARM64'
+    $cfg.symbolDir = $cfg.symbolDir -replace '\\x64\\', '\ARM64\'
+    $cfg.inf2catOs = $cfg.inf2catOs -replace 'X64', 'ARM64'
+    $cfg.requestedSignatures = @($cfg.requestedSignatures | ForEach-Object { $_ -replace 'X64','ARM64' })
+    foreach ($d in $cfg.drivers) { $d.sourceDir = $d.sourceDir -replace 'bin\\Release(?=\\)', 'bin\Release-ARM64' }
+}
 $asb            = Get-AsbVersion          # version from Directory.Build.props (single source)
 $workDir          = Resolve-RelPath $cfg.workDir
 $script:OutDir    = Resolve-RelPath $cfg.outDir
@@ -483,7 +501,8 @@ $ver = $asb.Short
 $pending = @()
 foreach ($j in $jobs) {
     $d = $j.Driver
-    $productDisplayName = "$($d.productName) $ver"
+    $archTag = if ($Platform -eq 'ARM64') { ' ARM64' } else { '' }
+    $productDisplayName = "$($d.productName)$archTag $ver"
     Write-Host "`n=== $productDisplayName ==="
 
     $product = Invoke-Api POST "$ApiBase/products" @{
