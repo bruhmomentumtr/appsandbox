@@ -33,7 +33,7 @@ Requirements:
 Windows 11 with an x64 Processor or macOS Tahoe (M Series)
 
 # Tips:
-[Windows] Enable hotkeys or mute the virtual machines audio: connect to the VM and right click the connection Window Title bar
+[Windows] Enable hotkeys or mute the VM audio: connect to the VM and right-click the connection title bar  
 [Windows] Need a high performance remote desktop to remotely access your VM? [Phaze](https://phaze.app) works well
 
 
