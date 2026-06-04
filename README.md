@@ -12,7 +12,7 @@ Windows features:
 - 2 Channel Audio
 - GPU Acceleration via Paravirtualization (GPU-PV) with support for DirectX 12 (Windows only), OpenGL, Vulkan, CUDA, OpenCL
 - GPU Hardware Video Decoder/Encoder support
-- SSH via Hyper-V socket proxy
+- SSH via Hyper-V socket proxy (no network required)
 - Snapshots
 - Fixed 1080P60 display
 - Host to client hot-key support
@@ -25,7 +25,7 @@ Mac features:
 - Copy and Paste
 - 2 Channel Audio
 - GPU Acceleration via Paravirtualization with support for Metal
-- SSH via 
+- SSH via virtio-vsock (no network required)
 - Dynamic display sizing
 - Provision and boot with / without internet
 
