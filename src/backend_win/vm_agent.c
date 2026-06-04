@@ -488,8 +488,15 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         disconnected:
         /* Connection lost */
         vm->agent_online = FALSE;
-        closesocket(s);
-        conn->sock = INVALID_SOCKET;
+        /* Atomically claim the socket so we never double-close a handle that
+           vm_agent_stop() may have already closed (and whose value could have
+           been recycled by another socket()/accept()). */
+        {
+            SOCKET old = (SOCKET)InterlockedExchangePointer(
+                (PVOID volatile *)&conn->sock, (PVOID)INVALID_SOCKET);
+            if (old != INVALID_SOCKET)
+                closesocket(old);
+        }
         ui_log(L"Agent offline for \"%s\".", vm->name);
         notify_agent_status(vm);
 
@@ -541,10 +548,15 @@ void vm_agent_stop(VmInstance *instance)
 
     conn->stop = TRUE;
 
-    /* Unblock recv/select by closing the socket */
-    if (conn->sock != INVALID_SOCKET) {
-        closesocket(conn->sock);
-        conn->sock = INVALID_SOCKET;
+    /* Unblock recv/select by closing the socket. Atomically claim it so we
+       never double-close a handle the agent thread may close concurrently at
+       its disconnected: label (a recycled value could close a live unrelated
+       socket). */
+    {
+        SOCKET old = (SOCKET)InterlockedExchangePointer(
+            (PVOID volatile *)&conn->sock, (PVOID)INVALID_SOCKET);
+        if (old != INVALID_SOCKET)
+            closesocket(old);
     }
 
     if (conn->thread) {

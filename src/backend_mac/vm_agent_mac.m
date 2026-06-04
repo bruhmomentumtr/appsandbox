@@ -181,6 +181,7 @@
     if (!self.socketDevice) return -1;
 
     __block int fd = -1;
+    __block BOOL claimed = NO;   /* set once the waiter gives up; late handler then owns its dup */
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
 
     /* VZVirtioSocketDevice.connectToPort: must be called on the VM's
@@ -191,15 +192,31 @@
         [self.socketDevice connectToPort:VM_AGENT_MAC_PORT
                         completionHandler:^(VZVirtioSocketConnection * _Nullable c,
                                             NSError * _Nullable err) {
-            if (c && !err) {
-                /* Dup so the connection object's dealloc doesn't close our fd. */
-                fd = dup(c.fileDescriptor);
+            /* Dup so the connection object's dealloc doesn't close our fd. */
+            int newfd = (c && !err) ? dup(c.fileDescriptor) : -1;
+            @synchronized (self) {
+                if (claimed) {
+                    /* Waiter already timed out and returned; close our dup. */
+                    if (newfd >= 0) close(newfd);
+                } else {
+                    fd = newfd;
+                }
             }
             dispatch_semaphore_signal(sem);
         }];
     });
 
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+    /* dispatch_semaphore_wait returns 0 when signaled, non-zero on timeout. */
+    long timed_out = dispatch_semaphore_wait(sem,
+        dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+    @synchronized (self) {
+        claimed = YES;
+        if (timed_out != 0 && fd >= 0) {
+            /* Handler raced in just after the timeout; drop the fd it duped. */
+            close(fd);
+            fd = -1;
+        }
+    }
     return fd;
 }
 

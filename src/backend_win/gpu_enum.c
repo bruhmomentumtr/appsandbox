@@ -285,7 +285,7 @@ BOOL gpu_enumerate(GpuList *list)
                 DWORD inf_size = sizeof(inf_name);
                 if (RegQueryValueExW(drv_key, L"InfPath", NULL, NULL,
                                      (BYTE *)inf_name, &inf_size) == ERROR_SUCCESS
-                    && inf_name[0]) {
+                    && (inf_name[MAX_PATH - 1] = L'\0', inf_name[0])) {
                     wchar_t store_path[MAX_PATH];
                     DWORD store_size = MAX_PATH;
                     if (SetupGetInfDriverStoreLocationW(inf_name, NULL, NULL,
@@ -533,6 +533,7 @@ BOOL gpu_get_default_driver_path(GpuList *list,
     IWbemServices *svc = NULL;
     HRESULT hr;
     BOOL found = FALSE;
+    BOOL com_inited = FALSE;
 
     (void)list;
 
@@ -545,9 +546,13 @@ BOOL gpu_get_default_driver_path(GpuList *list,
 
     /* Connect to WMI for DriverStore resolution */
     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+    if (hr == S_OK || hr == S_FALSE) {
+        com_inited = TRUE;
+    } else if (hr != RPC_E_CHANGED_MODE) {
         hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-        if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE) {
+        if (hr == S_OK || hr == S_FALSE) {
+            com_inited = TRUE;
+        } else if (hr != RPC_E_CHANGED_MODE) {
             SetupDiDestroyDeviceInfoList(iface_set);
             return FALSE;
         }
@@ -592,7 +597,7 @@ BOOL gpu_get_default_driver_path(GpuList *list,
     }
 
     if (svc) svc->lpVtbl->Release(svc);
-    CoUninitialize();
+    if (com_inited) CoUninitialize();
     SetupDiDestroyDeviceInfoList(iface_set);
     return found;
 }

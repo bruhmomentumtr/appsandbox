@@ -20,7 +20,21 @@
 
 - (void)installMenuItems {
     NSMenu *mainMenu = [NSApp mainMenu];
-    if (!mainMenu) return;
+    if (!mainMenu) {
+        /* The app is built programmatically (no nib / no setMainMenu:), so
+         * [NSApp mainMenu] is nil here. Build a minimal menu bar with an
+         * application menu (Quit) to host the View → Event Log item below. */
+        mainMenu = [[NSMenu alloc] init];
+        NSMenuItem *appItem = [[NSMenuItem alloc] init];
+        [mainMenu addItem:appItem];
+        NSMenu *appSubmenu = [[NSMenu alloc] init];
+        appItem.submenu = appSubmenu;
+        NSString *appName = [[NSProcessInfo processInfo] processName];
+        [appSubmenu addItemWithTitle:[NSString stringWithFormat:@"Quit %@", appName]
+                              action:@selector(terminate:)
+                       keyEquivalent:@"q"];
+        [NSApp setMainMenu:mainMenu];
+    }
 
     /* Find or create a "View" menu. */
     NSMenuItem *viewItem = nil;
@@ -30,8 +44,8 @@
     if (!viewItem) {
         viewItem = [[NSMenuItem alloc] initWithTitle:@"View" action:NULL keyEquivalent:@""];
         viewItem.submenu = [[NSMenu alloc] initWithTitle:@"View"];
-        /* Insert before Window/Help. */
-        NSUInteger insertAt = mainMenu.itemArray.count - 1;
+        /* Insert before Window/Help, else append at the end. */
+        NSUInteger insertAt = mainMenu.itemArray.count;
         for (NSUInteger i = 0; i < mainMenu.itemArray.count; i++) {
             NSString *t = mainMenu.itemArray[i].title;
             if ([t isEqualToString:@"Window"] || [t isEqualToString:@"Help"]) {

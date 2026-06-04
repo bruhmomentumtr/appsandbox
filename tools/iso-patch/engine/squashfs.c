@@ -147,6 +147,20 @@ sqfs_ctx_t *sqfs_open(const wchar_t *path)
         return NULL;
     }
 
+    /* Validate block_size before any code divides/modulos by it (see
+     * sqfs_read_file). It is image-controlled: must be non-zero, a power of
+     * two, equal to (1 << block_log), and within the spec's 1 MiB ceiling. */
+    if (ctx->sb.block_size == 0 ||
+        (ctx->sb.block_size & (ctx->sb.block_size - 1)) != 0 ||
+        ctx->sb.block_log >= 32 ||
+        ctx->sb.block_size != (1u << ctx->sb.block_log) ||
+        ctx->sb.block_size > (1u << 20)) {
+        LOG_E("  invalid block_size %u (block_log %u)",
+              ctx->sb.block_size, ctx->sb.block_log);
+        sqfs_close(ctx);
+        return NULL;
+    }
+
     /* Pre-load id table, fragment table, inode table, dir table.
      * Each is small (a few MB max) and random access is O(1). */
     if (load_id_table(ctx) != 0) {
@@ -589,7 +603,7 @@ static int walk_directory(walk_state_t *w, uint32_t dir_block_off,
 {
     sqfs_ctx_t *ctx = w->ctx;
     int64_t d = stream_resolve(&ctx->dir_stream, dir_block_off, byte_off);
-    if (d < 0) {
+    if (d < 0 || (size_t)d > ctx->dir_stream.len) {
         LOG_E("dir block 0x%x byte_off=%u not in dir stream",
               dir_block_off, byte_off);
         return -1;
@@ -600,6 +614,12 @@ static int walk_directory(walk_state_t *w, uint32_t dir_block_off,
      * accounting for `.` and `..` which aren't stored. So actual bytes = size - 3. */
     if (dir_size < 3) return 0;
     size_t bytes_left = dir_size - 3;
+    /* dir_size is image-controlled; clamp the scan window to what actually
+     * remains in the decompressed dir stream so `end` cannot run past buf. */
+    {
+        size_t avail = ctx->dir_stream.len - (size_t)d;
+        if (bytes_left > avail) bytes_left = avail;
+    }
     const uint8_t *p = base;
     const uint8_t *end = base + bytes_left;
 
@@ -811,6 +831,8 @@ int sqfs_read_file(sqfs_ctx_t *ctx, const sqfs_entry_t *entry,
 {
     const uint8_t *p = ctx->inode_stream.buf + entry->_file_inode_off;
     sqfs_inode_common_t hdr;
+    size_t inode_off;
+    size_t body_avail;
     memcpy(&hdr, p, sizeof(hdr));
     const uint8_t *body = p + sizeof(hdr);
 
@@ -819,23 +841,43 @@ int sqfs_read_file(sqfs_ctx_t *ctx, const sqfs_entry_t *entry,
     uint32_t frag_idx;
     uint32_t frag_off;
     const uint32_t *block_sizes;
+    size_t block_list_avail;   /* # of uint32 block_sizes[] entries in body */
+
+    /* body must lie within the decompressed inode stream; bytes after the
+     * fixed struct hold the variable-length block_sizes[] array. */
+    inode_off = (size_t)(body - ctx->inode_stream.buf);
+    if (body < ctx->inode_stream.buf || inode_off > ctx->inode_stream.len) {
+        LOG_E("sqfs_read_file: %s: inode body out of range", entry->path);
+        return -1;
+    }
+    body_avail = ctx->inode_stream.len - inode_off;
 
     if (hdr.type == SQFS_REG_TYPE) {
         sqfs_basic_file_t f;
+        if (body_avail < sizeof(f)) {
+            LOG_E("sqfs_read_file: %s: inode body too short", entry->path);
+            return -1;
+        }
         memcpy(&f, body, sizeof(f));
         blocks_start = f.blocks_start;
         file_size    = f.file_size;
         frag_idx     = f.frag_idx;
         frag_off     = f.block_offset;
         block_sizes  = (const uint32_t *)(body + sizeof(f));
+        block_list_avail = (body_avail - sizeof(f)) / sizeof(uint32_t);
     } else if (hdr.type == SQFS_EREG_TYPE) {
         sqfs_ext_file_t f;
+        if (body_avail < sizeof(f)) {
+            LOG_E("sqfs_read_file: %s: inode body too short", entry->path);
+            return -1;
+        }
         memcpy(&f, body, sizeof(f));
         blocks_start = f.blocks_start;
         file_size    = f.file_size;
         frag_idx     = f.frag_idx;
         frag_off     = f.block_offset;
         block_sizes  = (const uint32_t *)(body + sizeof(f));
+        block_list_avail = (body_avail - sizeof(f)) / sizeof(uint32_t);
     } else {
         LOG_E("sqfs_read_file: %s is not a regular file (type=%u)",
               entry->path, hdr.type);
@@ -843,6 +885,10 @@ int sqfs_read_file(sqfs_ctx_t *ctx, const sqfs_entry_t *entry,
     }
 
     size_t block_size = ctx->sb.block_size;
+    if (block_size == 0) {
+        LOG_E("sqfs_read_file: %s: zero block_size", entry->path);
+        return -1;
+    }
     size_t n_full = (size_t)(file_size / block_size);
     int has_frag = (frag_idx != 0xffffffffu);
     size_t tail = (size_t)(file_size % block_size);
@@ -855,11 +901,28 @@ int sqfs_read_file(sqfs_ctx_t *ctx, const sqfs_entry_t *entry,
 
     /* Full blocks (and the last block if no fragment). */
     size_t block_list_count = has_frag ? n_full : (n_full + (tail ? 1 : 0));
+    /* The block_sizes[] array is image-controlled in length only via the
+     * inode body; reject if the inode does not actually carry that many
+     * uint32 entries (else block_sizes[i] reads past inode_stream). */
+    if (block_list_count > block_list_avail) {
+        LOG_E("sqfs_read_file: %s: block_list_count %zu exceeds inode body (%zu)",
+              entry->path, block_list_count, block_list_avail);
+        free(out); return -1;
+    }
     for (size_t i = 0; i < block_list_count; i++) {
         uint32_t bs = block_sizes[i];
         int uncompressed = (bs & 0x01000000) ? 1 : 0;
         size_t on_disk = bs & 0x00ffffffu;
         size_t this_block_logical = (i < n_full) ? block_size : tail;
+        /* Bytes still free in `out`. Every write below must stay within it;
+         * on valid input each block writes exactly this_block_logical and
+         * the sum equals file_size, so the normal path is unchanged. */
+        size_t remaining = (size_t)file_size - written;
+
+        if (this_block_logical > remaining) {
+            LOG_E("sqfs_read_file: %s: block %zu overruns output", entry->path, i);
+            free(out); return -1;
+        }
 
         if (on_disk == 0) {
             /* sparse - zero fill */
@@ -869,6 +932,13 @@ int sqfs_read_file(sqfs_ctx_t *ctx, const sqfs_entry_t *entry,
         }
 
         if (uncompressed) {
+            /* An uncompressed block holds its bytes verbatim; it must equal
+             * the logical block length and fit in the remaining output. */
+            if (on_disk != this_block_logical) {
+                LOG_E("sqfs_read_file: %s: uncompressed block %zu size %zu != %zu",
+                      entry->path, i, on_disk, this_block_logical);
+                free(out); return -1;
+            }
             if (sqfs_read_raw(ctx, disk, out + written, on_disk) != 0) {
                 free(out); return -1;
             }
@@ -882,8 +952,15 @@ int sqfs_read_file(sqfs_ctx_t *ctx, const sqfs_entry_t *entry,
                 free(cbuf); free(out); return -1;
             }
             size_t got = 0;
-            if (data_decompress(cbuf, on_disk, out + written, block_size, &got) != 0) {
+            /* Output cap is the true remaining logical block length, not the
+             * full block_size: the tail block has only `tail` bytes left. */
+            if (data_decompress(cbuf, on_disk, out + written, this_block_logical, &got) != 0) {
                 LOG_E("data block decompress at 0x%llx", (unsigned long long)disk);
+                free(cbuf); free(out); return -1;
+            }
+            if (got != this_block_logical) {
+                LOG_E("sqfs_read_file: %s: block %zu decompressed %zu != %zu",
+                      entry->path, i, got, this_block_logical);
                 free(cbuf); free(out); return -1;
             }
             free(cbuf);

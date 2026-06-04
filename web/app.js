@@ -800,7 +800,13 @@ function renderVmTable() {
             vm.sshEnabled, vm.sshState, vm.sshPort,
             vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
             vm.gpuMode, vm.gpuName, vm.networkMode,
-            selectedSnap[i] || 'current'
+            selectedSnap[i] || 'current',
+            /* Snapshot tree: take/delete/rename/branch must trigger a row rebuild
+               so makeSnapCell re-runs. These fields only change on user snapshot
+               actions (never on install-progress ticks — a VM can't be snapshotted
+               while running), so the rebuild-skip optimization above is preserved. */
+            vm.hasSnapshots, vm.snapCurrent, vm.snapCurrentBranch,
+            JSON.stringify(vm.snapshots || []), JSON.stringify(vm.baseBranches || [])
         ].join('|');
 
         if (!firstBuild && rowSigCache[vm.name] === sig) {

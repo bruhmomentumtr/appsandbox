@@ -869,6 +869,9 @@ static void on_webview2_message(const wchar_t *json)
         return;
 
     if (wcscmp(action, L"uiReady") == 0) {
+        /* JS has loaded and registered its message listener; deliver any
+         * messages queued before WebView2 was ready (e.g. early ui_log lines). */
+        webview2_flush_queue();
         if (!prereq_check_all()) {
             webview2_post(L"{\"type\":\"prereqRequired\"}");
             return;

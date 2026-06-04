@@ -720,6 +720,10 @@ ext4_writer_t *ext4_writer_open(HANDLE phys,
     if (est_inodes > w->num_groups * w->inodes_per_group) {
         uint32_t per = (est_inodes + w->num_groups - 1) / w->num_groups;
         per = (per + 7) & ~7u;
+        /* A single 4 KiB inode bitmap block addresses at most BLOCK_SIZE*8
+         * inodes; never let inodes_per_group exceed that or write_inode_bitmap
+         * overruns its fixed bm[BLOCK_SIZE] stack buffer. */
+        if (per > BLOCK_SIZE * 8) per = BLOCK_SIZE * 8;
         w->inodes_per_group = per;
     }
     w->total_inodes = w->inodes_per_group * w->num_groups;
@@ -1210,7 +1214,11 @@ static int finalize_dirs(ext4_writer_t *w)
 static int write_all_inodes(ext4_writer_t *w)
 {
     LOG_I("writing %u inode bodies across %u groups", w->n_used_inodes, w->num_groups);
-    size_t table_bytes = (size_t)w->inodes_per_group * INODE_SIZE;
+    /* The table is written by whole 4 KiB blocks (inode_table_blocks_per_group),
+     * so the buffer must be block-aligned: inodes_per_group*INODE_SIZE alone is
+     * smaller whenever inodes_per_group is not a multiple of 16, which would make
+     * part_write_block read past tbl. The per-group memset zeroes the padding. */
+    size_t table_bytes = (size_t)w->inode_table_blocks_per_group * BLOCK_SIZE;
     uint8_t *tbl = (uint8_t *)calloc(1, table_bytes);
     if (!tbl) return -1;
 

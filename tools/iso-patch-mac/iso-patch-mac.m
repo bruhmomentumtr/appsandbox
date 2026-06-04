@@ -263,8 +263,12 @@ static BOOL mount_disk(NSString *diskImagePath, MountState *out, NSString **errO
 /* ---- Manifest ---- */
 
 typedef struct {
-    NSString *src;
-    NSString *destRel;
+    /* Non-retaining: these point into autoreleased NSArrays from
+     * load_manifest that outlive the whole stage command (the only
+     * @autoreleasepool wraps cmd_stage in main). NSValue stores raw bytes and
+     * never retains them, so the struct members must not be __strong. */
+    __unsafe_unretained NSString *src;
+    __unsafe_unretained NSString *destRel;
     mode_t    mode;
     uid_t     uid;
     gid_t     gid;
@@ -939,7 +943,9 @@ static int cmd_stage(int argc, char **argv) {
     if (raw.length < 8) return nil;
     uint64_t n = 0;
     [raw getBytes:&n length:sizeof(n)];
-    if (n == 0 || raw.length < 8 + n) return nil;
+    /* raw.length >= 8 is guaranteed above, so (raw.length - 8) can't underflow;
+     * compare with subtraction rather than 8 + n. */
+    if (n == 0 || n > raw.length - 8) return nil;
     NSData *urlData = [raw subdataWithRange:NSMakeRange(8, (NSUInteger)n)];
     NSString *savedURL = [[NSString alloc] initWithData:urlData encoding:NSUTF8StringEncoding];
     if (![savedURL isEqualToString:url.absoluteString]) return nil;

@@ -268,6 +268,7 @@ NewAdapterCommon
         CVadAdapterCommon *p = new(PoolFlags, VAD_ADAPTER_POOLTAG) CVadAdapterCommon(UnknownOuter);
         if (p == NULL)
         {
+            InterlockedDecrement(&CVadAdapterCommon::m_AdapterInstances);
             ntStatus = STATUS_INSUFFICIENT_RESOURCES;
             DPF(D_ERROR, ("NewAdapterCommon failed, 0x%x", ntStatus));
             goto Done;

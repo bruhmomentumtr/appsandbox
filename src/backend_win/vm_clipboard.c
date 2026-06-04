@@ -415,7 +415,11 @@ static HGLOBAL clip_build_hdrop_from_temp(const wchar_t *temp_dir)
 
     ptr = (wchar_t *)((BYTE *)df + sizeof(DROPFILES));
     for (i = 0; i < count; i++) {
-        wcscpy_s(ptr, MAX_PATH, paths[i]);
+        /* destsz must be this entry's reserved slice (wcslen+1), NOT MAX_PATH:
+           the buffer is sized tightly per path (see total_size above), so passing
+           MAX_PATH makes wcscpy_s's secure-CRT tail-fill memset run past the
+           allocation -> heap overflow (caught by full page heap at memset). */
+        wcscpy_s(ptr, wcslen(paths[i]) + 1, paths[i]);
         ptr += wcslen(paths[i]) + 1;
     }
     *ptr = L'\0';
@@ -640,8 +644,13 @@ static DWORD WINAPI clip_writer_thread_proc(LPVOID param)
             if (!clip_writer_handle_message(clip, s, &hdr)) break;
         }
 
-        closesocket(clip->writer_socket);
-        clip->writer_socket = INVALID_SOCKET;
+        /* Atomically claim the socket so the writer thread and clip_stop()
+           never double-close the same handle (App Verifier invalid-handle). */
+        {
+            SOCKET old = (SOCKET)InterlockedExchangePointer(
+                (PVOID volatile *)&clip->writer_socket, (PVOID)INVALID_SOCKET);
+            if (old != INVALID_SOCKET) closesocket(old);
+        }
 
         if (clip->stop) break;
 
@@ -802,7 +811,9 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
         UINT32 count, i;
         int off;
 
-        if (hdr->data_size > 16384) return FALSE;
+        /* Need at least the 4-byte leading count; reject short frames so the
+           `*(UINT32 *)buf` read below cannot over-read the allocation. */
+        if (hdr->data_size < 4 || hdr->data_size > 16384) return FALSE;
         buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, hdr->data_size);
         if (!buf) return FALSE;
         if (!clip_recv_exact(s, buf, (int)hdr->data_size)) { HeapFree(GetProcessHeap(), 0, buf); return FALSE; }
@@ -832,6 +843,11 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
             UINT32 fmt_id   = *(UINT32 *)(buf + off); off += 4;
             UINT32 name_len = *(UINT32 *)(buf + off); off += 4;
             UINT local_id = fmt_id;
+
+            /* off is in [8, data_size] here; reject a name_len that runs past
+               the buffer (or whose signed cast would corrupt off) before the
+               unconditional `off += name_len` advance below. */
+            if (name_len > (UINT32)((int)hdr->data_size - off)) break;
 
             if (name_len > 0 && name_len < 256 && off + (int)name_len <= (int)hdr->data_size) {
                 char name[256];
@@ -947,8 +963,13 @@ static DWORD WINAPI clip_reader_thread_proc(LPVOID param)
 
         clip_reader_free_pending(clip);
         clip_remove_dir_recursive(clip->temp_dir);
-        closesocket(clip->reader_socket);
-        clip->reader_socket = INVALID_SOCKET;
+        /* Atomically claim the socket so the reader thread and clip_stop()
+           never double-close the same handle (App Verifier invalid-handle). */
+        {
+            SOCKET old = (SOCKET)InterlockedExchangePointer(
+                (PVOID volatile *)&clip->reader_socket, (PVOID)INVALID_SOCKET);
+            if (old != INVALID_SOCKET) closesocket(old);
+        }
 
         if (clip->stop) break;
     }
@@ -1019,13 +1040,17 @@ ASB_API void vm_clipboard_destroy(VmClipboard clip)
 
     clip->stop = TRUE;
 
-    if (clip->writer_socket != INVALID_SOCKET) {
-        closesocket(clip->writer_socket);
-        clip->writer_socket = INVALID_SOCKET;
+    /* Atomically claim each socket so only one side ever closes it; the writer/
+       reader threads close their own via the same exchange (no double-close). */
+    {
+        SOCKET old = (SOCKET)InterlockedExchangePointer(
+            (PVOID volatile *)&clip->writer_socket, (PVOID)INVALID_SOCKET);
+        if (old != INVALID_SOCKET) closesocket(old);
     }
-    if (clip->reader_socket != INVALID_SOCKET) {
-        closesocket(clip->reader_socket);
-        clip->reader_socket = INVALID_SOCKET;
+    {
+        SOCKET old = (SOCKET)InterlockedExchangePointer(
+            (PVOID volatile *)&clip->reader_socket, (PVOID)INVALID_SOCKET);
+        if (old != INVALID_SOCKET) closesocket(old);
     }
 
     if (clip->writer_thread) {

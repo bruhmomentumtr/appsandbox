@@ -336,10 +336,12 @@ static DWORD WINAPI display_recv_thread(LPVOID param)
                 /* Full frame update */
                 UINT row;
                 UINT copy_w = hdr.width * 4;
+                UINT src_rows = hdr.stride ? (data_size / hdr.stride) : 0;
                 BYTE *src = recv_buf;
                 if (copy_w > d->frame_stride) copy_w = d->frame_stride;
                 if (copy_w > hdr.stride)      copy_w = hdr.stride;
-                for (row = 0; row < hdr.height && row < d->frame_height; row++) {
+                for (row = 0; row < hdr.height && row < d->frame_height &&
+                              row < src_rows; row++) {
                     memcpy(d->frame_buf + row * d->frame_stride,
                            src + row * hdr.stride, copy_w);
                 }
@@ -363,6 +365,10 @@ static DWORD WINAPI display_recv_thread(LPVOID param)
                     rect_w = (UINT)(right - left);
                     rect_h = (UINT)(bottom - top);
                     rect_row_bytes = rect_w * 4;
+
+                    if ((size_t)(src - recv_buf) +
+                        (size_t)rect_row_bytes * rect_h > data_size)
+                        break;
 
                     for (row = 0; row < rect_h; row++) {
                         UINT dst_y = (UINT)top + row;

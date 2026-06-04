@@ -282,6 +282,11 @@ NTSTATUS CVadWaveStream::AllocateBufferWithNotification
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (0 == m_ulDmaMovementRate)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     RequestedSize_ -= RequestedSize_ % (m_pWfExt->Format.nBlockAlign);
 
     PHYSICAL_ADDRESS highAddress;
@@ -731,6 +736,11 @@ NTSTATUS CVadWaveStream::GetPresentationPosition(
     if (!NT_SUCCESS(status))
     {
         return status;
+    }
+
+    if (0 == m_pWfExt->Format.nAvgBytesPerSec)
+    {
+        return STATUS_INVALID_DEVICE_STATE;
     }
 
     _pPresentationPosition->u64PositionInBlocks = ullPresentationPosition * m_pWfExt->Format.nSamplesPerSec / m_pWfExt->Format.nAvgBytesPerSec;

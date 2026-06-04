@@ -59,6 +59,14 @@ static dispatch_source_t g_authKeepAlive = NULL;
                                  | kAuthorizationFlagExtendRights;
         (void)AuthorizationCopyRights(g_auth, &rights, NULL, flags, NULL);
     });
+    /* Free g_auth from the cancel handler: GCD runs it only after any in-flight
+     * event handler returns. */
+    dispatch_source_set_cancel_handler(g_authKeepAlive, ^{
+        if (g_auth) {
+            AuthorizationFree(g_auth, kAuthorizationFlagDestroyRights);
+            g_auth = NULL;
+        }
+    });
     dispatch_resume(g_authKeepAlive);
 }
 
@@ -99,9 +107,13 @@ static dispatch_source_t g_authKeepAlive = NULL;
 
 + (void)releaseAuthorization {
     if (g_authKeepAlive) {
+        /* The cancel handler frees g_auth; don't free it here as well. */
         dispatch_source_cancel(g_authKeepAlive);
         g_authKeepAlive = NULL;
+        return;
     }
+    /* Keep-alive was never started (auth created but rights check failed, so
+     * no timer/handler ever existed); free directly. */
     if (g_auth) {
         AuthorizationFree(g_auth, kAuthorizationFlagDestroyRights);
         g_auth = NULL;

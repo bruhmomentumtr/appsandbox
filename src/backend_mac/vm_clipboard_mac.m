@@ -50,8 +50,24 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint32_t path_len;
     uint64_t file_size;
-    uint32_t is_directory;
+    uint32_t is_directory;   /* entry type: 0=file, 1=dir, 2=symlink */
 } ClipFileInfo;
+
+/* ClipFileInfo.is_directory is a 3-value entry type. For a symlink, file_size
+ * holds the byte length of the link target and the target string is streamed
+ * after the header (same framing as file bytes); the guest recreates the link
+ * rather than following it. */
+#define CLIP_ENTRY_FILE     0u
+#define CLIP_ENTRY_DIR      1u
+#define CLIP_ENTRY_SYMLINK  2u
+
+/* Read a symbolic link's raw (unresolved) target. */
+static NSData *clip_readlink(NSString *path) {
+    char buf[4096];
+    ssize_t n = readlink(path.fileSystemRepresentation, buf, sizeof(buf));
+    if (n < 0) return nil;
+    return [NSData dataWithBytes:buf length:(NSUInteger)n];
+}
 
 /* ---- Pending-request dispatcher (host receives from guest) ----
  * Mirror of the guest's pending table. Every outbound DATA_REQ_V2 carries
@@ -267,16 +283,34 @@ typedef struct __attribute__((packed)) {
 - (int)connectVsock {
     if (!self.socketDevice) return -1;
     __block int fd = -1;
+    __block BOOL claimed = NO;   /* set once the waiter gives up; late handler then owns its dup */
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     dispatch_async(dispatch_get_main_queue(), ^{
         [self.socketDevice connectToPort:VM_CLIPBOARD_VSOCK_PORT
                         completionHandler:^(VZVirtioSocketConnection * _Nullable c,
                                             NSError * _Nullable err) {
-            if (c && !err) fd = dup(c.fileDescriptor);
+            int newfd = (c && !err) ? dup(c.fileDescriptor) : -1;
+            @synchronized (self) {
+                if (claimed) {
+                    /* Waiter timed out already; close our dup. */
+                    if (newfd >= 0) close(newfd);
+                } else {
+                    fd = newfd;
+                }
+            }
             dispatch_semaphore_signal(sem);
         }];
     });
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+    /* dispatch_semaphore_wait returns 0 when signaled, non-zero on timeout. */
+    long timed_out = dispatch_semaphore_wait(sem,
+        dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+    @synchronized (self) {
+        claimed = YES;
+        if (timed_out != 0 && fd >= 0) {
+            close(fd);
+            fd = -1;
+        }
+    }
     return fd;
 }
 
@@ -584,8 +618,43 @@ static int wr_full(int fd, const void *buf, size_t n) {
     return rc;
 }
 
+/* V1 symlink entry: type=SYMLINK, file_size = target length, target string
+ * after the header. Preserves the link instead of following it. */
+- (int)sendSymlinkEntry:(NSString *)relPath target:(NSData *)target {
+    if (_sock < 0) return -1;
+    NSData *pathUTF8 = [relPath dataUsingEncoding:NSUTF8StringEncoding];
+    uint32_t path_len  = (uint32_t)pathUTF8.length;
+    uint32_t tlen      = (uint32_t)target.length;
+    uint32_t data_size = (uint32_t)sizeof(ClipFileInfo) + path_len;
+    ClipHeader h = {
+        .magic      = htonl(CLIP_MAGIC),
+        .msg_type   = htonl(CLIP_MSG_FILE_DATA),
+        .format_len = htonl(0),
+        .data_size  = htonl(data_size),
+    };
+    ClipFileInfo info = {
+        .path_len     = htonl(path_len),
+        .file_size    = CFSwapInt64HostToBig((uint64_t)tlen),
+        .is_directory = htonl(CLIP_ENTRY_SYMLINK),
+    };
+    int rc = 1;
+    pthread_mutex_lock(&_sendLock);
+    if (rc > 0) rc = wr_full(_sock, &h, sizeof(h));
+    if (rc > 0) rc = wr_full(_sock, &info, sizeof(info));
+    if (rc > 0 && path_len) rc = wr_full(_sock, pathUTF8.bytes, path_len);
+    if (rc > 0 && tlen)     rc = wr_full(_sock, target.bytes, tlen);
+    pthread_mutex_unlock(&_sendLock);
+    return rc;
+}
+
 - (int)sendFileTree:(NSURL *)top {
     NSString *base = top.lastPathComponent;
+    NSNumber *isLink = nil;
+    [top getResourceValue:&isLink forKey:NSURLIsSymbolicLinkKey error:nil];
+    if (isLink.boolValue) {
+        return [self sendSymlinkEntry:base
+                               target:(clip_readlink(top.path) ?: [NSData data])];
+    }
     NSNumber *isDir = nil;
     [top getResourceValue:&isDir forKey:NSURLIsDirectoryKey error:nil];
     if (!isDir.boolValue) {
@@ -602,11 +671,18 @@ static int wr_full(int fd, const void *buf, size_t n) {
     if ([self sendFileEntry:base isDir:YES fileSize:0 openFd:-1] <= 0) return -1;
     NSDirectoryEnumerator *en = [NSFileManager.defaultManager
         enumeratorAtURL:top
-        includingPropertiesForKeys:@[NSURLIsDirectoryKey]
+        includingPropertiesForKeys:@[NSURLIsDirectoryKey, NSURLIsSymbolicLinkKey]
                            options:0 errorHandler:nil];
     for (NSURL *child in en) {
         NSString *rel = [base stringByAppendingPathComponent:
                          [child.path substringFromIndex:top.path.length + 1]];
+        NSNumber *cl = nil;
+        [child getResourceValue:&cl forKey:NSURLIsSymbolicLinkKey error:nil];
+        if (cl.boolValue) {
+            if ([self sendSymlinkEntry:rel
+                                target:(clip_readlink(child.path) ?: [NSData data])] <= 0) return -1;
+            continue;
+        }
         NSNumber *cd = nil;
         [child getResourceValue:&cd forKey:NSURLIsDirectoryKey error:nil];
         if (cd.boolValue) {
@@ -863,10 +939,48 @@ static int wr_full(int fd, const void *buf, size_t n) {
     return rc;
 }
 
+/* V2 symlink entry: type=SYMLINK, file_size = target length, target string
+ * streamed after the header (same framing as file bytes). Preserves the link
+ * instead of following it. */
+- (int)sendSymlinkEntryV2:(uint32_t)seq relPath:(NSString *)relPath target:(NSData *)target {
+    if (_sock < 0) return -1;
+    NSData *pathUTF8 = [relPath dataUsingEncoding:NSUTF8StringEncoding];
+    uint32_t path_len  = (uint32_t)pathUTF8.length;
+    uint32_t tlen      = (uint32_t)target.length;
+    uint32_t data_size = 4 + (uint32_t)sizeof(ClipFileInfo) + path_len;
+    ClipHeader h = {
+        .magic      = htonl(CLIP_MAGIC),
+        .msg_type   = htonl(CLIP_MSG_FILE_DATA_V2),
+        .format_len = htonl(0),
+        .data_size  = htonl(data_size),
+    };
+    ClipFileInfo info = {
+        .path_len     = htonl(path_len),
+        .file_size    = CFSwapInt64HostToBig((uint64_t)tlen),
+        .is_directory = htonl(CLIP_ENTRY_SYMLINK),
+    };
+    uint32_t seqBE = htonl(seq);
+    int rc = 1;
+    pthread_mutex_lock(&_sendLock);
+    if (rc > 0) rc = wr_full(_sock, &h, sizeof(h));
+    if (rc > 0) rc = wr_full(_sock, &seqBE, 4);
+    if (rc > 0) rc = wr_full(_sock, &info, sizeof(info));
+    if (rc > 0 && path_len) rc = wr_full(_sock, pathUTF8.bytes, path_len);
+    if (rc > 0 && tlen)     rc = wr_full(_sock, target.bytes, tlen);
+    pthread_mutex_unlock(&_sendLock);
+    return rc;
+}
+
 /* V2 per-file-tree sender: mirrors -sendFileTree: but using FILE_DATA_V2
  * and carrying seq. Walks one top-level URL and emits entries. */
 - (int)sendFileTreeV2:(NSURL *)top seq:(uint32_t)seq {
     NSString *base = top.lastPathComponent;
+    NSNumber *isLink = nil;
+    [top getResourceValue:&isLink forKey:NSURLIsSymbolicLinkKey error:nil];
+    if (isLink.boolValue) {
+        return [self sendSymlinkEntryV2:seq relPath:base
+                                 target:(clip_readlink(top.path) ?: [NSData data])];
+    }
     NSNumber *isDir = nil;
     [top getResourceValue:&isDir forKey:NSURLIsDirectoryKey error:nil];
     if (!isDir.boolValue) {
@@ -883,11 +997,18 @@ static int wr_full(int fd, const void *buf, size_t n) {
     if ([self sendFileEntryV2:seq relPath:base isDir:YES fileSize:0 openFd:-1] <= 0) return -1;
     NSDirectoryEnumerator *en = [NSFileManager.defaultManager
         enumeratorAtURL:top
-        includingPropertiesForKeys:@[NSURLIsDirectoryKey]
+        includingPropertiesForKeys:@[NSURLIsDirectoryKey, NSURLIsSymbolicLinkKey]
                            options:0 errorHandler:nil];
     for (NSURL *child in en) {
         NSString *rel = [base stringByAppendingPathComponent:
                          [child.path substringFromIndex:top.path.length + 1]];
+        NSNumber *cl = nil;
+        [child getResourceValue:&cl forKey:NSURLIsSymbolicLinkKey error:nil];
+        if (cl.boolValue) {
+            if ([self sendSymlinkEntryV2:seq relPath:rel
+                                   target:(clip_readlink(child.path) ?: [NSData data])] <= 0) return -1;
+            continue;
+        }
         NSNumber *cd = nil;
         [child getResourceValue:&cd forKey:NSURLIsDirectoryKey error:nil];
         if (cd.boolValue) {
@@ -1243,7 +1364,8 @@ static int wr_full(int fd, const void *buf, size_t n) {
             for (uint32_t j = 0; j < tc; j++) {
                 if (end - p < 4) goto host_parse_done;
                 uint32_t ulen; memcpy(&ulen, p, 4); p += 4; ulen = ntohl(ulen);
-                if ((size_t)(end - p) < ulen + 8 + 4) goto host_parse_done;
+                /* Compute the bound in size_t (the 32-bit sum could wrap). */
+                if ((size_t)(end - p) < (size_t)ulen + 8 + 4) goto host_parse_done;
                 NSString *uti = [[NSString alloc] initWithBytes:p length:ulen
                                                        encoding:NSUTF8StringEncoding];
                 p += ulen;

@@ -2014,6 +2014,18 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
             pl.workers[wi] = CreateThread(NULL, 0, decompress_worker, &pl, 0, &tid);
             if (!pl.workers[wi]) {
                 log_err(L"CreateThread(worker) failed");
+                /* Stop + join the workers already created so they don't
+                   dereference the stack-local 'pl' after we return. */
+                EnterCriticalSection(&pl.wq.cs);
+                pl.wq.stop = 1;
+                WakeAllConditionVariable(&pl.wq.cv_worker);
+                LeaveCriticalSection(&pl.wq.cs);
+                if (wi > 0) {
+                    WaitForMultipleObjects(wi, pl.workers, TRUE, INFINITE);
+                    for (int wj = 0; wj < wi; wj++) CloseHandle(pl.workers[wj]);
+                }
+                DeleteCriticalSection(&pl.cs);
+                DeleteCriticalSection(&pl.wq.cs);
                 sqfs_close(sq); ext4_writer_close(ew); goto cleanup;
             }
         }
@@ -2021,6 +2033,16 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
         HANDLE consumer = CreateThread(NULL, 0, consumer_thread, &pl, 0, &ctid);
         if (!consumer) {
             log_err(L"CreateThread(consumer) failed");
+            /* Stop + join all workers (no slots pushed yet; they are
+               blocked in work_queue_pop) before the stack-local 'pl' dies. */
+            EnterCriticalSection(&pl.wq.cs);
+            pl.wq.stop = 1;
+            WakeAllConditionVariable(&pl.wq.cv_worker);
+            LeaveCriticalSection(&pl.wq.cs);
+            WaitForMultipleObjects(pl.n_workers, pl.workers, TRUE, INFINITE);
+            for (int wi = 0; wi < pl.n_workers; wi++) CloseHandle(pl.workers[wi]);
+            DeleteCriticalSection(&pl.cs);
+            DeleteCriticalSection(&pl.wq.cs);
             sqfs_close(sq); ext4_writer_close(ew); goto cleanup;
         }
 
@@ -2044,6 +2066,19 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
         log_msg(L"ingest: walk=%d files=%zu dirs=%zu syms=%zu special=%zu errors=%zu bytes=%.1f MiB",
                 walk_rc, pl.n_files, pl.n_dirs, pl.n_syms, pl.n_special, pl.n_errors,
                 (double)pl.bytes_total / (1024.0 * 1024.0));
+        /* The squashfs reader is the integrity detector: a non-zero walk_rc
+           means a structural traversal failure and n_errors counts per-file
+           data/decompress failures. Either one means the rootfs is only
+           partially ingested, so refuse to finalise it as success (leaving
+           exit_code = 1 deletes the incomplete VHDX in cleanup). */
+        if (walk_rc != 0 || pl.n_errors != 0) {
+            log_err(L"squashfs ingest incomplete (walk=%d errors=%zu): "
+                    L"aborting, source image may be truncated or corrupt",
+                    walk_rc, pl.n_errors);
+            sqfs_close(sq);
+            ext4_writer_close(ew);
+            goto cleanup;
+        }
         strncpy(kernel_ver, pl.kernel_version, sizeof(kernel_ver) - 1);
         sqfs_close(sq);
     }

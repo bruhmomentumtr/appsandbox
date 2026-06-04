@@ -362,6 +362,7 @@ CVadTopologyMiniport::PropertyHandlerJackDescription
                         pMI->Count = 1;
 
                         RtlCopyMemory(pDesc, JackDescriptions[nPinId], sizeof(KSJACK_DESCRIPTION));
+                        PropertyRequest->ValueSize = cbNeeded;
                         ntStatus = STATUS_SUCCESS;
                     }
                 }
@@ -435,6 +436,7 @@ CVadTopologyMiniport::PropertyHandlerJackDescription2
                         pDesc->DeviceStateInfo = 0;
                         pDesc->JackCapabilities = JackCapabilities;
 
+                        PropertyRequest->ValueSize = cbNeeded;
                         ntStatus = STATUS_SUCCESS;
                     }
                 }

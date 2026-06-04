@@ -271,6 +271,10 @@ static BOOL p9_version(P9Session *s)
     }
 
     s->msize = unpack_u32(&payload);
+    /* 9P spec requires server msize <= client msize; clamp so subsequent
+       replies cannot exceed the fixed-size recvbuf (stack overflow guard). */
+    if (s->msize < 7 || s->msize > P9_MSIZE)
+        s->msize = P9_MSIZE;
     unpack_str(&payload, ver, sizeof(ver));
 
     P9LOG("9P version: %s, msize: %u", ver, s->msize);
@@ -390,8 +394,19 @@ static BOOL p9_read(P9Session *s, UINT32 fid, UINT64 offset, UINT32 count,
         return FALSE;
     }
 
-    *nread_out = unpack_u32(&payload);
-    *data_out = payload;
+    {
+        UINT32 msg_size, avail, nread;
+        memcpy(&msg_size, s->recvbuf, 4);  /* validated <= s->msize by sock_recv_msg */
+        nread = unpack_u32(&payload);
+        /* payload now points at recvbuf + 11 (size[4] type[1] tag[2] count[4]) */
+        avail = (msg_size >= 11) ? (msg_size - 11) : 0;
+        if (nread > avail) {
+            P9LOG("9P Rread count %u exceeds payload %u", nread, avail);
+            return FALSE;
+        }
+        *nread_out = nread;
+        *data_out = payload;
+    }
     return TRUE;
 }
 
@@ -416,8 +431,19 @@ static BOOL p9_readdir(P9Session *s, UINT32 fid, UINT64 offset, UINT32 count,
         return FALSE;
     }
 
-    *nread_out = unpack_u32(&payload);
-    *data_out = payload;
+    {
+        UINT32 msg_size, avail, nread;
+        memcpy(&msg_size, s->recvbuf, 4);  /* validated <= s->msize by sock_recv_msg */
+        nread = unpack_u32(&payload);
+        /* payload now points at recvbuf + 11 (size[4] type[1] tag[2] count[4]) */
+        avail = (msg_size >= 11) ? (msg_size - 11) : 0;
+        if (nread > avail) {
+            P9LOG("9P Rreaddir count %u exceeds payload %u", nread, avail);
+            return FALSE;
+        }
+        *nread_out = nread;
+        *data_out = payload;
+    }
     return TRUE;
 }
 

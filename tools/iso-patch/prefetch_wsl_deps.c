@@ -210,12 +210,12 @@ int do_prefetch_wsl_deps(const wchar_t *out_dir)
     log_msg(L"wsl-deps: downloading microsoft.direct3d.linux." D3D_VER L".nupkg");
     if (http_download(d3d_url, d3d_pkg) != 0) {
         log_err(L"wsl-deps: direct3d download failed");
-        return -1;
+        goto fail;
     }
     log_msg(L"wsl-deps: downloading microsoft.dxcore.linux.amd64fre." DXCORE_VER L".nupkg");
     if (http_download(dxcore_url, dxcore_pkg) != 0) {
         log_err(L"wsl-deps: dxcore download failed");
-        return -1;
+        goto fail;
     }
 
     /* ---- 3. Extract via tar.exe (handles zip via libarchive) ---- */
@@ -230,14 +230,14 @@ int do_prefetch_wsl_deps(const wchar_t *out_dir)
             sys_dir, d3d_pkg, d3d_extract);
         if (u_run_cmd(cmd) != 0) {
             log_err(L"wsl-deps: tar -xf direct3d.nupkg failed");
-            return -1;
+            goto fail;
         }
         swprintf_s(cmd, 2048,
             L"\"%s\\tar.exe\" -xf \"%s\" -C \"%s\"",
             sys_dir, dxcore_pkg, dxcore_extract);
         if (u_run_cmd(cmd) != 0) {
             log_err(L"wsl-deps: tar -xf dxcore.nupkg failed");
-            return -1;
+            goto fail;
         }
     }
 
@@ -264,7 +264,7 @@ int do_prefetch_wsl_deps(const wchar_t *out_dir)
         if (!CopyFileW(src, dst, FALSE)) {
             log_err(L"wsl-deps: CopyFileW %s -> %s failed: %lu",
                     src, dst, GetLastError());
-            return -1;
+            goto fail;
         }
         copied++;
     }
@@ -278,4 +278,14 @@ int do_prefetch_wsl_deps(const wchar_t *out_dir)
 
     log_msg(L"wsl-deps: OK — %d .so file(s) at %s", copied, out_dir);
     return 0;
+
+fail:
+    /* Same temp cleanup as the success path so a failed run does not
+     * leak the unique %TEMP%\isopatch-wsl-deps-<tick> directory. */
+    {
+        wchar_t cmd[1024];
+        swprintf_s(cmd, 1024, L"cmd.exe /c rd /s /q \"%s\" 2>nul", tmp);
+        u_run_cmd(cmd);
+    }
+    return -1;
 }

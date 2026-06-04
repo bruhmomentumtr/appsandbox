@@ -7,8 +7,11 @@
 
 static void generate_guid_string(wchar_t *out, size_t out_len)
 {
-    GUID g;
-    CoCreateGuid(&g);
+    GUID g = {0};
+    if (FAILED(CoCreateGuid(&g))) {
+        if (out_len > 0) out[0] = L'\0';
+        return;
+    }
     swprintf_s(out, out_len,
         L"%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
         g.Data1, g.Data2, g.Data3,
@@ -70,7 +73,7 @@ void snapshot_save(SnapshotTree *tree)
     int i, b;
 
     swprintf_s(path, MAX_PATH, L"%s\\tree.dat", tree->base_dir);
-    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
+    if (_wfopen_s(&f, path, L"w, ccs=UTF-8") != 0 || !f) return;
 
     fwprintf(f, L"[Base]\n%s\n\n", tree->base_vhdx);
 
@@ -118,7 +121,7 @@ static void snapshot_load(SnapshotTree *tree)
     int section = 0; /* 0=none, 1=base, 2=basebranch, 3=snapshot, 4=branch */
 
     swprintf_s(path, MAX_PATH, L"%s\\tree.dat", tree->base_dir);
-    if (_wfopen_s(&f, path, L"r") != 0 || !f) return;
+    if (_wfopen_s(&f, path, L"r, ccs=UTF-8") != 0 || !f) return;
 
     while (fgetws(line, 1024, f)) {
         size_t len = wcslen(line);

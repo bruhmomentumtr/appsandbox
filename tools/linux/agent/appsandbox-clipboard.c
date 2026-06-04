@@ -1770,12 +1770,25 @@ static void handle_property_notify(xcb_property_notify_event_t *ev)
     } else {
         /* Accumulate. */
         if (g_pending_host.accum_len + n > g_pending_host.accum_cap) {
-            while (g_pending_host.accum_len + n > g_pending_host.accum_cap)
-                g_pending_host.accum_cap *= 2;
-            uint8_t *no = realloc(g_pending_host.accum, g_pending_host.accum_cap);
-            if (no) g_pending_host.accum = no;
+            /* Grow into a temporary capacity and commit accum/accum_cap only on
+               a successful realloc. The original doubled accum_cap *before* the
+               realloc, so on realloc failure accum still pointed at the old,
+               smaller buffer while accum_cap was already inflated -> the memcpy
+               below overflowed the un-enlarged buffer (C10). */
+            size_t new_cap = g_pending_host.accum_cap ? g_pending_host.accum_cap : 1;
+            while (g_pending_host.accum_len + n > new_cap)
+                new_cap *= 2;
+            uint8_t *no = realloc(g_pending_host.accum, new_cap);
+            if (no) {
+                g_pending_host.accum = no;
+                g_pending_host.accum_cap = new_cap;
+            }
         }
-        if (g_pending_host.accum) {
+        /* Append only if the buffer truly has room; if realloc failed above the
+           capacity is unchanged (still too small) so the chunk is dropped
+           rather than overflowing. */
+        if (g_pending_host.accum &&
+            g_pending_host.accum_len + n <= g_pending_host.accum_cap) {
             memcpy(g_pending_host.accum + g_pending_host.accum_len, val, n);
             g_pending_host.accum_len += n;
         }
@@ -1830,7 +1843,10 @@ static int handle_writer_message(int fd, const struct ClipHeader *h)
     }
 
     case CLIP_MSG_FORMAT_LIST: {
-        if (h->data_size > 16384) return -1;
+        /* Need at least the 4-byte leading count; reject short frames so the
+           `*(uint32_t *)buf` read below cannot over-read the allocation (L11,
+           Linux analog of H4/C9). */
+        if (h->data_size < 4 || h->data_size > 16384) return -1;
         uint8_t *buf = malloc(h->data_size);
         if (!buf) return -1;
         if (recv_exact(fd, buf, h->data_size) < 0) { free(buf); return -1; }
@@ -1962,8 +1978,21 @@ static int handle_writer_message(int fd, const struct ClipHeader *h)
             snprintf(full, sizeof(full), "%s/%s", g_hdrop.tmp_dir, u8);
 
             if (fi.is_directory) {
-                mkdir_p(full);
-                /* Directories carry no body bytes (file_size==0). */
+                int mk = mkdir_p(full);   /* 0 on success/EEXIST, -1 on failure */
+                /* Directories carry no body bytes (file_size==0). A *top-level*
+                   directory (no '/' in its relative path) is itself a dropped
+                   item, so list its URI — the file manager then copies the whole
+                   folder recursively. Nested dirs/files are reached through it
+                   and must NOT be listed (listing every nested file is what made
+                   a pasted folder dump its contents flat). Only list it if the
+                   dir actually exists (mk==0), mirroring the file branch's
+                   wrote_locally guard so a failed mkdir can't leave a URI that
+                   points at a missing folder. */
+                if (mk == 0 && !strchr(u8, '/')) {
+                    char uri[1100];
+                    snprintf(uri, sizeof(uri), "file://%s", full);
+                    hdrop_add_uri(uri);
+                }
             } else {
                 /* Ensure parent exists. */
                 char parent[1024];
@@ -1995,7 +2024,11 @@ static int handle_writer_message(int fd, const struct ClipHeader *h)
                 }
                 if (fp) { fclose(fp); wrote_locally = true; }
 
-                if (wrote_locally) {
+                /* Only list TOP-LEVEL files. A file nested inside a dropped
+                   folder is reached via that folder's URI (added above); listing
+                   it here too made the file manager paste it flat at the target,
+                   losing the folder structure. */
+                if (wrote_locally && !strchr(u8, '/')) {
                     char uri[1100];
                     snprintf(uri, sizeof(uri), "file://%s", full);
                     hdrop_add_uri(uri);
