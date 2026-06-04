@@ -81,8 +81,16 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint32_t path_len;
     uint64_t file_size;
-    uint32_t is_directory;
+    uint32_t is_directory;   /* entry type: 0=file, 1=dir, 2=symlink */
 } ClipFileInfo;
+
+/* is_directory is a 3-value entry type (matches the host). For a symlink,
+ * file_size is the link-target byte length and the target string follows the
+ * header like file bytes; we recreate it with symlink() instead of copying. */
+#define CLIP_ENTRY_FILE     0u
+#define CLIP_ENTRY_DIR      1u
+#define CLIP_ENTRY_SYMLINK  2u
+#define CLIP_SYMLINK_MAX    4096u   /* sane cap on a link-target length */
 
 /* ---- Globals ---- */
 
@@ -1007,6 +1015,28 @@ static BOOL stream_file_data(int fd, ClipHeader h, NSURL *destDir,
     }
 
     NSURL *target = [destDir URLByAppendingPathComponent:rel];
+    if (is_dir == CLIP_ENTRY_SYMLINK) {
+        /* Body (file_size bytes) is the link target string. */
+        if (file_size == 0 || file_size > CLIP_SYMLINK_MAX) {
+            uint64_t rem = file_size; uint8_t td[4096];
+            while (rem > 0) {
+                size_t w = rem > sizeof(td) ? sizeof(td) : (size_t)rem;
+                if (read_full(fd, td, w) <= 0) return NO;
+                rem -= w;
+            }
+            return YES;
+        }
+        char *lnk = malloc((size_t)file_size + 1);
+        if (!lnk) return NO;
+        if (read_full(fd, lnk, (size_t)file_size) <= 0) { free(lnk); return NO; }
+        lnk[file_size] = 0;
+        [NSFileManager.defaultManager createDirectoryAtURL:[target URLByDeletingLastPathComponent]
+                               withIntermediateDirectories:YES attributes:nil error:nil];
+        symlink(lnk, target.path.fileSystemRepresentation);
+        free(lnk);
+        if (outTopLevel && rel.pathComponents.count == 1) *outTopLevel = target;
+        return YES;
+    }
     if (is_dir) {
         [NSFileManager.defaultManager createDirectoryAtURL:target
                                withIntermediateDirectories:YES
@@ -1113,10 +1143,11 @@ static int connect_sequence_inbound_format_list(int fd, ClipHeader h) {
             rh.data_size  = ntohl(rh.data_size);
             if (rh.magic != CLIP_MAGIC) return -1;
             if (rh.data_size > CLIP_MAX_PAYLOAD) return -1;
+            if (rh.format_len > CLIP_MAX_PAYLOAD) return -1;
 
             NSString *respFmt = nil;
             if (rh.format_len) {
-                char *fb = malloc(rh.format_len + 1);
+                char *fb = malloc((size_t)rh.format_len + 1);
                 if (!fb) return -1;
                 if (read_full(fd, fb, rh.format_len) <= 0) { free(fb); return -1; }
                 fb[rh.format_len] = 0;
@@ -1184,10 +1215,11 @@ static int handle_inbound(int fd) {
     h.data_size  = ntohl(h.data_size);
     if (h.magic != CLIP_MAGIC)            return -1;
     if (h.data_size > CLIP_MAX_PAYLOAD)   return -1;
+    if (h.format_len > CLIP_MAX_PAYLOAD)  return -1;
 
     NSString *format = nil;
     if (h.format_len) {
-        char *fb = malloc(h.format_len + 1);
+        char *fb = malloc((size_t)h.format_len + 1);
         if (!fb) return -1;
         if (read_full(fd, fb, h.format_len) <= 0) { free(fb); return -1; }
         fb[h.format_len] = 0;
@@ -1438,7 +1470,28 @@ static int handle_inbound(int fd) {
             if (p.fileTreeDir) {
                 NSString *target = [p.fileTreeDir
                     stringByAppendingPathComponent:relPath];
-                if (is_dir) {
+                if (is_dir == CLIP_ENTRY_SYMLINK) {
+                    /* Body (file_size bytes) is the link target string. */
+                    if (file_size == 0 || file_size > CLIP_SYMLINK_MAX) {
+                        uint64_t rem = file_size; uint8_t td[4096];
+                        while (rem > 0) {
+                            size_t w = rem > sizeof(td) ? sizeof(td) : (size_t)rem;
+                            if (read_full(fd, td, w) <= 0) return -1;
+                            rem -= w;
+                        }
+                    } else {
+                        char *lnk = malloc((size_t)file_size + 1);
+                        if (!lnk) return -1;
+                        if (read_full(fd, lnk, (size_t)file_size) <= 0) { free(lnk); return -1; }
+                        lnk[file_size] = 0;
+                        [NSFileManager.defaultManager createDirectoryAtPath:
+                            [target stringByDeletingLastPathComponent]
+                                            withIntermediateDirectories:YES
+                                                             attributes:nil error:nil];
+                        symlink(lnk, target.fileSystemRepresentation);
+                        free(lnk);
+                    }
+                } else if (is_dir) {
                     [NSFileManager.defaultManager createDirectoryAtPath:target
                                         withIntermediateDirectories:YES
                                                          attributes:nil error:nil];

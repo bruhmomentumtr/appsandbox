@@ -598,6 +598,10 @@ int main(int argc, char *argv[]) {
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT,  &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
+    /* Auto-reap the fork+exec children we spawn for mute/unmute and shutdown:
+     * Darwin reaps children automatically when SIGCHLD is ignored, and nothing
+     * here waits on a child's exit status. */
+    signal(SIGCHLD, SIG_IGN);
 
     agent_log("Service starting (pid %d).", getpid());
 
