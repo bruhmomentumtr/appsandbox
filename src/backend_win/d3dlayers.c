@@ -36,9 +36,8 @@
 #define DL_FE3_PATH_SECURED L"/ClientWebService/client.asmx/secured"
 #define DL_SOAP_HEADERS     L"Content-Type: application/soap+xml; charset=utf-8\r\n"
 #define DL_CACHE_SUBDIR     L"d3dlayers"
-/* The D3D Mapping Layers Store package ships a per-architecture .appx; pick the
-   one matching the guest (= build) architecture. The host downloads it, so on
-   the ARM64 build we fetch and stage the arm64 layers for the arm64 guest. */
+/* The Store package ships a per-architecture .appx (and arch subfolder inside);
+   pick the one matching the guest = build architecture. */
 #if defined(_M_ARM64)
 #  define DL_ARCH        L"arm64"
 #  define DL_ARCH_A       "arm64"
@@ -47,15 +46,10 @@
 #  define DL_ARCH_A       "x64"
 #endif
 #define DL_APPX_NAME    L"D3DMappingLayers_" DL_ARCH L".appx"
-/* Substring identifying the package file in the SyncUpdates response — the
-   InstallerSpecificIdentifier contains e.g. "..._x64_..." / "..._arm64_...". */
 #define DL_ISI_ARCH      "_" DL_ARCH_A "_"
 #define DL_MAX_ROUNDS       5   /* FE3 faults intermittently; retry the chain */
 
-/* Files to extract: dest leaf name <- source path inside the .appx. The arch
-   subfolder inside the package (x64\ / arm64\) is selected by DL_ARCH; the
-   Vulkan ICD manifest is staged under the arch-neutral name dzn_icd.json so the
-   guest agent references one fixed filename regardless of architecture. */
+/* Files to extract: dest leaf name <- source path inside the .appx. */
 static const wchar_t *const DL_DST[] = {
     L"OpenGLOn12.dll", L"dxil.dll", L"OpenCLOn12.dll",
     L"clon12compiler.dll", L"vulkan_dzn.dll", L"dzn_icd.json"

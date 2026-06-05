@@ -3,13 +3,9 @@
 
 #include <windows.h>
 
-/* Target architecture, resolved at compile time. The supported pairing is
-   x64 build -> x64 host -> x64 guest, and ARM64 build -> ARM host -> ARM guest
-   (no cross-arch installs), so build arch == host arch == guest arch and a
-   single compile-time flag drives every architecture decision: the HCS
-   SecuritySettings (ARM Windows HCS has no vTPM / guest-state isolation), the
-   autounattend processorArchitecture token + Win11 TPM-check bypass, the
-   OpenSSH MSI variant, and the GPU-PV D3D mapping-layer package. */
+/* Compile-time target architecture. Build arch == host arch == guest arch
+   (x64->x64->x64, ARM64->ARM->ARM; no cross-arch), so one compile-time flag
+   drives every architecture decision. */
 #if defined(_M_ARM64)
 #  define ASB_IS_ARM64 1
 #else

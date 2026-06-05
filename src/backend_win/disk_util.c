@@ -15,26 +15,20 @@
 
 #include <urlmon.h>
 
-/* Architecture token written into every autounattend/unattend component's
-   processorArchitecture attribute. Matches the guest, which is the build arch
-   (see ASB_IS_ARM64 in disk_util.h). */
 #if ASB_IS_ARM64
 #  define ASB_UA_ARCH   L"arm64"
 #else
 #  define ASB_UA_ARCH   L"amd64"
 #endif
 
-/* OpenSSH Server MSI, staged into the guest and installed by SetupComplete.cmd.
-   The Win32-OpenSSH release ships a per-architecture MSI; pick the one matching
-   the guest (= build) architecture so it installs on an ARM64 guest. */
 #if ASB_IS_ARM64
 #  define SSH_MSI_URL     L"https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-ARM64-v10.0.0.0.msi"
 #  define SSH_MSI_NAME    L"OpenSSH-ARM64-v10.0.0.0.msi"
-#  define SSH_MSI_NAME_A   "OpenSSH-ARM64-v10.0.0.0.msi"  /* narrow, for the cmd scripts */
+#  define SSH_MSI_NAME_A   "OpenSSH-ARM64-v10.0.0.0.msi"
 #else
 #  define SSH_MSI_URL     L"https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-Win64-v10.0.0.0.msi"
 #  define SSH_MSI_NAME    L"OpenSSH-Win64-v10.0.0.0.msi"
-#  define SSH_MSI_NAME_A   "OpenSSH-Win64-v10.0.0.0.msi"  /* narrow, for the cmd scripts */
+#  define SSH_MSI_NAME_A   "OpenSSH-Win64-v10.0.0.0.msi"
 #endif
 
 static const GUID VHDX_VENDOR_MS = {
@@ -232,12 +226,10 @@ static const wchar_t *lang_to_input_locale(const wchar_t *lang)
 }
 
 #if ASB_IS_ARM64
-/* Emit RunSynchronousCommand entries (inside an already-open <RunSynchronous>)
-   that disable the Windows 11 setup hardware requirement checks by writing the
-   HKLM\SYSTEM\Setup\LabConfig bypass keys. ARM Windows HCS exposes no vTPM, so
-   without these Windows Setup's appraiser would refuse to install. `order` is
-   the next <Order> value to use; returns the order after the last entry.
-   ARM-only: on x64 the guest gets a real vTPM from HCS and needs no bypass. */
+/* ARM Windows HCS exposes no vTPM, so the Windows 11 Setup hardware checks are
+   bypassed via the HKLM\SYSTEM\Setup\LabConfig keys (x64 gets a real vTPM and
+   needs none). Writes one <RunSynchronousCommand> per key into an already-open
+   <RunSynchronous>, starting at <Order> `order`; returns the next order. */
 static int write_tpm_bypass_commands(FILE *f, int order)
 {
     static const wchar_t *const keys[] = {
@@ -322,11 +314,8 @@ static BOOL generate_autounattend(const wchar_t *output_path,
         L"            </Disk></DiskConfiguration>\n",
         lang, lang_to_input_locale(lang), lang, lang, lang);
 
-    /* ARM only: disable the Windows 11 Setup hardware checks via the
-       HKLM\SYSTEM\Setup\LabConfig keys, from a windowsPE RunSynchronous in the
-       Setup component (runs before the appraiser). ARM Windows HCS has no vTPM,
-       so Setup would otherwise refuse to install. */
 #if ASB_IS_ARM64
+    /* windowsPE Setup pass — bypass keys must run before the Win11 appraiser. */
     fwprintf(f, L"            <RunSynchronous>\n");
     write_tpm_bypass_commands(f, 1);
     fwprintf(f, L"            </RunSynchronous>\n");
@@ -879,8 +868,7 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
         L"                    <Path>cmd /c for %%d in (D E F G H I J) do @if exist %%d:\\SetupComplete.cmd copy /Y %%d:\\SetupComplete.cmd C:\\Windows\\Setup\\Scripts\\</Path>\n"
         L"                </RunSynchronousCommand>\n"
 #if ASB_IS_ARM64
-        /* ARM only: Windows 11 LabConfig hardware-check bypass keys (no vTPM on
-           ARM). Orders 6-10 continue this component's RunSynchronous. */
+        /* ARM Windows HCS has no vTPM — Windows 11 LabConfig hardware-check bypass keys. */
         L"                <RunSynchronousCommand wcm:action=\"add\">\n"
         L"                    <Order>6</Order>\n"
         L"                    <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>\n"
@@ -1446,7 +1434,6 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
                 L"                </RunSynchronousCommand>\n", order++);
         }
 #if ASB_IS_ARM64
-        /* ARM only: Windows 11 LabConfig hardware-check bypass keys (no vTPM on ARM). */
         write_tpm_bypass_commands(f, order);
 #endif
     }
@@ -1576,7 +1563,6 @@ BOOL generate_unattend_vhdx_template(const wchar_t *output_path,
                 L"                </RunSynchronousCommand>\n", order++);
         }
 #if ASB_IS_ARM64
-        /* ARM only: Windows 11 LabConfig hardware-check bypass keys (no vTPM on ARM). */
         write_tpm_bypass_commands(f, order);
 #endif
     }

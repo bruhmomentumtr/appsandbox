@@ -24,6 +24,7 @@
 #include "prefetch_build_deps.h"
 #include "prefetch_wsl_deps.h"
 #include "prefetch_repo.h"
+#include "target_arch.h"
 
 #pragma comment(lib, "virtdisk.lib")
 #pragma comment(lib, "ole32.lib")
@@ -2582,7 +2583,7 @@ static BOOL find_fat32_volume_on_disk(DWORD disk_no,
 
 /* Re-attach the just-built Ubuntu cloud-image VHDX, mount its FAT32 ESP,
    and replace /EFI/ubuntu/grub.cfg with a stanza that forwards the kernel
-   ring buffer and systemd journal to ttyS0. Without this the only kernel
+   ring buffer and systemd journal to the serial console. Without this the only kernel
    messages on Hyper-V COM1 are the pre-pivot ones; once dracut hands off
    to systemd, printk goes to /dev/kmsg only and we go blind on serial.
 
@@ -2627,12 +2628,12 @@ static HRESULT patch_ubuntu_esp_grub_for_debug(const wchar_t *vhdx_path)
         "for f in ($root)/vmlinuz-*-generic; do set vmlinuz=$f; done\n"
         "for f in ($root)/initrd.img-*-generic; do set initrdimg=$f; done\n"
         "linux $vmlinuz root=LABEL=cloudimg-rootfs ro "
-            "console=tty1 console=ttyS0 "
+            IP_EARLYCON_A "console=tty1 console=" IP_SERIAL_A " "
             "systemd.journald.forward_to_console=1 "
             "systemd.log_target=console "
             "systemd.log_level=info "
             "loglevel=7 "
-            "earlyprintk=ttyS0\n"
+            IP_EARLYPRINTK_A "\n"
         "initrd $initrdimg\n"
         "boot\n";
 

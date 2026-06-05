@@ -419,9 +419,8 @@ FodyWeavers.xsd
 !/vendor/webview2/arm64
 !/vendor/webview2/arm64/**
 
-# Vendored ARM64 devcon.exe — same explicit un-ignore (the arm64/ rule above
-# otherwise catches it). The x64 devcon at vendor/devcon/devcon.exe is tracked
-# directly; the ARM64 build stages this copy into bin\Release-ARM64\drivers\.
+# Vendored ARM64 devcon.exe — explicit un-ignore (the arm64/ rule above
+# otherwise catches it, same as webview2). x64 devcon is tracked directly.
 !/vendor/devcon/arm64
 !/vendor/devcon/arm64/**
 

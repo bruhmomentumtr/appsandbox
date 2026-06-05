@@ -18,6 +18,7 @@
 
 #include "prefetch_repo.h"
 #include "iso_patch_log.h"
+#include "target_arch.h"
 
 #include <windows.h>
 #include <winhttp.h>
@@ -366,7 +367,7 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
         }
         /* wsl-mesa.tar.zst from the prebuilt dir (large, ~21 MB). */
         swprintf_s(s, MAX_PATH,
-            L"%s\\tools\\linux\\wsl-mesa\\prebuilt\\ubuntu-26.04-amd64\\wsl-mesa.tar.zst",
+            L"%s\\tools\\linux\\wsl-mesa\\prebuilt\\ubuntu-26.04-" IP_DEB_ARCH L"\\wsl-mesa.tar.zst",
             extracted_root);
         swprintf_s(d, MAX_PATH, L"%s\\wsl-mesa.tar.zst", out_dir);
         u_cp_file(s, d);

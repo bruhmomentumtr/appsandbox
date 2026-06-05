@@ -13,7 +13,7 @@
 
 #include <windows.h>
 
-/* iso_path        : path to ubuntu-XX.XX-desktop-amd64.iso
+/* iso_path        : path to ubuntu-XX.XX-desktop-<arch>.iso (amd64 or arm64)
  * vhdx_path       : output VHDX (overwritten if exists)
  * size_gb         : virtual disk size in GiB (>= 16)
  * manifest_path   : NULL or tab-separated <src>\t<rootfs-dest> to inject

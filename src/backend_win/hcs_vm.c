@@ -1042,12 +1042,9 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             name_esc);
     }
 
-    /* SecuritySettings (virtual TPM + GuestStateOnly isolation) — x64 only.
-       The vTPM is required by the Windows 11 guest on x64. ARM Windows HCS
-       supports neither a vTPM nor guest-state isolation, so the whole block is
-       emitted only on x64. The Windows 11 Setup TPM/SecureBoot requirement
-       check is bypassed via the autounattend LabConfig keys (see
-       generate_autounattend in disk_util.c). */
+    /* ARM Windows HCS supports neither a vTPM nor guest-state isolation, so
+       SecuritySettings is x64-only; on ARM the Win11 Setup TPM/SecureBoot check
+       is bypassed via the autounattend LabConfig keys (disk_util.c). */
     security_section[0] = L'\0';
 #if !ASB_IS_ARM64
     if (is_windows) {
