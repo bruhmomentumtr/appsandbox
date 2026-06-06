@@ -8,6 +8,7 @@
 
 #include "prefetch_wsl_deps.h"
 #include "iso_patch_log.h"
+#include "target_arch.h"
 
 #include <windows.h>
 #include <winhttp.h>
@@ -196,8 +197,8 @@ int do_prefetch_wsl_deps(const wchar_t *out_dir)
         WSL_FEED L"/microsoft.direct3d.linux/" D3D_VER
         L"/microsoft.direct3d.linux." D3D_VER L".nupkg");
     swprintf_s(dxcore_url, 1024,
-        WSL_FEED L"/microsoft.dxcore.linux.amd64fre/" DXCORE_VER
-        L"/microsoft.dxcore.linux.amd64fre." DXCORE_VER L".nupkg");
+        WSL_FEED L"/microsoft.dxcore.linux." IP_DEB_ARCH L"fre/" DXCORE_VER
+        L"/microsoft.dxcore.linux." IP_DEB_ARCH L"fre." DXCORE_VER L".nupkg");
 
     wchar_t d3d_pkg[MAX_PATH], dxcore_pkg[MAX_PATH];
     wchar_t d3d_extract[MAX_PATH], dxcore_extract[MAX_PATH];
@@ -212,7 +213,7 @@ int do_prefetch_wsl_deps(const wchar_t *out_dir)
         log_err(L"wsl-deps: direct3d download failed");
         goto fail;
     }
-    log_msg(L"wsl-deps: downloading microsoft.dxcore.linux.amd64fre." DXCORE_VER L".nupkg");
+    log_msg(L"wsl-deps: downloading microsoft.dxcore.linux." IP_DEB_ARCH L"fre." DXCORE_VER L".nupkg");
     if (http_download(dxcore_url, dxcore_pkg) != 0) {
         log_err(L"wsl-deps: dxcore download failed");
         goto fail;
@@ -243,7 +244,7 @@ int do_prefetch_wsl_deps(const wchar_t *out_dir)
 
     /* ---- 4. Copy the 3 .so files directly into out_dir (no cache layout).
      *
-     * direct3d nupkg has build/native/lib/x64/{libd3d12.so, libd3d12core.so}.
+     * direct3d nupkg has build/native/lib/<arch>/{libd3d12.so, libd3d12core.so}.
      * dxcore   nupkg has build/native/lib/libDXCore.so (rename to lowercase).
      */
     struct copy_spec {
@@ -252,8 +253,8 @@ int do_prefetch_wsl_deps(const wchar_t *out_dir)
         const wchar_t *dst_name;
     };
     const struct copy_spec specs[] = {
-        { d3d_extract,    L"build\\native\\lib\\x64\\libd3d12.so",     L"libd3d12.so"     },
-        { d3d_extract,    L"build\\native\\lib\\x64\\libd3d12core.so", L"libd3d12core.so" },
+        { d3d_extract,    L"build\\native\\lib\\" IP_D3D_LIBDIR L"\\libd3d12.so",     L"libd3d12.so"     },
+        { d3d_extract,    L"build\\native\\lib\\" IP_D3D_LIBDIR L"\\libd3d12core.so", L"libd3d12core.so" },
         { dxcore_extract, L"build\\native\\lib\\libDXCore.so",         L"libdxcore.so"    }, /* lowercase */
     };
     int copied = 0;

@@ -33,4 +33,19 @@
   <PropertyGroup Condition="'$(BuildingInsideVisualStudio)' != 'true'">
     <SkipPackageVerification>true</SkipPackageVerification>
   </PropertyGroup>
+
+  <!--
+    Same class of problem as the InfVerif skip above, for ARM64 driver builds.
+    ARM64 drivers must be Universal, so the WDK runs ApiValidator on them — but it
+    defaults to the x86 ApiExtractor (aitstatic.exe), which cannot read an ARM64 PE
+    and fails with exit code 193 (ERROR_BAD_EXE_FORMAT) when cross-building ARM64 on
+    a non-ARM64 host (e.g. the x64 dev/CI box). Disable it ONLY for that cross-build
+    case: native ARM64 hosts and every x64 build still run it, and Microsoft re-runs
+    full API validation on every attestation submission, so nothing ships unchecked.
+    (Checks both PROCESSOR_ARCHITECTURE and ...ITEW6432 so an emulated x64 MSBuild on
+    an ARM64 host is correctly treated as "host can validate".)
+  -->
+  <PropertyGroup Condition="'$(Platform)' == 'ARM64' And '$(PROCESSOR_ARCHITECTURE)' != 'ARM64' And '$(PROCESSOR_ARCHITEW6432)' != 'ARM64'">
+    <ApiValidator_Enable>false</ApiValidator_Enable>
+  </PropertyGroup>
 </Project>

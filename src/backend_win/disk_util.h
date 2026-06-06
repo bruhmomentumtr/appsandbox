@@ -3,6 +3,15 @@
 
 #include <windows.h>
 
+/* Compile-time target architecture. Build arch == host arch == guest arch
+   (x64->x64->x64, ARM64->ARM->ARM; no cross-arch), so one compile-time flag
+   drives every architecture decision. */
+#if defined(_M_ARM64)
+#  define ASB_IS_ARM64 1
+#else
+#  define ASB_IS_ARM64 0
+#endif
+
 /* Create a new dynamically-expanding VHDX file.
    size_gb: maximum virtual size in gigabytes. */
 HRESULT vhdx_create(const wchar_t *path, ULONGLONG size_gb);

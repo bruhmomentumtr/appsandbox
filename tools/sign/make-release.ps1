@@ -2,7 +2,7 @@
   make-release.ps1 - Build AppSandbox, then conditionally sign + package.
 
   Flow:
-    1. Build the solution (Release|x64) unless -NoBuild.
+    1. Build the solution (Release|$Platform) unless -NoBuild.
     2. Check whether the App Sandbox LLC EV YubiKey is plugged in.
          - NOT present  -> SKIP signing, driver attestation, and ZIP.
                            The (test-signed) dev build is left as-is. Done.
@@ -14,15 +14,21 @@
   So nothing is signed or zipped on an ordinary dev machine without the token.
 
   USAGE:
-    .\make-release.ps1                  # build + (if YubiKey) sign + attest + zip
-    .\make-release.ps1 -NoBuild         # package the current bin\Release
+    .\make-release.ps1                  # x64: build + (if YubiKey) sign + attest + zip
+    .\make-release.ps1 -Platform ARM64  # Windows on ARM (bin\Release-ARM64 -> *-win-arm64.zip)
+    .\make-release.ps1 -NoBuild         # package the current bin\Release[-ARM64]
     .\make-release.ps1 -SkipDrivers     # sign app binaries + zip; leave drivers as-is
     .\make-release.ps1 -ForceDriverSign # re-submit drivers for attestation even if cached
+
+  -Platform selects the bin\ output dir (ARM64 -> bin\Release-ARM64), the driver
+  attestation OS/signature codes (sign-drivers.ps1 -Platform rewrites the x64 config
+  at sign time), and the zip name. The AppSandboxPackage project passes
+  -Platform $(Platform) after a Release build.
 #>
 [CmdletBinding()]
 param(
   [string]$Configuration = 'Release',
-  [string]$Platform      = 'x64',
+  [ValidateSet('x64','ARM64')][string]$Platform = 'x64',
   [string]$OS            = 'win',   # OS token in the zip name; not passed to MSBuild
   [string]$Version       = '',     # empty => read from Directory.Build.props (single source)
   [switch]$NoBuild,
@@ -40,7 +46,10 @@ $env:ASB_SKIP_PACKAGE_PROJECT = '1'
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $sln  = Join-Path $repo 'AppSandbox.sln'
-$bin  = Join-Path $repo ("bin\{0}" -f $Configuration)   # x64 -> bin\Release
+# Output dir matches the .vcxproj OutDir convention: x64 -> bin\Release,
+# ARM64 -> bin\Release-ARM64.
+$binLeaf = if ($Platform -eq 'ARM64') { "$Configuration-ARM64" } else { $Configuration }
+$bin  = Join-Path $repo ("bin\{0}" -f $binLeaf)
 
 $cfgPath = Join-Path $PSScriptRoot 'submission-config.json'
 $cfg     = if (Test-Path $cfgPath) { Get-Content $cfgPath -Raw | ConvertFrom-Json } else { $null }
@@ -84,6 +93,11 @@ function Get-AsbVersion([string]$repoRoot) {
 #                         returns an error (never UI) when the specific card bearing it is absent.
 #                         This is what tells our token apart from some unrelated card the user inserted.
 if (-not ([System.Management.Automation.PSTypeName]'AsbScReader').Type) {
+    # Add-Type shells out to the .NET Framework C# compiler, which reads the LIB environment
+    # variable and fails the compile (CS1668, warning-as-error) on any entry that does not exist.
+    # The VS ARM64 build pushes a non-existent ...\atlmfc\lib\ARM64 onto LIB (the ATL/MFC ARM64
+    # libs aren't installed); csc needs nothing from LIB here, so drop missing entries first.
+    if ($env:LIB) { $env:LIB = (($env:LIB -split ';') | Where-Object { $_ -and (Test-Path $_) }) -join ';' }
     Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -290,8 +304,8 @@ if (-not $SkipDrivers) {
         if ($reusable) {
             Write-Host "Reusing existing Microsoft-signed drivers (v$($asb.Full)) from drivers-signed - no resubmit."
         } else {
-            Write-Host "Driver attestation signing (sign-drivers.ps1) - Microsoft round-trip..."
-            & (Join-Path $PSScriptRoot 'sign-drivers.ps1')
+            Write-Host "Driver attestation signing (sign-drivers.ps1 -Platform $Platform) - Microsoft round-trip..."
+            & (Join-Path $PSScriptRoot 'sign-drivers.ps1') -Platform $Platform
             if ($LASTEXITCODE -ne 0) { throw "Driver attestation failed." }
         }
         # Deposit the MS-signed drivers into bin\Release\drivers (deposited .sys/.dll match the MS
@@ -360,7 +374,7 @@ $files | ForEach-Object { Write-Host ("  " + $_.FullName.Substring($stage.Length
 $mb = [math]::Round((($files | Measure-Object Length -Sum).Sum) / 1MB, 1)
 Write-Host ("--- {0} files, {1} MB ---`n" -f $files.Count, $mb)
 
-$zip = Join-Path $bin ("AppSandbox-{0}-{1}-{2}.zip" -f $Version, $OS, $Platform)
+$zip = Join-Path $bin ("AppSandbox-{0}-{1}-{2}.zip" -f $Version, $OS, $Platform.ToLower())
 if (Test-Path $zip) { Remove-Item $zip -Force }
 # Flat layout: the items sit at the zip root (file.zip\AppSandbox.exe, file.zip\drivers\...),
 # with the drivers\ / resources\ / web\ subfolders preserved - no extra parent folder.

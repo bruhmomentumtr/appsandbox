@@ -454,7 +454,7 @@ static void gl_provision(const wchar_t *dir)
        The manifest's library_path is the absolute guest DLL path (set host-side
        in d3dlayers.c) so the loader can LoadLibraryEx it under
        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, which requires a fully-qualified path. */
-    swprintf_s(path, MAX_PATH, L"%s\\dzn_icd.x64.json", dir);
+    swprintf_s(path, MAX_PATH, L"%s\\dzn_icd.json", dir);
     if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
         if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Khronos\\Vulkan\\Drivers",
                 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL) == ERROR_SUCCESS) {

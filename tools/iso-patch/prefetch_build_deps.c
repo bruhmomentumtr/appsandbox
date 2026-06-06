@@ -1,7 +1,7 @@
 /* prefetch_build_deps.c - see header for design.
  *
  * Pipeline:
- *   1. WinHTTP-download Packages.xz for <codename>/main/binary-amd64
+ *   1. WinHTTP-download Packages.xz for <codename>/main/binary-<arch>
  *   2. Decompress it in-process with the vendored xz-embedded decoder
  *      (xz_decompress_file_to_file below; Packages.gz is raw-gzipped
  *      text that tar.exe rejects, so we target the .xz instead).
@@ -26,6 +26,7 @@
 
 #include "prefetch_build_deps.h"
 #include "iso_patch_log.h"
+#include "target_arch.h"
 #include "engine/xz/xz.h"
 
 #include <windows.h>
@@ -704,7 +705,7 @@ int do_prefetch_build_deps(const wchar_t *codename,
     swprintf_s(pkgs,    MAX_PATH, L"%s\\Packages",    staging);
 
     wchar_t url[1024];
-    swprintf_s(url, 1024, L"%s/dists/%s/main/binary-amd64/Packages.xz",
+    swprintf_s(url, 1024, L"%s/dists/%s/main/binary-" IP_DEB_ARCH L"/Packages.xz",
                mirror, codename);
     log_msg(L"prefetch: GET %s", url);
     if (http_download(url, pkgs_xz) != 0) {

@@ -14,7 +14,7 @@
  *   OpenCLOn12.dll      OpenCL -> D3D12
  *   clon12compiler.dll  OpenCL compiler backend
  *   vulkan_dzn.dll      Vulkan (Mesa Dozen) -> D3D12
- *   dzn_icd.x64.json    Vulkan ICD manifest (points at vulkan_dzn.dll)
+ *   dzn_icd.json        Vulkan ICD manifest (points at vulkan_dzn.dll)
  */
 
 #ifndef D3DLAYERS_H

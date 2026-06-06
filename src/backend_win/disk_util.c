@@ -15,8 +15,21 @@
 
 #include <urlmon.h>
 
-#define SSH_MSI_URL     L"https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-Win64-v10.0.0.0.msi"
-#define SSH_MSI_NAME    L"OpenSSH-Win64-v10.0.0.0.msi"
+#if ASB_IS_ARM64
+#  define ASB_UA_ARCH   L"arm64"
+#else
+#  define ASB_UA_ARCH   L"amd64"
+#endif
+
+#if ASB_IS_ARM64
+#  define SSH_MSI_URL     L"https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-ARM64-v10.0.0.0.msi"
+#  define SSH_MSI_NAME    L"OpenSSH-ARM64-v10.0.0.0.msi"
+#  define SSH_MSI_NAME_A   "OpenSSH-ARM64-v10.0.0.0.msi"
+#else
+#  define SSH_MSI_URL     L"https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-Win64-v10.0.0.0.msi"
+#  define SSH_MSI_NAME    L"OpenSSH-Win64-v10.0.0.0.msi"
+#  define SSH_MSI_NAME_A   "OpenSSH-Win64-v10.0.0.0.msi"
+#endif
 
 static const GUID VHDX_VENDOR_MS = {
     0xec984aec, 0xa0f9, 0x47e9,
@@ -212,6 +225,30 @@ static const wchar_t *lang_to_input_locale(const wchar_t *lang)
     return L"0409:00000409";  /* fallback */
 }
 
+#if ASB_IS_ARM64
+/* ARM Windows HCS exposes no vTPM, so the Windows 11 Setup hardware checks are
+   bypassed via the HKLM\SYSTEM\Setup\LabConfig keys (x64 gets a real vTPM and
+   needs none). Writes one <RunSynchronousCommand> per key into an already-open
+   <RunSynchronous>, starting at <Order> `order`; returns the next order. */
+static int write_tpm_bypass_commands(FILE *f, int order)
+{
+    static const wchar_t *const keys[] = {
+        L"BypassTPMCheck", L"BypassSecureBootCheck", L"BypassRAMCheck",
+        L"BypassStorageCheck", L"BypassCPUCheck"
+    };
+    int i;
+    for (i = 0; i < (int)(sizeof(keys) / sizeof(keys[0])); i++) {
+        fwprintf(f,
+            L"                <RunSynchronousCommand wcm:action=\"add\">\n"
+            L"                    <Order>%d</Order>\n"
+            L"                    <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v %s /t REG_DWORD /d 1 /f</Path>\n"
+            L"                </RunSynchronousCommand>\n",
+            order++, keys[i]);
+    }
+    return order;
+}
+#endif
+
 /* Generate autounattend.xml with credentials and VM name substituted.
    If is_template, adds SecureStartup-FilterDriver to disable BitLocker
    (required for sysprep). */
@@ -238,7 +275,7 @@ static BOOL generate_autounattend(const wchar_t *output_path,
         L"\n"
         L"    <settings pass=\"windowsPE\">\n"
         L"        <component name=\"Microsoft-Windows-International-Core-WinPE\"\n"
-        L"                   processorArchitecture=\"amd64\"\n"
+        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
         L"            <SetupUILanguage><UILanguage>%s</UILanguage></SetupUILanguage>\n"
@@ -248,7 +285,7 @@ static BOOL generate_autounattend(const wchar_t *output_path,
         L"            <UserLocale>%s</UserLocale>\n"
         L"        </component>\n"
         L"        <component name=\"Microsoft-Windows-Setup\"\n"
-        L"                   processorArchitecture=\"amd64\"\n"
+        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
         L"            <UserData>\n"
@@ -274,19 +311,29 @@ static BOOL generate_autounattend(const wchar_t *output_path,
         L"                    <ModifyPartition wcm:action=\"add\"><Order>2</Order><PartitionID>2</PartitionID></ModifyPartition>\n"
         L"                    <ModifyPartition wcm:action=\"add\"><Order>3</Order><PartitionID>3</PartitionID><Format>NTFS</Format><Label>Windows</Label><Letter>C</Letter></ModifyPartition>\n"
         L"                </ModifyPartitions>\n"
-        L"            </Disk></DiskConfiguration>\n"
+        L"            </Disk></DiskConfiguration>\n",
+        lang, lang_to_input_locale(lang), lang, lang, lang);
+
+#if ASB_IS_ARM64
+    /* windowsPE Setup pass — bypass keys must run before the Win11 appraiser. */
+    fwprintf(f, L"            <RunSynchronous>\n");
+    write_tpm_bypass_commands(f, 1);
+    fwprintf(f, L"            </RunSynchronous>\n");
+#endif
+
+    fwprintf(f,
         L"        </component>\n"
         L"    </settings>\n"
         L"\n"
         L"    <settings pass=\"specialize\">\n"
         L"        <component name=\"Microsoft-Windows-Shell-Setup\"\n"
-        L"                   processorArchitecture=\"amd64\"\n"
+        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
         L"            <ComputerName>%s</ComputerName>\n"
         L"        </component>\n"
         L"        <component name=\"Microsoft-Windows-Deployment\"\n"
-        L"                   processorArchitecture=\"amd64\"\n"
+        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
         L"            <RunSynchronous>\n"
@@ -294,7 +341,6 @@ static BOOL generate_autounattend(const wchar_t *output_path,
         L"                    <Order>1</Order>\n"
         L"                    <Path>reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OOBE /v BypassNRO /t REG_DWORD /d 1 /f</Path>\n"
         L"                </RunSynchronousCommand>\n",
-        lang, lang_to_input_locale(lang), lang, lang, lang,
         comp_name);
 
     {
@@ -336,7 +382,7 @@ static BOOL generate_autounattend(const wchar_t *output_path,
     if (is_template) {
         fwprintf(f,
             L"        <component name=\"Microsoft-Windows-SecureStartup-FilterDriver\"\n"
-            L"                   processorArchitecture=\"amd64\"\n"
+            L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
             L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
             L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
             L"            <PreventDeviceEncryption>true</PreventDeviceEncryption>\n"
@@ -353,7 +399,7 @@ static BOOL generate_autounattend(const wchar_t *output_path,
         fwprintf(f,
             L"    <settings pass=\"oobeSystem\">\n"
             L"        <component name=\"Microsoft-Windows-Deployment\"\n"
-            L"                   processorArchitecture=\"amd64\"\n"
+            L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
             L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
             L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
             L"            <Reseal>\n"
@@ -364,7 +410,7 @@ static BOOL generate_autounattend(const wchar_t *output_path,
             L"\n"
             L"    <settings pass=\"auditUser\">\n"
             L"        <component name=\"Microsoft-Windows-Deployment\"\n"
-            L"                   processorArchitecture=\"amd64\"\n"
+            L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
             L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
             L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
             L"            <RunSynchronous>\n"
@@ -382,7 +428,7 @@ static BOOL generate_autounattend(const wchar_t *output_path,
         fwprintf(f,
             L"    <settings pass=\"oobeSystem\">\n"
             L"        <component name=\"Microsoft-Windows-International-Core\"\n"
-            L"                   processorArchitecture=\"amd64\"\n"
+            L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
             L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
             L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
             L"            <InputLocale>%s</InputLocale>\n"
@@ -391,7 +437,7 @@ static BOOL generate_autounattend(const wchar_t *output_path,
             L"            <UserLocale>%s</UserLocale>\n"
             L"        </component>\n"
             L"        <component name=\"Microsoft-Windows-Shell-Setup\"\n"
-            L"                   processorArchitecture=\"amd64\"\n"
+            L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
             L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
             L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
             L"            <OOBE>\n"
@@ -730,9 +776,9 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
             if (ssh_enabled) {
                 fputs(
                     "REM Install OpenSSH Server\r\n"
-                    "if exist \"%ISODRV%\\OpenSSH-Win64-v10.0.0.0.msi\" (\r\n"
+                    "if exist \"%ISODRV%\\" SSH_MSI_NAME_A "\" (\r\n"
                     "    echo [SSH] Installing OpenSSH Server... >> \"%LOG%\"\r\n"
-                    "    msiexec /i \"%ISODRV%\\OpenSSH-Win64-v10.0.0.0.msi\" /qn /norestart >> \"%LOG%\" 2>&1\r\n"
+                    "    msiexec /i \"%ISODRV%\\" SSH_MSI_NAME_A "\" /qn /norestart >> \"%LOG%\" 2>&1\r\n"
                     "    echo [SSH] msiexec exit code: %errorlevel% >> \"%LOG%\"\r\n"
                     "    sc config sshd start= auto >> \"%LOG%\" 2>&1\r\n"
                     "    net start sshd >> \"%LOG%\" 2>&1\r\n"
@@ -791,13 +837,13 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
         L"\n"
         L"    <settings pass=\"specialize\">\n"
         L"        <component name=\"Microsoft-Windows-Shell-Setup\"\n"
-        L"                   processorArchitecture=\"amd64\"\n"
+        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
         L"            <ComputerName>%s</ComputerName>\n"
         L"        </component>\n"
         L"        <component name=\"Microsoft-Windows-Deployment\"\n"
-        L"                   processorArchitecture=\"amd64\"\n"
+        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
         L"            <RunSynchronous>\n"
@@ -821,13 +867,36 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
         L"                    <Order>5</Order>\n"
         L"                    <Path>cmd /c for %%d in (D E F G H I J) do @if exist %%d:\\SetupComplete.cmd copy /Y %%d:\\SetupComplete.cmd C:\\Windows\\Setup\\Scripts\\</Path>\n"
         L"                </RunSynchronousCommand>\n"
+#if ASB_IS_ARM64
+        /* ARM Windows HCS has no vTPM — Windows 11 LabConfig hardware-check bypass keys. */
+        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
+        L"                    <Order>6</Order>\n"
+        L"                    <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>\n"
+        L"                </RunSynchronousCommand>\n"
+        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
+        L"                    <Order>7</Order>\n"
+        L"                    <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>\n"
+        L"                </RunSynchronousCommand>\n"
+        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
+        L"                    <Order>8</Order>\n"
+        L"                    <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>\n"
+        L"                </RunSynchronousCommand>\n"
+        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
+        L"                    <Order>9</Order>\n"
+        L"                    <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassStorageCheck /t REG_DWORD /d 1 /f</Path>\n"
+        L"                </RunSynchronousCommand>\n"
+        L"                <RunSynchronousCommand wcm:action=\"add\">\n"
+        L"                    <Order>10</Order>\n"
+        L"                    <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v BypassCPUCheck /t REG_DWORD /d 1 /f</Path>\n"
+        L"                </RunSynchronousCommand>\n"
+#endif
         L"            </RunSynchronous>\n"
         L"        </component>\n"
         L"    </settings>\n"
         L"\n"
         L"    <settings pass=\"oobeSystem\">\n"
         L"        <component name=\"Microsoft-Windows-International-Core\"\n"
-        L"                   processorArchitecture=\"amd64\"\n"
+        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
         L"            <InputLocale>%s</InputLocale>\n"
@@ -836,7 +905,7 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
         L"            <UserLocale>%s</UserLocale>\n"
         L"        </component>\n"
         L"        <component name=\"Microsoft-Windows-Shell-Setup\"\n"
-        L"                   processorArchitecture=\"amd64\"\n"
+        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
         L"            <OOBE>\n"
@@ -1204,9 +1273,9 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
             if (ssh_enabled) {
                 fputs(
                     "REM Install OpenSSH Server\r\n"
-                    "if exist \"%ISODRV%\\OpenSSH-Win64-v10.0.0.0.msi\" (\r\n"
+                    "if exist \"%ISODRV%\\" SSH_MSI_NAME_A "\" (\r\n"
                     "    echo [SSH] Installing OpenSSH Server... >> \"%LOG%\"\r\n"
-                    "    msiexec /i \"%ISODRV%\\OpenSSH-Win64-v10.0.0.0.msi\" /qn /norestart >> \"%LOG%\" 2>&1\r\n"
+                    "    msiexec /i \"%ISODRV%\\" SSH_MSI_NAME_A "\" /qn /norestart >> \"%LOG%\" 2>&1\r\n"
                     "    echo [SSH] msiexec exit code: %errorlevel% >> \"%LOG%\"\r\n"
                     "    sc config sshd start= auto >> \"%LOG%\" 2>&1\r\n"
                     "    net start sshd >> \"%LOG%\" 2>&1\r\n"
@@ -1329,13 +1398,13 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
         L"\n"
         L"    <settings pass=\"specialize\">\n"
         L"        <component name=\"Microsoft-Windows-Shell-Setup\"\n"
-        L"                   processorArchitecture=\"amd64\"\n"
+        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
         L"            <ComputerName>%s</ComputerName>\n"
         L"        </component>\n"
         L"        <component name=\"Microsoft-Windows-Deployment\"\n"
-        L"                   processorArchitecture=\"amd64\"\n"
+        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
         L"            <RunSynchronous>\n"
@@ -1364,6 +1433,9 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
                 L"                    <Path>bcdedit /set testsigning on</Path>\n"
                 L"                </RunSynchronousCommand>\n", order++);
         }
+#if ASB_IS_ARM64
+        write_tpm_bypass_commands(f, order);
+#endif
     }
 
     fwprintf(f,
@@ -1376,7 +1448,7 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
     fwprintf(f,
         L"    <settings pass=\"oobeSystem\">\n"
         L"        <component name=\"Microsoft-Windows-International-Core\"\n"
-        L"                   processorArchitecture=\"amd64\"\n"
+        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
         L"            <InputLocale>%s</InputLocale>\n"
@@ -1385,7 +1457,7 @@ BOOL generate_unattend_vhdx(const wchar_t *output_path,
         L"            <UserLocale>%s</UserLocale>\n"
         L"        </component>\n"
         L"        <component name=\"Microsoft-Windows-Shell-Setup\"\n"
-        L"                   processorArchitecture=\"amd64\"\n"
+        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
         L"            <OOBE>\n"
@@ -1455,13 +1527,13 @@ BOOL generate_unattend_vhdx_template(const wchar_t *output_path,
         L"\n"
         L"    <settings pass=\"specialize\">\n"
         L"        <component name=\"Microsoft-Windows-Shell-Setup\"\n"
-        L"                   processorArchitecture=\"amd64\"\n"
+        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
         L"            <ComputerName>%s</ComputerName>\n"
         L"        </component>\n"
         L"        <component name=\"Microsoft-Windows-Deployment\"\n"
-        L"                   processorArchitecture=\"amd64\"\n"
+        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
         L"            <RunSynchronous>\n"
@@ -1490,13 +1562,16 @@ BOOL generate_unattend_vhdx_template(const wchar_t *output_path,
                 L"                    <Path>bcdedit /set testsigning on</Path>\n"
                 L"                </RunSynchronousCommand>\n", order++);
         }
+#if ASB_IS_ARM64
+        write_tpm_bypass_commands(f, order);
+#endif
     }
 
     fwprintf(f,
         L"            </RunSynchronous>\n"
         L"        </component>\n"
         L"        <component name=\"Microsoft-Windows-SecureStartup-FilterDriver\"\n"
-        L"                   processorArchitecture=\"amd64\"\n"
+        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
         L"            <PreventDeviceEncryption>true</PreventDeviceEncryption>\n"
@@ -1509,7 +1584,7 @@ BOOL generate_unattend_vhdx_template(const wchar_t *output_path,
     fwprintf(f,
         L"    <settings pass=\"oobeSystem\">\n"
         L"        <component name=\"Microsoft-Windows-Deployment\"\n"
-        L"                   processorArchitecture=\"amd64\"\n"
+        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
         L"            <Reseal>\n"
@@ -1520,7 +1595,7 @@ BOOL generate_unattend_vhdx_template(const wchar_t *output_path,
         L"\n"
         L"    <settings pass=\"auditUser\">\n"
         L"        <component name=\"Microsoft-Windows-Deployment\"\n"
-        L"                   processorArchitecture=\"amd64\"\n"
+        L"                   processorArchitecture=\"" ASB_UA_ARCH L"\"\n"
         L"                   publicKeyToken=\"31bf3856ad364e35\"\n"
         L"                   language=\"neutral\" versionScope=\"nonSxS\">\n"
         L"            <RunSynchronous>\n"
@@ -1604,9 +1679,9 @@ BOOL generate_vhdx_setupcomplete(const wchar_t *output_path, BOOL ssh_enabled)
         fputs(
             "REM Install OpenSSH Server\r\n"
             "set SSHDIR=%SystemRoot%\\AppSandbox\r\n"
-            "if exist \"%SSHDIR%\\OpenSSH-Win64-v10.0.0.0.msi\" (\r\n"
+            "if exist \"%SSHDIR%\\" SSH_MSI_NAME_A "\" (\r\n"
             "    echo [SSH] Installing OpenSSH Server... >> \"%LOG%\"\r\n"
-            "    msiexec /i \"%SSHDIR%\\OpenSSH-Win64-v10.0.0.0.msi\" /qn /norestart >> \"%LOG%\" 2>&1\r\n"
+            "    msiexec /i \"%SSHDIR%\\" SSH_MSI_NAME_A "\" /qn /norestart >> \"%LOG%\" 2>&1\r\n"
             "    echo [SSH] msiexec exit code: %errorlevel% >> \"%LOG%\"\r\n"
             "    sc config sshd start= auto >> \"%LOG%\" 2>&1\r\n"
             "    net start sshd >> \"%LOG%\" 2>&1\r\n"

@@ -1,6 +1,7 @@
 #include "hcs_vm.h"
 #include "vm_agent.h"
 #include "ui.h"
+#include "disk_util.h"   /* ASB_IS_ARM64 */
 #include <stdio.h>
 #include <sddl.h>
 #include <aclapi.h>
@@ -1041,9 +1042,11 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             name_esc);
     }
 
-    /* SecuritySettings with TPM — enabled for all Windows VMs.
-       TPM does not block test-signed drivers; only Secure Boot does. */
+    /* ARM Windows HCS supports neither a vTPM nor guest-state isolation, so
+       SecuritySettings is x64-only; on ARM the Win11 Setup TPM/SecureBoot check
+       is bypassed via the autounattend LabConfig keys (disk_util.c). */
     security_section[0] = L'\0';
+#if !ASB_IS_ARM64
     if (is_windows) {
         wcscpy_s(security_section, 512,
             L",\"SecuritySettings\":{"
@@ -1051,6 +1054,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             L"\"Isolation\":{\"IsolationType\":\"GuestStateOnly\"}"
             L"}");
     }
+#endif
 
     /* Plan9 shares — GPU driver directories for agent p9copy.
        Skip for template VMs (no GPU assigned during template creation). */

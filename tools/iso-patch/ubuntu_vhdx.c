@@ -7,7 +7,7 @@
  *   4. open ext4 writer on root partition
  *   5. stream casper/minimal.squashfs -> rootfs (producer + N decompress
  *      workers + writer-consumer)
- *   6. extract grub-efi-amd64-bin/-signed + shim-signed .debs from ISO
+ *   6. extract grub-efi-<arch>-bin/-signed + shim-signed .debs from ISO
  *      pool/ -> stage into rootfs at /usr/lib/{grub,shim}/...
  *   7. write /etc/fstab, /boot/grub/grub.cfg (bootstrap), first-boot service
  *   8. close ext4 writer
@@ -25,6 +25,7 @@
 #include "engine/ext4.h"
 #include "engine/squashfs.h"
 #include "engine/log.h"
+#include "target_arch.h"
 
 #include <windows.h>
 #include <virtdisk.h>
@@ -454,9 +455,9 @@ static int install_signed_efi(wchar_t iso_letter, const wchar_t *esp_dir)
     swprintf(shim_dir, MAX_PATH, L"%c:\\pool\\main\\s\\shim-signed", iso_letter);
 
     wchar_t grub_deb[MAX_PATH], shim_deb[MAX_PATH];
-    if (u_find_first(grub_dir, L"grub-efi-amd64-signed_*.deb",
+    if (u_find_first(grub_dir, L"grub-efi-" IP_DEB_ARCH L"-signed_*.deb",
                      grub_deb, MAX_PATH) != 0) {
-        log_err(L"grub-efi-amd64-signed deb not found in %s", grub_dir);
+        log_err(L"grub-efi-" IP_DEB_ARCH L"-signed deb not found in %s", grub_dir);
         return -1;
     }
     if (u_find_first(shim_dir, L"shim-signed_*.deb",
@@ -467,26 +468,26 @@ static int install_signed_efi(wchar_t iso_letter, const wchar_t *esp_dir)
     log_msg(L"signed EFI: grub=%s shim=%s", grub_deb, shim_deb);
 
     wchar_t dst_grub[MAX_PATH], dst_shim[MAX_PATH], dst_mm[MAX_PATH];
-    wchar_t dst_bootx64[MAX_PATH], dst_grub_boot[MAX_PATH], dst_mm_boot[MAX_PATH];
-    swprintf(dst_grub,      MAX_PATH, L"%sEFI\\ubuntu\\grubx64.efi", esp_dir);
-    swprintf(dst_shim,      MAX_PATH, L"%sEFI\\ubuntu\\shimx64.efi", esp_dir);
-    swprintf(dst_mm,        MAX_PATH, L"%sEFI\\ubuntu\\mmx64.efi",   esp_dir);
-    swprintf(dst_bootx64,   MAX_PATH, L"%sEFI\\BOOT\\BOOTX64.EFI",   esp_dir);
-    swprintf(dst_grub_boot, MAX_PATH, L"%sEFI\\BOOT\\grubx64.efi",   esp_dir);
-    swprintf(dst_mm_boot,   MAX_PATH, L"%sEFI\\BOOT\\mmx64.efi",     esp_dir);
+    wchar_t dst_boot[MAX_PATH], dst_grub_boot[MAX_PATH], dst_mm_boot[MAX_PATH];
+    swprintf(dst_grub,      MAX_PATH, L"%sEFI\\ubuntu\\grub" IP_EFI_SFX L".efi", esp_dir);
+    swprintf(dst_shim,      MAX_PATH, L"%sEFI\\ubuntu\\shim" IP_EFI_SFX L".efi", esp_dir);
+    swprintf(dst_mm,        MAX_PATH, L"%sEFI\\ubuntu\\mm" IP_EFI_SFX L".efi",   esp_dir);
+    swprintf(dst_boot,      MAX_PATH, L"%sEFI\\BOOT\\BOOT" IP_EFI_SFX_UP L".EFI", esp_dir);
+    swprintf(dst_grub_boot, MAX_PATH, L"%sEFI\\BOOT\\grub" IP_EFI_SFX L".efi",   esp_dir);
+    swprintf(dst_mm_boot,   MAX_PATH, L"%sEFI\\BOOT\\mm" IP_EFI_SFX L".efi",     esp_dir);
 
     if (u_extract_from_deb(grub_deb,
-        L"usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed", dst_grub) != 0) return -1;
+        L"usr/lib/grub/" IP_GRUB_PLATFORM L"-signed/grub" IP_EFI_SFX L".efi.signed", dst_grub) != 0) return -1;
     if (u_extract_from_deb(shim_deb,
-        L"usr/lib/shim/shimx64.efi.signed.latest", dst_shim) != 0) return -1;
+        L"usr/lib/shim/shim" IP_EFI_SFX L".efi.signed.latest", dst_shim) != 0) return -1;
     if (u_extract_from_deb(shim_deb,
-        L"usr/lib/shim/mmx64.efi", dst_mm) != 0) return -1;
+        L"usr/lib/shim/mm" IP_EFI_SFX L".efi", dst_mm) != 0) return -1;
     if (u_extract_from_deb(shim_deb,
-        L"usr/lib/shim/shimx64.efi.signed.latest", dst_bootx64) != 0) return -1;
+        L"usr/lib/shim/shim" IP_EFI_SFX L".efi.signed.latest", dst_boot) != 0) return -1;
     if (u_extract_from_deb(grub_deb,
-        L"usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed", dst_grub_boot) != 0) return -1;
+        L"usr/lib/grub/" IP_GRUB_PLATFORM L"-signed/grub" IP_EFI_SFX L".efi.signed", dst_grub_boot) != 0) return -1;
     if (u_extract_from_deb(shim_deb,
-        L"usr/lib/shim/mmx64.efi", dst_mm_boot) != 0) return -1;
+        L"usr/lib/shim/mm" IP_EFI_SFX L".efi", dst_mm_boot) != 0) return -1;
 
     return 0;
 }
@@ -868,12 +869,12 @@ static void ext4_mkdir_p(ext4_writer_t *ew, const char *path)
 static int stage_grub_modules(wchar_t iso_letter, ext4_writer_t *ew)
 {
     static const struct stage_spec specs[] = {
-        { L"g\\grub2-unsigned", L"grub-efi-amd64-bin_",
-          L"usr\\lib\\grub\\x86_64-efi",
-          "/usr/lib/grub/x86_64-efi" },
-        { L"g\\grub2-signed",   L"grub-efi-amd64-signed_",
-          L"usr\\lib\\grub\\x86_64-efi-signed",
-          "/usr/lib/grub/x86_64-efi-signed" },
+        { L"g\\grub2-unsigned", L"grub-efi-" IP_DEB_ARCH L"-bin_",
+          L"usr\\lib\\grub\\" IP_GRUB_PLATFORM,
+          "/usr/lib/grub/" IP_GRUB_PLATFORM_A },
+        { L"g\\grub2-signed",   L"grub-efi-" IP_DEB_ARCH L"-signed_",
+          L"usr\\lib\\grub\\" IP_GRUB_PLATFORM L"-signed",
+          "/usr/lib/grub/" IP_GRUB_PLATFORM_A "-signed" },
         { L"s\\shim-signed",    L"shim-signed_",
           L"usr\\lib\\shim",
           "/usr/lib/shim" },
@@ -1036,7 +1037,7 @@ static int stage_local_apt(wchar_t iso_letter, ext4_writer_t *ew)
         }
     }
 
-    /* dists/<release>/ — Release, Release.gpg, main/binary-amd64/Packages{,.gz} */
+    /* dists/<release>/ — Release, Release.gpg, main/binary-<arch>/Packages{,.gz} */
     {
         wchar_t src[MAX_PATH];
         swprintf(src, MAX_PATH, L"%c:\\dists", iso_letter);
@@ -1093,7 +1094,7 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "echo \"---- rootfs sanity check ----\"\n"
         "ls -la /usr/sbin/grub-install /usr/sbin/update-grub /usr/bin/hostnamectl /usr/sbin/useradd 2>&1 || true\n"
         "ls /etc/xdg/autostart/gnome-initial-setup* 2>&1 || true\n"
-        "ls /usr/lib/grub/x86_64-efi/ 2>&1 | head -5 || true\n"
+        "ls /usr/lib/grub/" IP_GRUB_PLATFORM_A "/ 2>&1 | head -5 || true\n"
         "ls /usr/lib/shim/ 2>&1 || true\n"
         "mountpoint /boot/efi 2>&1 || true\n"
         "echo \"---- end sanity check ----\"\n"
@@ -1103,7 +1104,7 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "echo \"==== STEP 1: grub-install + update-grub ====\"\n"
         "if command -v grub-install >/dev/null 2>&1; then\n"
         "    if mountpoint -q /boot/efi; then\n"
-        "        grub-install --target=x86_64-efi --efi-directory=/boot/efi \\\n"
+        "        grub-install --target=" IP_GRUB_PLATFORM_A " --efi-directory=/boot/efi \\\n"
         "                     --bootloader-id=ubuntu --recheck --no-nvram \\\n"
         "          && echo \"OK: grub-install\" || echo \"FAIL: grub-install rc=$?\"\n"
         "        update-grub && echo \"OK: update-grub\" || echo \"FAIL: update-grub rc=$?\"\n"
@@ -1451,11 +1452,11 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "        zstd -d \"$EXTRAS/wsl-mesa.tar.zst\" -c | tar -C / -x \\\n"
         "          && echo \"OK: wsl-mesa extracted to /opt/wsl-mesa\" \\\n"
         "          || echo \"FAIL: wsl-mesa extract\"\n"
-        "        echo /opt/wsl-mesa/lib/x86_64-linux-gnu > /etc/ld.so.conf.d/wsl-mesa.conf\n"
+        "        echo /opt/wsl-mesa/lib/" IP_MULTIARCH_A " > /etc/ld.so.conf.d/wsl-mesa.conf\n"
         "        install -d /etc/vulkan/icd.d\n"
-        "        if [ -f /opt/wsl-mesa/share/vulkan/icd.d/dzn_icd.x86_64.json ]; then\n"
-        "            ln -sf /opt/wsl-mesa/share/vulkan/icd.d/dzn_icd.x86_64.json \\\n"
-        "                   /etc/vulkan/icd.d/dzn_icd.x86_64.json\n"
+        "        if [ -f /opt/wsl-mesa/share/vulkan/icd.d/" IP_DZN_ICD_A " ]; then\n"
+        "            ln -sf /opt/wsl-mesa/share/vulkan/icd.d/" IP_DZN_ICD_A " \\\n"
+        "                   /etc/vulkan/icd.d/" IP_DZN_ICD_A "\n"
         "        fi\n"
         "    fi\n"
         "else\n"
@@ -1633,7 +1634,7 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "echo \"-- ldconfig + Vulkan ICD --\"\n"
         "_check_file /etc/ld.so.conf.d/appsandbox-wsl-deps.conf\n"
         "_check_file /etc/ld.so.conf.d/wsl-mesa.conf\n"
-        "_check_file /etc/vulkan/icd.d/dzn_icd.x86_64.json\n"
+        "_check_file /etc/vulkan/icd.d/" IP_DZN_ICD_A "\n"
         "echo \"-- grub cmdline drop-in --\"\n"
         "_check_file /etc/default/grub.d/99-appsandbox-no-efifb.cfg\n"
         "_check_glob '/opt/appsandbox/local-apt/pool/main/*'\n"
@@ -2123,7 +2124,7 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
             "    insmod ext2\n"
             "    set root='hd0,gpt2'\n"
             "    linux  /boot/vmlinuz-%s root=UUID=%s ro"
-            " console=tty0 console=ttyS0,115200\n"
+            " " IP_EARLYCON_A "console=tty0 console=" IP_SERIAL_A ",115200\n"
             "    initrd /boot/initrd.img-%s\n"
             "}\n",
             kernel_ver, uuid_text, kernel_ver);

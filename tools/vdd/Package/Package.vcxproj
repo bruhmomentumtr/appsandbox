@@ -113,7 +113,8 @@
 copy /Y "$(SolutionDir)ARM64\$(Configuration)\AppSandboxVDD\AppSandboxVDD.dll" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\"
 copy /Y "$(SolutionDir)ARM64\$(Configuration)\AppSandboxVDD\AppSandboxVDD.inf" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\"
 copy /Y "$(SolutionDir)ARM64\$(Configuration)\AppSandboxVDD\appsandboxvdd.cat" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\AppSandboxVDD.cat"
-powershell -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)ARM64\$(Configuration)\AppSandboxVDD\appsandboxvdd.cat'; if ($sig.SignerCertificate) { [IO.File]::WriteAllBytes('$(SolutionDir)bin\$(Configuration)-ARM64\drivers\AppSandboxVDD.cer', $sig.SignerCertificate.RawData) }"</Command>
+powershell -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)ARM64\$(Configuration)\AppSandboxVDD\appsandboxvdd.cat'; if ($sig.SignerCertificate) { [IO.File]::WriteAllBytes('$(SolutionDir)bin\$(Configuration)-ARM64\drivers\AppSandboxVDD.cer', $sig.SignerCertificate.RawData) }"
+copy /Y "$(SolutionDir)vendor\devcon\arm64\devcon.exe" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\"</Command>
       <Message>Copying VDD driver files to bin\$(Configuration)-ARM64\drivers\...</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
@@ -134,7 +135,8 @@ copy /Y "$(SolutionDir)vendor\devcon\devcon.exe" "$(SolutionDir)bin\$(Configurat
 copy /Y "$(SolutionDir)ARM64\$(Configuration)\AppSandboxVDD\AppSandboxVDD.dll" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\"
 copy /Y "$(SolutionDir)ARM64\$(Configuration)\AppSandboxVDD\AppSandboxVDD.inf" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\"
 copy /Y "$(SolutionDir)ARM64\$(Configuration)\AppSandboxVDD\appsandboxvdd.cat" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\AppSandboxVDD.cat"
-powershell -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)ARM64\$(Configuration)\AppSandboxVDD\appsandboxvdd.cat'; if ($sig.SignerCertificate) { [IO.File]::WriteAllBytes('$(SolutionDir)bin\$(Configuration)-ARM64\drivers\AppSandboxVDD.cer', $sig.SignerCertificate.RawData) }"</Command>
+powershell -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)ARM64\$(Configuration)\AppSandboxVDD\appsandboxvdd.cat'; if ($sig.SignerCertificate) { [IO.File]::WriteAllBytes('$(SolutionDir)bin\$(Configuration)-ARM64\drivers\AppSandboxVDD.cer', $sig.SignerCertificate.RawData) }"
+copy /Y "$(SolutionDir)vendor\devcon\arm64\devcon.exe" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\"</Command>
       <Message>Copying VDD driver files to bin\$(Configuration)-ARM64\drivers\...</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
