@@ -78,6 +78,7 @@ are native C / Objective-C with an HTML/JS UI (WebView2 on Windows, WKWebView on
 # Tips:
 [Windows] Enable hotkeys or mute the VM audio: connect to the VM and right-click the connection title bar  
 [Windows] Need a high performance remote desktop to remotely access your VM? [Phaze](https://phaze.app) works well
+[Windows] You can check if the GPU-PV driver setup is working by running gpu-test.exe inside your App Sandbox Windows VM, gpu-test.exe will show a box with 6 rotating cubes, each using a different rendering engine (D3D9, D3D10, D3D11, D3D12, OpenGL and Vulkan).  If one or more fail, they will not correctly show a rotating cube for that rendering API.  [gpu-test.zip](https://github.com/user-attachments/files/28667894/gpu-test.zip). Note: The rendering API succeeding means that the GPU-PV worked, but sometimes games or apps are coded in such a way that they will not detect the GPU-PV system correctly and still show an error.
 
 ## License
 
