@@ -49,28 +49,45 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 static GpuList g_gpu_list;
 
 /* Prepare the GL mapping-layer Plan9 share for a Windows GPU guest: ensure the
- * D3D mapping layers are fetched/cached on the host, place the OpenGL ICD shim
- * alongside them, then append the "AppSandbox.GlLayers" share. The guest agent
- * copies this share AFTER the GPU driver shares and provisions it (stages
- * dxil.dll to System32, sets AppInit_DLLs + the Khronos OpenCL/Vulkan ICD keys).
- * Best-effort: if the layers can't be fetched, no share is added and GL/CL/
- * Vulkan acceleration is simply unavailable. */
+ * D3D mapping layers (OpenCL/Vulkan/dxil) are fetched/cached on the host, stage
+ * Mesa's standalone OpenGL trio (opengl32/gallium_wgl/z-1) alongside them, then
+ * append the "AppSandbox.GlLayers" share. The guest agent copies this share
+ * AFTER the GPU driver shares and provisions it (deploys the Mesa trio + dxil.dll
+ * to System32, sets the Khronos OpenCL/Vulkan ICD keys). Best-effort: if the
+ * layers can't be fetched, no share is added and GL/CL/Vulkan acceleration is
+ * simply unavailable.
+ *
+ * The Mesa trio is vendored prebuilt per-arch (tools/win-mesa-gl/prebuilt) and
+ * staged into resources\win-mesa-gl by the build (only this build's arch, since
+ * host arch == guest arch). We copy it flat into the share dir, matching the
+ * flat layout the share already uses for the MS mapping layers. */
 static void prepare_gl_layers_share(GpuDriverShareList *shares)
 {
-    wchar_t dir[MAX_PATH], exe[MAX_PATH], src[MAX_PATH], dst[MAX_PATH], *slash;
+    static const wchar_t *const mesa_trio[] = {
+        L"opengl32.dll", L"gallium_wgl.dll", L"z-1.dll"
+    };
+    wchar_t dir[MAX_PATH], exe[MAX_PATH], res[MAX_PATH];
+    wchar_t src[MAX_PATH], dst[MAX_PATH], *slash;
+    int i;
 
     if (!d3dlayers_ensure_cached(dir, MAX_PATH))
         return;
 
-    /* Stage the OpenGL ICD shim into the same dir so one share carries it. */
+    /* Locate the staged Mesa trio (resources\win-mesa-gl beside the exe). */
     GetModuleFileNameW(NULL, exe, MAX_PATH);
     slash = wcsrchr(exe, L'\\');
     if (slash) *slash = L'\0';
-    swprintf_s(src, MAX_PATH, L"%s\\resources\\appsandbox_gl_shim.dll", exe);
-    if (GetFileAttributesW(src) == INVALID_FILE_ATTRIBUTES)
-        swprintf_s(src, MAX_PATH, L"%s\\appsandbox_gl_shim.dll", exe);
-    swprintf_s(dst, MAX_PATH, L"%s\\appsandbox_gl_shim.dll", dir);
-    CopyFileW(src, dst, FALSE);  /* best-effort; shim may not be built yet */
+    swprintf_s(res, MAX_PATH, L"%s\\resources\\win-mesa-gl", exe);
+    if (GetFileAttributesW(res) == INVALID_FILE_ATTRIBUTES)
+        swprintf_s(res, MAX_PATH, L"%s\\win-mesa-gl", exe);
+
+    /* Copy the trio flat into the share dir so it rides to the guest with the
+     * other mapping layers; the agent deploys it into System32. */
+    for (i = 0; i < (int)(sizeof(mesa_trio) / sizeof(mesa_trio[0])); i++) {
+        swprintf_s(src, MAX_PATH, L"%s\\%s", res, mesa_trio[i]);
+        swprintf_s(dst, MAX_PATH, L"%s\\%s", dir, mesa_trio[i]);
+        CopyFileW(src, dst, FALSE);  /* best-effort; trio may not be staged yet */
+    }
 
     gpu_append_gl_layers_share(shares, dir);
 }

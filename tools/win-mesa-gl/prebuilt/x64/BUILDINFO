@@ -1,0 +1,6 @@
+mesa-version : 26.1.2
+mesa-branch  : 26.1
+arch         : x64
+built-on     : Sat 06/06/2026 18:44:19.39
+toolchain    : C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat x64
+gallium      : d3d12  (video-codecs=all, llvm=disabled, b_vscrt=mt)

@@ -1,0 +1,14 @@
+; Meson cross file: build ARM64 Mesa from an x64 host (vcvarsall x64_arm64).
+; Required so meson selects ARM64 SIMD/BLAKE3 sources instead of the host's x64
+; ones.
+[binaries]
+c = 'cl'
+cpp = 'cl'
+ar = 'lib'
+windres = 'rc'
+
+[host_machine]
+system = 'windows'
+cpu_family = 'aarch64'
+cpu = 'aarch64'
+endian = 'little'
