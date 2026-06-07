@@ -104,6 +104,7 @@
       <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
 xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
 xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)."
+xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\arm64\*.dll" "$(OutDir)resources\win-mesa-gl\"
 </Command>
       <Message>Copying resources, web UI, and WebView2Loader to output directory...</Message>
     </PostBuildEvent>
@@ -130,6 +131,7 @@ xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)."
       <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
 xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
 xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)."
+xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resources\win-mesa-gl\"
 </Command>
       <Message>Copying resources, web UI, and WebView2Loader to output directory...</Message>
     </PostBuildEvent>
@@ -160,6 +162,7 @@ xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)."
       <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
 xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
 xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)."
+xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\arm64\*.dll" "$(OutDir)resources\win-mesa-gl\"
 </Command>
       <Message>Copying resources, web UI, and WebView2Loader to output directory...</Message>
     </PostBuildEvent>
@@ -190,6 +193,7 @@ xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)."
       <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
 xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
 xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)."
+xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resources\win-mesa-gl\"
 </Command>
       <Message>Copying resources, web UI, and WebView2Loader to output directory...</Message>
     </PostBuildEvent>

@@ -424,6 +424,13 @@ FodyWeavers.xsd
 !/vendor/devcon/arm64
 !/vendor/devcon/arm64/**
 
+# Vendored prebuilt Mesa OpenGL trio — explicit un-ignore (the x64/ and arm64/
+# rules above otherwise catch them, same as webview2/devcon).
+!/tools/win-mesa-gl/prebuilt/x64
+!/tools/win-mesa-gl/prebuilt/x64/**
+!/tools/win-mesa-gl/prebuilt/arm64
+!/tools/win-mesa-gl/prebuilt/arm64/**
+
 # Local-only planning and notes — kept on disk for context, not pushed.
 /docs/
 

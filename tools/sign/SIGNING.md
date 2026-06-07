@@ -17,9 +17,10 @@ token and **(b)** a Microsoft Partner Center *Hardware* account can reproduce it
 
 | Artifact | Signing | Tool |
 | --- | --- | --- |
-| `AppSandbox.exe`, `appsandbox_core.dll`, `appsandbox_gl_shim.dll`, `iso-patch.exe`, the 6 `appsandbox-*.exe` (host + the guest copies under `resources\`) | **EV Authenticode** (your cert) | `signtool` |
+| `AppSandbox.exe`, `appsandbox_core.dll`, `iso-patch.exe`, the 6 `appsandbox-*.exe` (host + the guest copies under `resources\`) | **EV Authenticode** (your cert) | `signtool` |
 | `AppSandboxVDD.{dll,inf,cat}`, `AppSandboxVAD.{sys,inf,cat}` | **EV-signed** (binary + catalog) **then Microsoft attestation** — you EV-sign the `.sys`/`.dll`, regenerate + EV-sign the `.cat`, EV-sign the CAB; Microsoft returns the package with the **catalog MS-signed** (the binary keeps your EV signature) | `signtool` + `inf2cat` + `makecab` + Hardware API |
 | `WebView2Loader.dll` | already Microsoft-signed — **not** re-signed | — |
+| Mesa GL trio — `opengl32.dll`, `gallium_wgl.dll`, `z-1.dll` (both arches, vendored in `tools/win-mesa-gl/prebuilt`) | **EV Authenticode**, **pre-signed once** via `tools/win-mesa-gl/build/sign-mesa.ps1` (they are prebuilt, not built at release time; `make-release.ps1` skips files already signed by our cert, so it does not re-sign them) | `signtool` |
 
 Two different signatures because kernel-mode / UMDF drivers will not load on retail
 Windows from a self/EV signature alone — they need Microsoft's signature, obtained

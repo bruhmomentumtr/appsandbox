@@ -392,17 +392,41 @@ static BOOL logoff_session(DWORD session_id)
     return result;
 }
 
+/* Run a command hidden and wait for it (used for takeown/icacls). The cmd buffer
+   must be writable (CreateProcessW may modify it). */
+static void run_quiet(wchar_t *cmd)
+{
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                       NULL, NULL, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 30000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+}
+
+/* File size in bytes, or (ULONGLONG)-1 if the file is absent. */
+static ULONGLONG file_size_w(const wchar_t *path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad))
+        return (ULONGLONG)-1;
+    return ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+}
+
 /* Provision the D3D mapping layers after the agent has copied them into `dir`
-   (C:\Windows\AppSandbox\d3dlayers) over Plan9. Runs as SYSTEM from the GPU
-   copy thread, AFTER the GPU driver copy. Stages dxil.dll into System32 (the
-   layers load it by leaf name) and registers the ICDs: OpenGL via AppInit_DLLs
-   (full path to the shim), OpenCL + Vulkan via their Khronos registry keys.
-   Each step is gated on the file being present; idempotent across boots. */
+   (C:\Windows\AppSandbox\d3dlayers) over Plan9. Runs as SYSTEM from the GPU copy
+   thread, AFTER the GPU driver copy. Deploys Mesa's standalone opengl32 trio +
+   dxil.dll into System32 and registers the OpenCL + Vulkan ICDs via their Khronos
+   registry keys. Idempotent + self-healing across boots. */
 static void gl_provision(const wchar_t *dir)
 {
     wchar_t path[MAX_PATH], sys[MAX_PATH], dst[MAX_PATH];
     HKEY key;
-    DWORD one = 1, zero = 0;
+    DWORD zero = 0;
 
     agent_log("GL: provisioning mapping layers from %ls", dir);
 
@@ -418,25 +442,45 @@ static void gl_provision(const wchar_t *dir)
         }
     }
 
-    /* OpenGL: AppInit_DLLs = full path to the shim; enable; allow unsigned. */
-    swprintf_s(path, MAX_PATH, L"%s\\appsandbox_gl_shim.dll", dir);
-    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
-        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE,
-                L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows",
-                0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL) == ERROR_SUCCESS) {
-            RegSetValueExW(key, L"AppInit_DLLs", 0, REG_SZ,
-                           (const BYTE *)path, (DWORD)((wcslen(path) + 1) * sizeof(wchar_t)));
-            RegSetValueExW(key, L"LoadAppInit_DLLs", 0, REG_DWORD,
-                           (const BYTE *)&one, sizeof(one));
-            RegSetValueExW(key, L"RequireSignedAppInit_DLLs", 0, REG_DWORD,
-                           (const BYTE *)&zero, sizeof(zero));
-            RegCloseKey(key);
-            agent_log("GL: AppInit_DLLs set to %ls", path);
+    /* OpenGL: deploy Mesa's standalone opengl32 trio into System32. */
+    if (GetSystemDirectoryW(sys, MAX_PATH)) {
+        wchar_t srcdll[MAX_PATH], dstdll[MAX_PATH], bak[MAX_PATH], oldp[MAX_PATH];
+        wchar_t cmd[MAX_PATH * 2];
+
+        /* gallium_wgl.dll + z-1.dll: copied into System32 (opengl32 imports them). */
+        swprintf_s(srcdll, MAX_PATH, L"%s\\gallium_wgl.dll", dir);
+        swprintf_s(dstdll, MAX_PATH, L"%s\\gallium_wgl.dll", sys);
+        CopyFileW(srcdll, dstdll, FALSE);
+        swprintf_s(srcdll, MAX_PATH, L"%s\\z-1.dll", dir);
+        swprintf_s(dstdll, MAX_PATH, L"%s\\z-1.dll", sys);
+        CopyFileW(srcdll, dstdll, FALSE);
+
+        /* opengl32.dll is TrustedInstaller-owned and memory-mapped. Replace it
+           only when it isn't already our build (size differs) — self-heals if
+           Windows servicing/SFC restores Microsoft's. Back up the MS copy once,
+           take ownership + grant SYSTEM, rename the in-use file aside, copy ours. */
+        swprintf_s(srcdll, MAX_PATH, L"%s\\opengl32.dll", dir);
+        swprintf_s(dstdll, MAX_PATH, L"%s\\opengl32.dll", sys);
+        if (file_size_w(srcdll) != (ULONGLONG)-1 &&
+            file_size_w(srcdll) != file_size_w(dstdll)) {
+            swprintf_s(bak,  MAX_PATH, L"%s\\opengl32.dll.msbak", sys);
+            swprintf_s(oldp, MAX_PATH, L"%s\\opengl32.dll.old", sys);
+            if (file_size_w(bak) == (ULONGLONG)-1)
+                CopyFileW(dstdll, bak, TRUE);  /* back up pristine MS copy once */
+            swprintf_s(cmd, MAX_PATH * 2, L"%s\\takeown.exe /f \"%s\"", sys, dstdll);
+            run_quiet(cmd);
+            swprintf_s(cmd, MAX_PATH * 2, L"%s\\icacls.exe \"%s\" /grant *S-1-5-18:F", sys, dstdll);
+            run_quiet(cmd);
+            MoveFileExW(dstdll, oldp, MOVEFILE_REPLACE_EXISTING);  /* rename in-use aside */
+            if (CopyFileW(srcdll, dstdll, FALSE))
+                agent_log("GL: deployed Mesa opengl32 trio to System32.");
+            else
+                agent_log("GL: opengl32 -> System32 failed (%lu).", GetLastError());
         } else {
-            agent_log("GL: failed to open AppInit_DLLs key.");
+            agent_log("GL: Mesa opengl32 already current in System32.");
         }
     } else {
-        agent_log("GL: shim not present in share; OpenGL not enabled.");
+        agent_log("GL: GetSystemDirectory failed; OpenGL not deployed.");
     }
 
     /* OpenCL: Khronos vendor key — value name = ICD path, data 0 (= load it). */
@@ -520,8 +564,8 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
     }
 
     /* Provision the GL/CL/Vulkan mapping layers now — AFTER the GPU driver copy
-       but BEFORE the device disable/enable cycle, so the ICD configuration
-       (AppInit_DLLs + Khronos OpenCL/Vulkan keys + dxil.dll in System32) is in
+       but BEFORE the device disable/enable cycle, so the GL configuration (Mesa
+       opengl32 trio + dxil.dll in System32, Khronos OpenCL/Vulkan keys) is in
        place when the GPU device is restarted below. */
     if (gl_dir[0])
         gl_provision(gl_dir);
