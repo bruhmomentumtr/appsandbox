@@ -386,7 +386,15 @@ static LRESULT CALLBACK idd_render_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     switch (msg) {
     case WM_ERASEBKGND:
         return 1;
-    case WM_PAINT:
+    case WM_PAINT: {
+        /* Validate this window's update region; repaint once for expose/resize
+           (rendering is otherwise push-driven by received frames). */
+        PAINTSTRUCT ps;
+        BeginPaint(hwnd, &ps);
+        EndPaint(hwnd, &ps);
+        SendMessageW(GetParent(hwnd), WM_IDD_FRAME_READY, 0, 0);
+        return 0;
+    }
     case WM_MOUSEMOVE:
     case WM_LBUTTONDOWN: case WM_LBUTTONUP:
     case WM_RBUTTONDOWN: case WM_RBUTTONUP:
@@ -1211,6 +1219,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
     RECT rc;
     HRESULT hr;
     float clear_color[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    BOOL frame_uploaded = FALSE;
 
     if (!d->device || !d->ctx || !d->swap_chain || !d->rtv)
         return;
@@ -1239,6 +1248,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
         }
         d->frame_dirty = FALSE;
         LeaveCriticalSection(&d->frame_cs);
+        frame_uploaded = TRUE;
     }
 
     /* Compute letterboxed viewport within client area */
@@ -1256,7 +1266,8 @@ static void d3d_render_frame(VmDisplayIdd *d)
         vp.MaxDepth = 1.0f;
     }
 
-    if (d->render_count % 60 == 0 && d->hwnd) {
+    /* Refresh the title once per uploaded frame (~frame rate). */
+    if (frame_uploaded && d->hwnd) {
         wchar_t title[256];
         swprintf_s(title, 256, L"%s%s Display %ux%u recv=%u",
                    d->audio_muted ? L"\U0001F507 " : L"",
