@@ -544,7 +544,7 @@ BOOL json_get_string(const wchar_t *json, const wchar_t *key,
     if (!p) return FALSE;
 
     p += wcslen(pattern);
-    while (*p == L' ' || *p == L':') p++;
+    while (*p == L' ' || *p == L':' || *p == L'\t' || *p == L'\n' || *p == L'\r') p++;
     if (*p != L'"') return FALSE;
     p++;
     start = p;
@@ -571,7 +571,7 @@ BOOL json_get_int(const wchar_t *json, const wchar_t *key, int *out)
     if (!p) return FALSE;
 
     p += wcslen(pattern);
-    while (*p == L' ' || *p == L':') p++;
+    while (*p == L' ' || *p == L':' || *p == L'\t' || *p == L'\n' || *p == L'\r') p++;
 
     /* Handle quoted numbers from JS */
     if (*p == L'"') p++;
@@ -589,7 +589,7 @@ BOOL json_get_bool(const wchar_t *json, const wchar_t *key, BOOL *out)
     if (!p) return FALSE;
 
     p += wcslen(pattern);
-    while (*p == L' ' || *p == L':') p++;
+    while (*p == L' ' || *p == L':' || *p == L'\t' || *p == L'\n' || *p == L'\r') p++;
     *out = (*p == L't' || *p == L'T') ? TRUE : FALSE;
     return TRUE;
 }

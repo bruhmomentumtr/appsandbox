@@ -46,6 +46,7 @@ typedef struct {
     BOOL    is_template;              /* TRUE = template creation (no GPU/network) */
     BOOL    test_mode;               /* TRUE = disable Secure Boot (for test-signed drivers) */
     BOOL    ssh_enabled;             /* TRUE = install OpenSSH Server in guest */
+    BOOL    ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
 } VmConfig;
 
 /* Runtime state of a VM */
@@ -101,7 +102,11 @@ typedef struct {
     wchar_t     admin_user[128];          /* Guest local admin username */
     BOOL        ssh_enabled;             /* TRUE = OpenSSH Server installed in guest */
     DWORD       ssh_port;                /* Host-side TCP port for SSH tunnel (e.g. 2222) */
-    volatile int ssh_state;              /* 0=pending, 1=installing, 2=ready, 3=failed */
+    volatile int ssh_state;              /* 0=pending, 1=installing, 2=ready, 3=failed
+                                            (reported as 4 when ready && ssh_key_deployed) */
+    BOOL        ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key to the guest */
+    volatile BOOL ssh_key_deployed;      /* TRUE once the guest agent has written authorized_keys */
+    wchar_t     ssh_pubkey[512];         /* AppSandbox public-key line to deploy (ed25519) */
 } VmInstance;
 
 /* Initialize HCS - loads computecore.dll dynamically.

@@ -17,7 +17,9 @@
 #include <sys/types.h>
 #include <sys/select.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#include <pwd.h>
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
@@ -399,6 +401,48 @@ static void handle_ssh_enable(int client, const char *tag) {
     send_reply(client, tag, "ssh_ready");
 }
 
+/* Find the primary interactive macOS account (uid >= 501, home under /Users). */
+static int find_primary_user(char *home, size_t hsz, uid_t *uid, gid_t *gid) {
+    struct passwd *pw;
+    int found = 0;
+    setpwent();
+    while ((pw = getpwent())) {
+        if (pw->pw_uid < 501) continue;
+        if (!pw->pw_dir || strncmp(pw->pw_dir, "/Users/", 7) != 0) continue;
+        snprintf(home, hsz, "%s", pw->pw_dir);
+        *uid = pw->pw_uid; *gid = pw->pw_gid; found = 1;
+        break;
+    }
+    endpwent();
+    return found;
+}
+
+/* ssh_deploy_key: write the AppSandbox public key into the primary user's
+ * ~/.ssh/authorized_keys (0700 dir, 0600 file, owned by the user). */
+static int deploy_ssh_key(const char *pubkey) {
+    char home[256], sshdir[320], authk[400];
+    uid_t uid; gid_t gid;
+    FILE *f;
+    if (!pubkey || !*pubkey) return 0;
+    if (!find_primary_user(home, sizeof(home), &uid, &gid)) {
+        agent_log("ssh key: no primary /Users user found");
+        return 0;
+    }
+    snprintf(sshdir, sizeof(sshdir), "%s/.ssh", home);
+    snprintf(authk, sizeof(authk), "%s/authorized_keys", sshdir);
+    mkdir(sshdir, 0700);
+    f = fopen(authk, "w");
+    if (!f) { agent_log("ssh key: cannot write %s", authk); return 0; }
+    fprintf(f, "%s\n", pubkey);
+    fclose(f);
+    chmod(sshdir, 0700);
+    chmod(authk, 0600);
+    if (chown(sshdir, uid, gid) != 0 || chown(authk, uid, gid) != 0)
+        agent_log("ssh key: chown warning");
+    agent_log("ssh key: deployed to %s", authk);
+    return 1;
+}
+
 static void handle_client(int client) {
     char buf[512];
 
@@ -497,6 +541,8 @@ static void handle_client(int client) {
             send_reply(client, tag, "ok");
         } else if (strcmp(cmd, "ssh_enable") == 0) {
             handle_ssh_enable(client, tag);
+        } else if (strncmp(cmd, "ssh_deploy_key ", 15) == 0) {
+            send_reply(client, tag, deploy_ssh_key(cmd + 15) ? "ssh_key_deployed" : "ssh_key_failed");
         } else if (strcmp(cmd, "shutdown") == 0) {
             /* Reply first so the host hears "ok" before shutdown kills us.
              * Then fork+exec /sbin/shutdown -h now so it runs independently

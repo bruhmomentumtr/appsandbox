@@ -156,7 +156,8 @@
             <label>Options:</label>
             <div class="form-row">
                 <label class="win-only" title="Disable Secure Boot and enable test-signing"><input type="checkbox" id="test-mode"> Test Mode</label>
-                <label title="Exposes the VM's sshd on a host-loopback port, tunnelled over vsock"><input type="checkbox" id="ssh-enabled"> SSH Server</label>
+                <label title="Exposes the VM's sshd on a host-loopback port, tunnelled over vsock"><input type="checkbox" id="ssh-enabled" onchange="onSshToggle()"> SSH Server</label>
+                <label title="Deploy the AppSandbox SSH public key so you can connect with key auth (requires SSH Server)"><input type="checkbox" id="ssh-deploy-key" disabled> Deploy SSH key</label>
             </div>
         </div>
         <div class="modal-buttons">

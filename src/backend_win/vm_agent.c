@@ -204,6 +204,21 @@ static void notify_agent_status(VmInstance *vm)
         PostMessageW(g_agent_hwnd, WM_VM_AGENT_STATUS, 0, (LPARAM)vm);
 }
 
+/* Fire-and-forget: ask the guest agent to write the AppSandbox public key into
+   authorized_keys. The guest replies async (untagged) "ssh_key_deployed" or
+   "ssh_key_failed" (handled in process_async_message). Sent once SSH is ready;
+   no-op if not requested, already done, or the key is missing. */
+static void vm_agent_send_deploy_key(SOCKET s, VmInstance *vm)
+{
+    char cmd[640], pubkey_a[512];
+    if (!vm->ssh_deploy_key || !vm->ssh_pubkey[0] || vm->ssh_key_deployed)
+        return;
+    WideCharToMultiByte(CP_UTF8, 0, vm->ssh_pubkey, -1, pubkey_a, sizeof(pubkey_a), NULL, NULL);
+    sprintf_s(cmd, sizeof(cmd), "ssh_deploy_key %s", pubkey_a);
+    send_line(s, cmd);
+    ui_log(L"Requested SSH key deploy for \"%s\".", vm->name);
+}
+
 /* Process an untagged (async) message from the agent.
    Returns: 0 = handled, 1 = os_shutdown (caller should break),
             2 = service_stopping (caller should break and let the reconnect
@@ -272,6 +287,14 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
         vm->ssh_state = 2;
         vm_ssh_proxy_start(vm);
         ui_log(L"SSH ready for \"%s\".", vm->name);
+        vm_agent_send_deploy_key(s, vm);   /* deploy the AppSandbox key now SSH is up */
+        notify_agent_status(vm);
+    } else if (strcmp(buf, "ssh_key_deployed") == 0) {
+        vm->ssh_key_deployed = TRUE;
+        ui_log(L"SSH key deployed for \"%s\".", vm->name);
+        notify_agent_status(vm);
+    } else if (strcmp(buf, "ssh_key_failed") == 0) {
+        ui_log(L"SSH key deploy FAILED for \"%s\".", vm->name);
         notify_agent_status(vm);
     } else if (strcmp(buf, "ssh_failed") == 0) {
         vm->ssh_state = 3;
@@ -414,6 +437,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                 vm->ssh_state = 2;
                 vm_ssh_proxy_start(vm);
                 ui_log(L"SSH ready for \"%s\".", vm->name);
+                vm_agent_send_deploy_key(s, vm);   /* deploy the AppSandbox key now SSH is up */
             } else if (strcmp(buf, "ssh_installing") == 0) {
                 vm->ssh_state = 1;
                 ui_log(L"SSH installing for \"%s\"...", vm->name);

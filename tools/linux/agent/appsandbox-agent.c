@@ -750,6 +750,56 @@ static void start_ssh_proxy(void)
     }
 }
 
+/* Find the primary interactive account (the one firstboot's useradd created):
+ * a real /home user with a login shell. The username is user-chosen, so we scan
+ * the passwd db rather than hardcode it. Returns 1 on success. */
+static int find_primary_user(char *home, size_t hsz, uid_t *uid, gid_t *gid)
+{
+    struct passwd *pw;
+    int found = 0;
+    setpwent();
+    while ((pw = getpwent())) {
+        const char *sh, *b;
+        if (pw->pw_uid < 1000 || pw->pw_uid >= 65534) continue;
+        if (!pw->pw_dir || strncmp(pw->pw_dir, "/home/", 6) != 0) continue;
+        sh = pw->pw_shell ? pw->pw_shell : "";
+        b = strrchr(sh, '/'); b = b ? b + 1 : sh;
+        if (strcmp(b, "nologin") == 0 || strcmp(b, "false") == 0) continue;
+        snprintf(home, hsz, "%s", pw->pw_dir);
+        *uid = pw->pw_uid; *gid = pw->pw_gid; found = 1;
+        break;
+    }
+    endpwent();
+    return found;
+}
+
+/* ssh_deploy_key: write the AppSandbox public key into the primary user's
+ * ~/.ssh/authorized_keys (0700 dir, 0600 file, owned by the user). */
+static int deploy_ssh_key(const char *pubkey)
+{
+    char home[256], sshdir[320], authk[400];
+    uid_t uid; gid_t gid;
+    FILE *f;
+    if (!pubkey || !*pubkey) return 0;
+    if (!find_primary_user(home, sizeof(home), &uid, &gid)) {
+        agent_log("ssh key: no primary /home user found");
+        return 0;
+    }
+    snprintf(sshdir, sizeof(sshdir), "%s/.ssh", home);
+    snprintf(authk, sizeof(authk), "%s/authorized_keys", sshdir);
+    mkdir(sshdir, 0700);
+    f = fopen(authk, "w");
+    if (!f) { agent_log("ssh key: cannot write %s: %s", authk, strerror(errno)); return 0; }
+    fprintf(f, "%s\n", pubkey);
+    fclose(f);
+    chmod(sshdir, 0700);
+    chmod(authk, 0600);
+    if (chown(sshdir, uid, gid) != 0 || chown(authk, uid, gid) != 0)
+        agent_log("ssh key: chown warning: %s", strerror(errno));
+    agent_log("ssh key: deployed to %s", authk);
+    return 1;
+}
+
 /* ssh_enable: enable+start openssh-server, then start the vsock:7 →
  * localhost:22 proxy. Reply: ssh_ready/ssh_failed. Idempotent — repeat
  * calls just confirm state. */
@@ -1049,6 +1099,9 @@ static void handle_client(int fd)
         }
         else if (strcmp(cmd, "ssh_enable") == 0) {
             handle_ssh_enable(fd, tag);
+        }
+        else if (strncmp(cmd, "ssh_deploy_key ", 15) == 0) {
+            send_reply(fd, tag, deploy_ssh_key(cmd + 15) ? "ssh_key_deployed" : "ssh_key_failed");
         }
         else if (strcmp(cmd, "idd_connect") == 0) {
             /* Mirror Windows handle_idd_connect (tools/agent/agent.c:1485):

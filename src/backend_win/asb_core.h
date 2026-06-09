@@ -60,6 +60,7 @@ typedef struct {
     const wchar_t *password;
     BOOL   test_mode;              /* TRUE = disable Secure Boot (test-signed drivers) */
     BOOL   ssh_enabled;            /* TRUE = install OpenSSH Server in guest */
+    BOOL   ssh_deploy_key;         /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
     BOOL   is_template;            /* TRUE = create as template VM */
 } AsbVmConfig;
 
@@ -180,6 +181,9 @@ ASB_API HRESULT asb_snap_rename(AsbVm vm, int snap_idx, int branch_idx,
                                  const wchar_t *new_name);
 
 ASB_API int     asb_snap_count(AsbVm vm);
+/* Number of branches forked directly off the base disk (snap_idx -2). Pair with
+   asb_snap_get_branch_info(vm, -2, b) to enumerate them, like asb_snap_count. */
+ASB_API int     asb_snap_base_branch_count(AsbVm vm);
 ASB_API BOOL    asb_snap_get_info(AsbVm vm, int snap_idx, AsbSnapshotInfo *out);
 ASB_API BOOL    asb_snap_get_branch_info(AsbVm vm, int snap_idx, int branch_idx,
                                           AsbBranchInfo *out);
