@@ -21,6 +21,8 @@ typedef void (^VmAgentOnlineChange)(BOOL online);
 typedef void (^VmAgentLog)(NSString *line);
 /* Mirrors Windows ssh_state: 0=disabled, 1=installing, 2=ready, 3=failed. */
 typedef void (^VmAgentSshStateChange)(int state);
+/* Fires on main queue with the guest's ssh_key_deployed / ssh_key_failed reply. */
+typedef void (^VmAgentKeyDeployed)(BOOL ok);
 
 @interface VmAgentMac : NSObject
 
@@ -42,6 +44,15 @@ typedef void (^VmAgentSshStateChange)(int state);
 /* Fires on main queue when the guest-reported ssh state changes
  * (synchronous reply to ssh_enable + any async ssh_ready/ssh_failed). */
 @property (nonatomic, copy, nullable)     VmAgentSshStateChange onSshStateChange;
+
+/* Set before start: the AppSandbox public-key line to deploy, or nil. When
+ * set, the agent sends `ssh_deploy_key <line>` FIRE-AND-FORGET as soon as SSH
+ * is ready (mirrors Windows vm_agent.c) -- not via the blocking tagged-command
+ * channel, whose 5 s socket-recv cap would drop a slow reply (the guest's
+ * getpwent can be cold on a freshly booted VM). The async ssh_key_deployed /
+ * ssh_key_failed reply fires onKeyDeployed. */
+@property (nonatomic, copy, nullable)     NSString *deployKeyLine;
+@property (nonatomic, copy, nullable)     VmAgentKeyDeployed onKeyDeployed;
 
 - (instancetype)initWithName:(NSString *)vmName
                 socketDevice:(VZVirtioSocketDevice *)device;

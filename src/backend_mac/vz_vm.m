@@ -7,6 +7,10 @@
 @property (nonatomic, strong, readwrite) NSString *name;
 @end
 
+static BOOL g_no_audio = NO;
+
+void vz_vm_set_no_audio(BOOL no_audio) { g_no_audio = no_audio; }
+
 static VZVirtioSoundDeviceConfiguration *BuildAudio(BOOL withInput) {
     VZVirtioSoundDeviceConfiguration *audio = [[VZVirtioSoundDeviceConfiguration alloc] init];
     NSMutableArray *streams = [NSMutableArray array];
@@ -176,7 +180,9 @@ static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
     config.pointingDevices = @[[[VZMacTrackpadConfiguration alloc] init],
                                 [[VZUSBScreenCoordinatePointingDeviceConfiguration alloc] init]];
     config.keyboards = @[[[VZUSBKeyboardConfiguration alloc] init]];
-    config.audioDevices = @[BuildAudio(YES)];
+    /* Headless daemons run without audio: the host-mic input stream would
+       block on a TCC prompt no daemon can show. (The GUI keeps full audio.) */
+    config.audioDevices = g_no_audio ? @[] : @[BuildAudio(YES)];
     config.socketDevices = @[[[VZVirtioSocketDeviceConfiguration alloc] init]];
 
     if (![config validateWithError:error]) return nil;

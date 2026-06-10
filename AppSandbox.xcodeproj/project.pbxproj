@@ -13,9 +13,11 @@
 		2005000000000000000000AA /* MainWindowController.m in Sources */ = {isa = PBXBuildFile; fileRef = 1005000000000000000000AA /* MainWindowController.m */; };
 		2007000000000000000000AA /* ui.m in Sources */ = {isa = PBXBuildFile; fileRef = 1007000000000000000000AA /* ui.m */; };
 		2008000000000000000000AA /* EventLogWindow.m in Sources */ = {isa = PBXBuildFile; fileRef = 1050000000000000000000AA /* EventLogWindow.m */; };
+		2009000000000000000000AA /* headless.m in Sources */ = {isa = PBXBuildFile; fileRef = 1052000000000000000000AA /* headless.m */; };
 		/* App target — Frameworks */
 		4001000000000000000000AA /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3001000000000000000000AA /* Cocoa.framework */; };
 		4002000000000000000000AA /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3002000000000000000000AA /* WebKit.framework */; };
+		4003000000000000000000AA /* Virtualization.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3003000000000000000000AA /* Virtualization.framework */; };
 		4010000000000000000000BB /* AppSandboxCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C002000000000000000000BB /* AppSandboxCore.framework */; };
 		/* App target — Resources */
 		6003000000000000000000AA /* web in Resources */ = {isa = PBXBuildFile; fileRef = 5003000000000000000000AA /* web */; };
@@ -142,6 +144,8 @@
 		1007000000000000000000AA /* ui.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ui.m; sourceTree = "<group>"; };
 		1050000000000000000000AA /* EventLogWindow.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = EventLogWindow.m; sourceTree = "<group>"; };
 		1051000000000000000000AA /* EventLogWindow.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = EventLogWindow.h; sourceTree = "<group>"; };
+		1052000000000000000000AA /* headless.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = headless.m; sourceTree = "<group>"; };
+		1053000000000000000000AA /* headless.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = headless.h; sourceTree = "<group>"; };
 		1019000000000000000000AA /* asb_core_mac.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = asb_core_mac.m; sourceTree = "<group>"; };
 		101A000000000000000000AA /* asb_core_mac.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = asb_core_mac.h; sourceTree = "<group>"; };
 		1009000000000000000000AA /* host_info.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = host_info.h; sourceTree = "<group>"; };
@@ -197,6 +201,7 @@
 			files = (
 				4001000000000000000000AA /* Cocoa.framework in Frameworks */,
 				4002000000000000000000AA /* WebKit.framework in Frameworks */,
+				4003000000000000000000AA /* Virtualization.framework in Frameworks */,
 				4010000000000000000000BB /* AppSandboxCore.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -298,6 +303,8 @@
 				1007000000000000000000AA /* ui.m */,
 				1051000000000000000000AA /* EventLogWindow.h */,
 				1050000000000000000000AA /* EventLogWindow.m */,
+				1053000000000000000000AA /* headless.h */,
+				1052000000000000000000AA /* headless.m */,
 				5001000000000000000000AA /* Info.plist */,
 				5002000000000000000000AA /* AppSandbox.entitlements */,
 				5004000000000000000000AA /* Assets.xcassets */,
@@ -412,6 +419,7 @@
 				D001000000000000000000BB /* PBXTargetDependency */,
 				E020000000000000000000CC /* PBXTargetDependency */,
 				E030000000000000000000DD /* PBXTargetDependency */,
+				E040000000000000000000EE /* PBXTargetDependency */,
 			);
 			name = AppSandbox;
 			productName = AppSandbox;
@@ -606,6 +614,7 @@
 				2005000000000000000000AA /* MainWindowController.m in Sources */,
 				2007000000000000000000AA /* ui.m in Sources */,
 				2008000000000000000000AA /* EventLogWindow.m in Sources */,
+				2009000000000000000000AA /* headless.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

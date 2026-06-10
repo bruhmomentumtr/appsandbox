@@ -24,6 +24,7 @@
 @property (nonatomic, assign) uint64_t lastHeartbeatMs;
 @property (nonatomic, assign) BOOL stopRequested;
 @property (nonatomic, assign) BOOL running;
+@property (nonatomic, assign) BOOL keyDeploySent;   /* once-per-connection guard */
 @end
 
 @implementation VmAgentMac
@@ -106,6 +107,7 @@
 
         [self logFmt:@"Agent online for \"%@\".", self.vmName];
         self.lastHeartbeatMs = [self nowMs];
+        self.keyDeploySent = NO;   /* re-attempt deploy on each (re)connection until it lands */
         [self setOnlineOnMain:YES];
 
         /* Request SSH bring-up if configured. Matches Windows vm_agent.c. */
@@ -146,8 +148,15 @@
                 NSString *prefix = [NSString stringWithFormat:@"%u:", _cmdSeq];
                 NSString *resp = [self readTaggedResponse:fd prefix:prefix];
                 if (!resp) {
+                    /* Timed out waiting for THIS command's reply. The guest may
+                     * just be briefly busy (its accept loop is single-threaded);
+                     * that must NOT tear the whole agent connection down. Hand
+                     * the timeout to the waiter but KEEP the connection -- a
+                     * genuinely dead socket is caught by the read loop below
+                     * (recvLine <= 0 -> break). A late reply arrives harmlessly
+                     * as an (ignored) async line. */
                     [self deliverResponse:nil];
-                    break;
+                    continue;
                 }
                 [self deliverResponse:resp];
                 continue;
@@ -249,6 +258,25 @@
     if (cb) {
         dispatch_async(dispatch_get_main_queue(), ^{ cb(state); });
     }
+    /* SSH up -> deploy the AppSandbox key now (fire-and-forget; the guest
+     * replies async). Same trigger point as Windows vm_agent.c. */
+    if (state == 2) [self sendDeployKeyIfNeeded];
+}
+
+/* Fire-and-forget `ssh_deploy_key <line>` on the live socket. The guest's
+ * untagged ssh_key_deployed / ssh_key_failed reply is picked up by the async
+ * read loop (processAsyncMessage). Once per connection. */
+- (void)sendDeployKeyIfNeeded {
+    NSString *line = self.deployKeyLine;
+    if (!line.length || self.keyDeploySent) return;
+    int s;
+    @synchronized (self) { s = _sock; }
+    if (s < 0) return;
+    NSString *cmd = [NSString stringWithFormat:@"ssh_deploy_key %@", line];
+    if ([self sendLine:s string:cmd] > 0) {
+        self.keyDeploySent = YES;
+        [self logFmt:@"[%@] Requested SSH key deploy.", self.vmName];
+    }
 }
 
 - (void)processAsyncMessage:(const char *)line {
@@ -278,6 +306,15 @@
         strcmp(line, "ssh_installing") == 0 ||
         strcmp(line, "ssh_failed") == 0) {
         [self processSshStateReply:[NSString stringWithUTF8String:line]];
+        return;
+    }
+    if (strcmp(line, "ssh_key_deployed") == 0 ||
+        strcmp(line, "ssh_key_failed") == 0) {
+        BOOL ok = (strcmp(line, "ssh_key_deployed") == 0);
+        [self logFmt:@"[%@] SSH key %@.", self.vmName,
+            ok ? @"deployed" : @"deploy FAILED"];
+        VmAgentKeyDeployed cb = self.onKeyDeployed;
+        if (cb) dispatch_async(dispatch_get_main_queue(), ^{ cb(ok); });
         return;
     }
     [self logFmt:@"[%@] (async) %s", self.vmName, line];

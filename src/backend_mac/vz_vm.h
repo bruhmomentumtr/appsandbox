@@ -9,6 +9,12 @@ NS_ASSUME_NONNULL_BEGIN
 
 typedef void (^VzVmStateChangeBlock)(VZVirtualMachineState state);
 
+/* Headless: omit the VM's audio devices entirely on the next load. Host mic
+ * capture would block on a TCC consent prompt no daemon can show, and output
+ * would play on the host speakers with no window to gate it. Set by
+ * asb_mac_set_headless before any VM start. */
+void vz_vm_set_no_audio(BOOL no_audio);
+
 @interface VzVm : NSObject
 
 @property (nonatomic, strong, readonly) VZVirtualMachine *machine;

@@ -1,14 +1,37 @@
 #import "vm_dir.h"
 
+#include <pwd.h>
+#include <unistd.h>
+
 @implementation VmDir
 
 + (NSURL *)vmsRootDirectory {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSURL *appSupport = [fm URLForDirectory:NSApplicationSupportDirectory
-                                    inDomain:NSUserDomainMask
-                           appropriateForURL:nil
-                                      create:YES
-                                       error:nil];
+    NSURL *appSupport = nil;
+
+    /* Under sudo (the headless daemon's required launch mode), NSUserDomainMask
+     * resolves to root's home (/var/root) -- a DIFFERENT VM registry and a
+     * cold restore-image cache than the user's GUI. Resolve the INVOKING
+     * user's real home instead (SUDO_USER -> passwd), so `sudo AppSandbox
+     * --headless` manages the same VMs the user sees in the app. Dormant in
+     * the GUI (never runs as root). */
+    const char *sudo_user = getenv("SUDO_USER");
+    if (geteuid() == 0 && sudo_user && *sudo_user) {
+        struct passwd *pw = getpwnam(sudo_user);
+        if (pw && pw->pw_dir && pw->pw_dir[0]) {
+            appSupport = [NSURL fileURLWithPath:
+                [[NSString stringWithUTF8String:pw->pw_dir]
+                    stringByAppendingPathComponent:@"Library/Application Support"]
+                                    isDirectory:YES];
+        }
+    }
+    if (!appSupport) {
+        appSupport = [fm URLForDirectory:NSApplicationSupportDirectory
+                                inDomain:NSUserDomainMask
+                       appropriateForURL:nil
+                                  create:YES
+                                   error:nil];
+    }
     NSURL *root = [[appSupport URLByAppendingPathComponent:@"AppSandbox" isDirectory:YES]
                       URLByAppendingPathComponent:@"VMs" isDirectory:YES];
     [fm createDirectoryAtURL:root withIntermediateDirectories:YES attributes:nil error:nil];

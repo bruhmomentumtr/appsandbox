@@ -76,7 +76,9 @@ static NSDictionary *vmToJsDict(const AsbVmMac *vm) {
         @"installStatus":   [NSString stringWithUTF8String:vm->install_status],
         @"sshEnabled":      @(vm->ssh_enabled ? YES : NO),
         @"sshPort":         @(vm->ssh_port),
-        @"sshState":        @(vm->ssh_state),
+        @"sshState":        @((vm->ssh_key_deployed && vm->ssh_state == 2) ? 4 : vm->ssh_state),
+        @"sshDeployKey":    @(vm->ssh_deploy_key ? YES : NO),
+        @"sshKeyDeployed":  @(vm->ssh_key_deployed ? YES : NO),
         @"snapCurrent":     @(-1),
         @"snapCurrentBranch": @(-1),
         @"hasSnapshots":    @NO,
@@ -264,6 +266,7 @@ static void handleCreateVm(NSDictionary *msg) {
     NSString *adminUser = msg[@"adminUser"] ?: @"user";
     NSString *adminPass = msg[@"adminPass"] ?: @"test123";
     BOOL sshEnabled     = [msg[@"sshEnabled"] boolValue];
+    BOOL sshDeployKey   = [msg[@"sshDeployKey"] boolValue];
     int ramMb           = [msg[@"ramMb"] intValue];
     int hddGb           = [msg[@"hddGb"] intValue];
     int cpuCores        = [msg[@"cpuCores"] intValue];
@@ -275,7 +278,7 @@ static void handleCreateVm(NSDictionary *msg) {
                                 ramMb, hddGb, cpuCores,
                                 gpuMode, networkMode, imagePath,
                                 [adminUser UTF8String], [adminPass UTF8String],
-                                sshEnabled);
+                                sshEnabled, sshDeployKey);
     if (rc != 0) {
         sendAlert([NSString stringWithFormat:@"Create failed (error %d)", rc]);
     }
@@ -396,13 +399,28 @@ void ui_handle_message(NSString *json) {
          * script. No AppleScript, no Apple-Events TCC prompt. */
         NSString *user = [NSString stringWithUTF8String:
             vm->admin_user[0] ? vm->admin_user : "user"];
+        /* If this VM had the AppSandbox key deployed, use it (-i) so the
+         * terminal logs in with key auth instead of a password prompt.
+         * IdentitiesOnly avoids offering the user's other keys, and -- since
+         * these are ephemeral loopback VMs -- StrictHostKeyChecking=no + a
+         * throwaway known_hosts skips the fingerprint prompt and keeps it out
+         * of the user's real known_hosts. Mirrors the Windows sshConnect. */
+        NSString *keyopt = @"";
+        if (vm->ssh_deploy_key) {
+            keyopt = [NSString stringWithFormat:
+                @"-i '%@' -o IdentitiesOnly=yes -o StrictHostKeyChecking=no "
+                @"-o UserKnownHostsFile='%@' ",
+                asb_mac_ssh_key_path(),
+                [NSTemporaryDirectory() stringByAppendingPathComponent:
+                    @"appsandbox_known_hosts"]];
+        }
         /* \033c full-reset clears Terminal's "Last login" banner and the
          * auto-echoed path it types before running a .command. */
         NSString *body = [NSString stringWithFormat:
             @"#!/bin/sh\n"
             @"printf '\\033c'\n"
-            @"exec ssh %@@127.0.0.1 -p %d\n",
-            user, vm->ssh_port];
+            @"exec ssh %@%@@127.0.0.1 -p %d\n",
+            keyopt, user, vm->ssh_port];
         NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
             [NSString stringWithFormat:@"appsandbox-ssh-%@-%u.command",
              n, arc4random()]];
