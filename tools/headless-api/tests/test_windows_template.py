@@ -63,14 +63,23 @@ try:
     check("delete-during-build guard applies to template -> 409", c.delete_vm(TPL)[0] == 409)
 
     print("    waiting for sysprep finalization (template -> /templates, leaves /vms)...", flush=True)
-    deadline = time.time() + 1800   # up to 30 min for Windows build + sysprep
-    last = None
-    while time.time() < deadline:
+    # Stall-based, not a fixed deadline: build progress / state transitions
+    # (building % -> running-sysprep -> left /vms) reset the clock; only a
+    # template making NO observable progress for 10 min fails the wait.
+    STALL = 600
+    last_sig = None
+    last_change = time.time()
+    while True:
         s = snap(TPL)
-        st = s["state"] if s else "(left /vms)"
-        if st != last:
-            print("    [%s] %s = %s" % (time.strftime("%H:%M:%S"), TPL, st), flush=True); last = st
+        sig = (s["state"], s.get("progress"), s.get("installStatus")) if s else ("(left /vms)",)
+        if sig != last_sig:
+            print("    [%s] %s = %s" % (time.strftime("%H:%M:%S"), TPL, sig[0]), flush=True)
+            last_sig = sig
+            last_change = time.time()
         if TPL in tpl_names() and TPL not in names():
+            break
+        if time.time() - last_change > STALL:
+            print("    STALLED: no progress for %ds (last: %s)" % (STALL, last_sig), flush=True)
             break
         time.sleep(10)
     check("template finalized: now in /templates", TPL in tpl_names(), "templates=%s" % sorted(tpl_names()))

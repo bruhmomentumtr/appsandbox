@@ -1,39 +1,56 @@
 """
-asb.py -- Python client for the AppSandbox headless daemon.
+asb.py -- Python client for the AppSandbox headless daemon (Windows + macOS).
 
-Start the daemon with:  appsandbox.exe --headless
+Start the daemon with:
+    Windows:  appsandbox.exe --headless                     (elevated shell)
+    macOS:    AppSandbox.app/Contents/MacOS/AppSandbox --headless
 Then:
 
     import asb
-    c = asb.connect()                 # reads %ProgramData%\\AppSandbox\\host.json
+    c = asb.connect()                 # reads the per-platform host.json
     c.start("linux")
     c.wait("linux", {"booting", "online"})
     c.stop("linux")
 
 Stdlib only (urllib) -- no third-party dependencies. The daemon exposes a
 Docker-style local HTTP/JSON API over loopback; the discovery file gives us the
-port + bearer token so connect() takes no arguments.
+port + bearer token so connect() takes no arguments. The API is IDENTICAL on
+both platforms; feature differences (snapshots/templates are Windows-only) are
+advertised in version()["capabilities"] and those routes return 501 on macOS.
 """
 import json
 import os
+import sys
 import time
 import urllib.request
 import urllib.error
 
 
-def _discovery_path():
+def _support_dir():
+    """Per-platform AppSandbox data dir (discovery file, ssh keypair, logs)."""
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/AppSandbox")
     base = os.environ.get("ProgramData", r"C:\ProgramData")
-    return os.path.join(base, "AppSandbox", "host.json")
+    return os.path.join(base, "AppSandbox")
+
+
+def _discovery_path():
+    return os.path.join(_support_dir(), "host.json")
+
+
+def daemon_launch_hint():
+    if sys.platform == "darwin":
+        return "AppSandbox.app/Contents/MacOS/AppSandbox --headless"
+    return "appsandbox.exe --headless (from an elevated shell)"
 
 
 def key_path():
     """Path to the AppSandbox SSH private key. VMs created with sshDeployKey=True
     get the matching public key in their authorized_keys, so you can connect with:
         ssh -i <key_path()> -p <sshInfo['port']> <sshInfo['user']>@127.0.0.1
-    The daemon generates the keypair (under %ProgramData%\\AppSandbox\\ssh\\) the
-    first time a key-deploy VM is created."""
-    base = os.environ.get("ProgramData", r"C:\ProgramData")
-    return os.path.join(base, "AppSandbox", "ssh", "id_appsandbox")
+    The daemon generates the keypair (under <support dir>/ssh/) the first time a
+    key-deploy VM is created."""
+    return os.path.join(_support_dir(), "ssh", "id_appsandbox")
 
 
 # VM lifecycle states the daemon's derived `state` can report.
@@ -185,8 +202,7 @@ def connect(endpoint=None, token=None, check=True):
         except FileNotFoundError:
             raise RuntimeError(
                 "no daemon discovery file at %s -- is the daemon running? "
-                "start it from an elevated shell: appsandbox.exe --headless"
-                % _discovery_path())
+                "start it with: %s" % (_discovery_path(), daemon_launch_hint()))
         endpoint = endpoint or info["endpoint"]
         token = token or info["token"]
     c = Client(endpoint, token)

@@ -100,7 +100,17 @@ a 30s-capped message-pump wait vs `INFINITE` elsewhere — `hcs_vm.c:254-271,661
    event bus. **Poll `asb_vm_agent_online()` on a ~1s timer** (it has no callback —
    `vm_agent.c:204` is HWND-only).
 5. Start the HTTP server + write the discovery file.
-6. On exit: `asb_detach()` (leave VMs running, `asb_core.c:2507`).
+6. On exit: `asb_cleanup()` — **the daemon owns its VMs and terminates them on
+   exit** (same teardown the GUI runs on `WM_DESTROY`).
+   > **FIXED 2026-06-10.** This step originally used `asb_detach()` (leave VMs
+   > running), which contradicted the README's ownership model and the
+   > `/v1/shutdown` force semantics, and meant the *next* daemon start would rip
+   > the HCN networks out from under the surviving VMs (`asb_init` →
+   > `hcn_cleanup_stale_networks` runs before `asb_reconnect_running`).
+   > `headless.c` now calls `asb_cleanup()` on both exit paths.
+   > `asb_reconnect_running` stays in startup purely as crash recovery: after an
+   > unclean daemon death, orphaned VMs are re-adopted so they can be managed
+   > and cleaned up.
 
 **macOS** (every VZ op marshals to the main queue via `run_on_main`,
 `asb_core_mac.m:43-46`):
@@ -719,7 +729,200 @@ across all three OSes because it rides the existing agent channel, not the per-O
 build paths. (Windows is verified end-to-end; Linux/macOS guest agents are built from
 the GitHub source on VM creation, so they go live once the branch is pushed.)
 
-**Still future / undecided:** the macOS daemon (§12.3 `asb_mac_set_headless`), and the
-optional `GET /v1/logs` + `agent`/`ssh`/`log` SSE events — only `state`/`progress`/`alert`
-are emitted today (agent-online and ssh-readiness remain observable by polling
-`status()` fields, per the level-vs-edge model in §6).
+**Still future / undecided:** the optional `GET /v1/logs` + `agent`/`ssh`/`log` SSE
+events — only `state`/`progress`/`alert` are emitted today (agent-online and
+ssh-readiness remain observable by polling `status()` fields, per the
+level-vs-edge model in §6).
+
+## 18. Fixes applied 2026-06-10 (review pass before the macOS port)
+
+A line-by-line + multi-agent adversarial review of the branch confirmed and
+fixed the following **Windows-side** issues (each verified against the code
+before fixing):
+
+- **Daemon exit semantics (design fix).** `headless.c` exit paths called
+  `asb_detach()` (leave VMs running). The daemon now calls `asb_cleanup()` —
+  it owns its VMs and terminates them on exit, like the GUI. See §2.3 step 6.
+- **From-template creates silently dropped `sshDeployKey`** (`asb_core.c`, the
+  synchronous from-template path): the instance never received
+  `ssh_deploy_key`/`ssh_pubkey` (only the ISO and Linux build paths set them),
+  so the key was generated then discarded with a success response. Fixed by
+  copying both onto the instance after `hcs_create_vm`.
+- **`ssh_key_deployed` was never reset**, so after a snapshot/branch revert the
+  key was not re-deployed while `sshInfo` kept reporting `sshState 4`. Now
+  reset on VM exit (`asb_hcs_state_changed`) and force-stop (`asb_vm_stop`);
+  the guest-side write is idempotent, so re-deploy-per-boot is safe.
+- **`load_vm_list` could abort the process** on a hand-edited/corrupt
+  `SshPubKey=` line ≥ 512 chars (`wcscpy_s` invokes the CRT invalid-parameter
+  handler). Now a truncating `wcsncpy_s(..., _TRUNCATE)`.
+- **`ensure_appsandbox_ssh_key` trusted ssh-keygen blindly**: timeout/exit code
+  unchecked, and partial key material would persist (regen keys only on the
+  `.pub` existing). Now checks both and deletes partial output on failure.
+- **`body_to_wide` could leave the wide buffer non-NUL-terminated** when
+  `MultiByteToWideChar` fails on an oversized body; now treated as empty.
+- **Bearer-token compare was case-insensitive** (`_strnicmp`); now exact.
+- **`vm_agent.c` posted `WM_VM_HYPERV_VIDEO_OFF` to a NULL HWND** in headless
+  mode (queueing thread messages on the never-pumped agent thread); now
+  NULL-guarded like every other notify site.
+- **Guest agents reported deploy success on permission failures**: the Windows
+  agent never checked the `icacls` exit code (StrictModes would reject the
+  key); the Linux/macOS agents logged `chown` failure as a warning, and the
+  `||` short-circuit skipped the file chown when the dir chown failed. All
+  three now report `ssh_key_failed` when the permission step fails.
+
+Known sharp edges documented but deliberately NOT changed: guest agents write
+`authorized_keys` with truncate-`"w"` semantics (single-key appliance model);
+the Windows guest agent's 256-byte command-line buffer requires ed25519-sized
+keys (the host generates ed25519 for exactly this reason); long-lived-daemon
+risks in `hcn_network.c` (NAT base frozen per process, external-network adapter
+staleness) and `disk_util.c` (SSH MSI cached beside the *process* exe;
+`URLDownloadToFileW` in service sessions) are tracked for the service-mode
+milestone (§16).
+
+## 19. macOS port — SHIPPED 2026-06-10
+
+The §11 step-7 / §12.3 work is done; the same HTTP/JSON API now runs on macOS.
+What shipped (all verified live on an M1 Pro: 40-check API smoke suite, real-VM
+headless boot→online→ssh→graceful-shutdown cycle, static suite green, full
+two-VM create lifecycle with the IPSW download under test):
+
+- **`src/app_mac/headless.m`** — the daemon. Same routes, field names, status
+  codes, SSE events, and GUI-mirroring validation as `headless.c`. Differences
+  are capability-gated only: `hostOs:"macOS"`,
+  `capabilities:{snapshots:false,templates:false}` (those routes → `501`),
+  `building` always false (the whole create is `installing`). Threading: the
+  main thread runs a bare `CFRunLoopRun()` (drains the main dispatch queue,
+  where every VZ op + core mutation lives — same model iso-patch-mac already
+  proves; no NSApplication, no window server, works over SSH); one background
+  thread runs the serial HTTP accept loop and marshals onto main
+  (`dispatch_sync` reads; `dispatch_async` create so nothing can wedge the
+  API); SSE clients get a detached write-only thread each.
+- **Privilege model (deliberately different from the original §2.3 sketch):**
+  `--headless` REQUIRES `sudo` and is then **fully non-interactive** — no
+  admin-password prompt, ever (scriptability requirement). When root, the
+  privileged stage step runs directly (no AEWP). `vm_dir.m` resolves
+  `SUDO_USER` so the root daemon operates on the invoking user's VM registry
+  and restore-image cache, and the daemon hands every artifact back
+  (`chown` on lock/discovery/log immediately; a debounced `chown -R` of the
+  AppSandbox tree on state/list events + at exit), so the user's GUI and the
+  unprivileged SDK client keep working. Up-front fail-fast mirrors §5.2a:
+  non-root → exit 3 with the sudo hint; second instance → exit 2.
+- **`asb_mac_set_headless` (§12.3) + two more session gates found during
+  implementation:** the flag suppresses the per-VM display window AND the
+  clipboard channel (NSPasteboard is per-Aqua-session; the channel also
+  serves guest-initiated host-pasteboard reads/writes regardless of the
+  sync gate) AND the VM audio devices (`vz_vm_set_no_audio`: host-mic capture
+  would hang on a TCC prompt no daemon can show; output would play on host
+  speakers). Matches Windows, where display/clipboard/audio live in the GUI
+  app and simply never activate headless.
+- **macOS host-side SSH key deploy** — full parity: `ssh_deploy_key` on
+  `asb_mac_vm_create` + GUI checkbox passthrough, ed25519 keypair via
+  `ssh-keygen` under `~/Library/Application Support/AppSandbox/ssh/`,
+  `SshDeployKey`/`SshPubKey` persisted, deploy over the agent's tagged command
+  channel on `ssh_ready`, `ssh_key_deployed` volatile + reset on stop
+  (re-deploy per boot), `sshState 4`/`keyDeployed` reporting, and the GUI's
+  Terminal SSH script uses `-i` + IdentitiesOnly when deployed. NOTE: unlike
+  Linux, the macOS guest agent is built locally and staged from the app
+  bundle, so key deploy works without pushing the branch.
+- **Create auto-starts (parity with Windows + the documented SDK behavior).**
+  The macOS install used to leave the VM at `stopped` once `install_complete`
+  flipped; now `finish_install` calls `autostart_after_install`, which waits
+  (off the main queue) until the staging step's `hdiutil` attach is fully
+  released — `disk_image_attached` polls `hdiutil info` — then starts the VM, so
+  it transitions install → booting → online on its own. `asb_mac_vm_start` was
+  made idempotent (guards on `vz_handle` as well as `running`) so an explicit
+  client/test start can't race the auto-start into a second VZ machine.
+- **Daemon exit = cleanup on macOS too:** VZ VMs are in-process, so exit
+  inherently terminates them; `cleanup_and_exit` also runs `asb_mac_cleanup()`
+  (agents/proxies/authorization) and the final ownership hand-back. The
+  `POST /v1/shutdown` `vms_active` guard counts running AND mid-install VMs.
+- **Cross-platform SDK + tests:** `asb.py` resolves per-platform paths;
+  the suite runs unmodified on both hosts (capability-gated), a macOS host
+  runs TWO concurrent macOS guests (one downloading the IPSW fresh — the
+  download path is part of the suite — one installing from the preserved
+  cache), and all build/install/download waits are **stall-based** on the
+  daemon's live progress reporting instead of fixed deadlines (`helpers.
+  wait_progress`; also applied to the Windows template sysprep wait).
+
+macOS-specific sharp edges found and handled or documented:
+- `VZMacOSRestoreImage` type-checks by file extension — a cache set aside as
+  `*.ipsw.orig` is rejected as "wrong file type"; the harness uses
+  `restore-orig.ipsw`.
+- **Concurrent imageless creates race the shared `restore.ipsw` download**
+  (`asb_core_mac.m` fetches per-VM but both target the same cache path) — the
+  harness serializes by gating the second create on the first's REPORTED
+  download progress; a core-side single-flight guard is future work.
+- A second `--headless` instance must never `open_log()` before the lock:
+  on macOS `fopen("w")` would truncate the running daemon's log (fixed; the
+  Windows daemon got the sibling fix of reporting "already running" via
+  `cli_fail` since its log-open silently fails there).
+
+### 19.1 GUI-mode SSH key deploy + adversarial-review fixes
+
+Live GUI validation surfaced a class of bug the headless suite couldn't (the
+headless daemon suppresses the display window, so the trigger below never
+fires), plus an adversarial bug-check pass caught a regression and two
+sudo-model defects. All fixed:
+
+- **GUI agent thrash on slow deploy.** The guest agent is single-threaded; on a
+  cold first boot `deploy_ssh_key`'s `getpwent`/OpenDirectory lookup takes ~8 s,
+  blocking the accept loop's heartbeats and command replies. In GUI mode the
+  core's on-agent-online catch-up pushes `mute`/clipboard state as *tagged*
+  commands; those timed out against the blocked guest and the host's
+  `readTaggedResponse` then tore the whole agent connection down (`break`),
+  causing repeated offline/online cycling and a lost `ssh_key_deployed`
+  confirmation (the key was still written — `sshState` just never reached 4).
+  Fixes: (a) the macOS guest agent now runs `deploy_ssh_key` on a **detached
+  worker thread** (send-mutex `g_send_mu` serializes the command socket), so it
+  never starves the accept loop; (b) the host (`vm_agent_mac.m`) no longer drops
+  the agent on a tagged-command timeout (`break` → `continue` — a genuinely
+  dead socket is still caught by the read loop); (c) `keyDeploySent` resets per
+  connection so deploy re-attempts across reconnects until confirmed. Headless
+  was never affected (no display window → no catch-up commands).
+- **Detached-worker fd reuse (regression from the threading fix).** The worker
+  captured the client fd by value; if the connection dropped and the host
+  reconnected, `accept()` could hand back the same fd number and the worker's
+  late reply would corrupt the new session. Fixed with a connection-generation
+  counter (`g_conn_gen`, bumped on every command-connection start/end): the
+  worker's `send_line_gen` only writes if its generation is still current.
+- **sudo ownership target vs. tree-location mismatch.** `resolve_sudo_user`
+  derived the chown uid/gid from `$SUDO_UID`/`$SUDO_GID` while `vm_dir.m`
+  resolved the directory from `$SUDO_USER` — they could disagree, leaving the
+  user's files root-owned. Both now resolve from the *same* `getpwnam(SUDO_USER)`,
+  and the daemon aborts (exit 3) if `SUDO_USER` is set but unresolvable rather
+  than silently operating on root's registry.
+- **Smaller hardening:** `cleanup_and_exit` got an idempotency guard (reachable
+  from SIGINT/SIGTERM/`/v1/shutdown`); the debounced `chown -R` pending flag is
+  now touched only on its serial queue (no cross-thread race).
+
+### 19.2 macOS startup fail-fast + shared GUI polish
+
+- **Runtime prerequisite checks (the macOS analogue of §5.2a).** The daemon's
+  Apple-silicon guard was originally a compile-time `#if !defined(__arm64__)` —
+  dead on an arm64-only build, so not a real gate. `run_headless` now verifies,
+  at runtime, before binding anything (each → exit 3 with a clear stderr line):
+  (1) **minimum macOS** via `isOperatingSystemAtLeastVersion:` against the
+  bundle's own `LSMinimumSystemVersion` (single source of truth — a direct
+  `--headless` launch bypasses the LaunchServices version gate that protects the
+  GUI); (2) **`VZVirtualMachine.isSupported`** (the real virtualization
+  capability gate, false on Intel / no-hypervisor — supersedes the arch macro).
+  Elevation + `SUDO_USER` resolution (§19) round out the set; a second instance
+  still exits 2. Required adding `Virtualization.framework` to the **app** target's
+  link (it was only linked by the core framework).
+- **Create auto-start verified live** (§19): a fresh GUI/daemon create now
+  transitions install → booting → online with no manual start — confirmed by the
+  daemon log line `Install complete -- starting VM.` 0.5 s before `State: Running`,
+  with zero client `start()` calls and the disk-lock poll finding the disk already
+  released.
+- **Shared web UI (`web/`) — both platforms, fixes a real macOS annoyance.** The
+  WKWebView was applying macOS **autocorrect / autocapitalization / spellcheck**
+  to text fields, silently rewriting VM names, usernames, and paths as you type
+  (there is no clean public WKWebView property to disable this). Fixed
+  declaratively with the WebKit-honored attributes: `spellcheck="false"` on
+  `<body>` (inherits) plus `autocorrect="off" autocapitalize="off"
+  spellcheck="false"` on the text inputs (`vm-name`, `admin-user`, `image-path`,
+  and the snapshot/rename `modal-input`). Also `style.css`: WebKit doesn't dim a
+  disabled native checkbox the way Chromium does, so an explicit rule
+  (`input[type=checkbox]:disabled` + `label:has(...)`) now greys "Deploy SSH key"
+  until "SSH Server" is ticked. Both changes are in the shared `web/` assets, so
+  Windows benefits too (no regression — Chromium already behaved).

@@ -1,9 +1,12 @@
 """
 The full per-VM test sequence, parametrized by a create-spec. The master harness
-(run_all.py) runs this CONCURRENTLY across several specs (e.g. Linux + Windows) --
-so multi-VM concurrency is inherent (the daemon juggles N VMs at once) and every
-path is proven on each OS simultaneously. Each call creates its own VM, runs
-everything against it, and deletes it. There is no separate multi-VM test.
+(run_all.py) runs this CONCURRENTLY across several specs (Linux + Windows on a
+Windows host; a macOS guest on a macOS host) -- so multi-VM concurrency is
+inherent where the platform has multiple guest types, and every path is proven
+on each OS. Each call creates its own VM, runs everything against it, and
+deletes it. There is no separate multi-VM test. Feature differences are
+capability-gated via version()["capabilities"] (snapshots/templates are
+Windows-only; those routes assert 501 on macOS).
 
 Lifecycle discipline (mirrors the GUI):
   * Every VM start boots all the way to ONLINE (agent connected) before the VM is
@@ -33,11 +36,24 @@ def run_vm_lifecycle(spec):
     ram = spec.get("ram", 4096)
     hdd = spec.get("hdd", 24)
     cores = spec.get("cores", 2)
-    iso = helpers.ISO_LIN if os_type == "Linux" else helpers.ISO_WIN
+    image = spec.get("image")            # explicit per-spec override (may be "")
+    if image is None:
+        if os_type == "Linux":
+            image = helpers.ISO_LIN
+        elif os_type == "Windows":
+            image = helpers.ISO_WIN
+        else:                            # macOS: IPSW; "" = cached/auto-fetched
+            image = helpers.IPSW_MAC
     ONLINE_T = 600 if os_type == "Linux" else 1800   # boot-to-online budget
     GRACE_T  = 240 if os_type == "Linux" else 600    # graceful-shutdown budget
+    # The build/install/download phase has NO fixed deadline: the daemon
+    # reports live progress (progress % / installStatus), so the wait below is
+    # stall-based -- it fails only after BUILD_STALL seconds of zero observable
+    # movement, however long a healthy download/install takes.
+    BUILD_STALL = 600
 
     c = asb.connect()
+    caps = c.version().get("capabilities", {})
     with open(os.path.join(helpers.ASB_DIR, "host.json"), encoding="utf-8") as f:
         info = json.load(f)
     base, token = info["endpoint"], info["token"]
@@ -95,21 +111,24 @@ def run_vm_lifecycle(spec):
             pass
     threading.Thread(target=sse_reader, daemon=True).start()
 
-    cfg = dict(name=name, osType=os_type, imagePath=iso, ramMb=ram, hddGb=hdd, cpuCores=cores,
+    cfg = dict(name=name, osType=os_type, ramMb=ram, hddGb=hdd, cpuCores=cores,
                gpuMode=1, networkMode=1, testMode=True, sshEnabled=True, sshDeployKey=True,
                adminUser="user", adminPass="test123")
+    if image:   # macOS may omit it (cached/auto-fetched restore image)
+        cfg["imagePath"] = image
     try:
         # --- create (validates the create path) ---
         code, body = c.create(**cfg)
         check("create -> 202", code in (200, 202), "%s %s" % (code, body))
 
         # --- delete/edit-during-build guards: the ONLY paths that act before the
-        #     guest finishes installing (deliberately pre-online). ---
+        #     guest finishes installing (deliberately pre-online). Windows
+        #     surfaces this as building=true; macOS as state=="installing". ---
         deadline = time.time() + 90
         caught_building = False
         while time.time() < deadline:
             s = st()
-            if s and s["building"]:
+            if s and (s["building"] or s["state"] == "installing"):
                 caught_building = True; break
             if s and not s["building"]:
                 break
@@ -119,15 +138,22 @@ def run_vm_lifecycle(spec):
             check("edit during build -> 409", c.edit(name, ramMb=ram)[0] == 409)
             check("still present after refused delete", name in {v["name"] for v in c.list()})
 
-        # --- wait until built (create auto-starts) ---
-        deadline = time.time() + 720
-        while time.time() < deadline:
+        # --- wait until built/installed. Create auto-starts on both platforms
+        #     (the macOS install briefly parks at "stopped" before the core
+        #     auto-boots it once the disk is released), so this just waits past
+        #     building/installing; boot_online is idempotent if it's already up.
+        #     Stall-based: live progress keeps the wait alive; a hung build
+        #     fails after BUILD_STALL seconds of no movement. ---
+        try:
+            s = helpers.wait_progress(
+                c, name,
+                lambda s: (not s["building"] and s["state"] != "installing"
+                           and (s["running"] or s["state"] == "stopped")),
+                stall=BUILD_STALL, label=name)
+            check("build finished", True)
+        except Exception as e:
             s = st()
-            if s and not s["building"] and (s["running"] or s["state"] == "stopped"):
-                break
-            time.sleep(4)
-        s = st()
-        check("build finished", bool(s) and not s["building"], "state=%s" % (s and s["state"]))
+            check("build finished", False, "%r state=%s" % (e, s and s["state"]))
 
         # --- boot all the way to ONLINE (agent connected). A fresh Windows install
         #     can take ~15-20 min to reach this. ---
@@ -166,7 +192,10 @@ def run_vm_lifecycle(spec):
 
         # --- running-state guards (VM is online now) ---
         check("edit RUNNING -> 409", c.edit(name, ramMb=son["ramMb"])[0] == 409)
-        check("snap RUNNING -> 409", c.snap_take(name)[0] == 409)
+        if caps.get("snapshots"):
+            check("snap RUNNING -> 409", c.snap_take(name)[0] == 409)
+        else:
+            check("snap on this host -> 501", c.snap_take(name)[0] == 501)
 
         # --- daemon shutdown-guard (SAFE: only POST while MY vm is running -> 409) ---
         sd = c.shutdown_daemon(force=False)
@@ -190,51 +219,55 @@ def run_vm_lifecycle(spec):
         check("edit odd RAM -> 400", c._req("PUT", "/vms/" + name, {"ramMb": 4001})[0] == 400)
         check("edit gpuMode=9 -> 400", c._req("PUT", "/vms/" + name, {"gpuMode": 9})[0] == 400)
 
-        # --- snapshots + branches (VM is stopped). Validate the on-disk artifacts,
-        #     not just the API list: the base disk and a per-snapshot differencing
-        #     VHDX under <vm>\snapshots\. ---
-        vm_dir = os.path.join(helpers.ASB_DIR, name)
-        snap_dir = os.path.join(vm_dir, "snapshots")
-        def snap_files(prefix):
-            here = os.listdir(snap_dir) if os.path.isdir(snap_dir) else []
-            return [f for f in here if f.lower().endswith(".vhdx") and f.lower().startswith(prefix)]
-        check("base disk.vhdx exists on disk", os.path.isfile(os.path.join(vm_dir, "disk.vhdx")))
-        n0 = len(c.snapshots(name)); snap0 = len(snap_files("snapshot_"))
-        check("snap take -> 202", c.snap_take(name, "s1")[0] == 202); time.sleep(2)
-        check("snapshot count +1", len(c.snapshots(name)) == n0 + 1)
-        check("snapshot_*.vhdx created on disk", len(snap_files("snapshot_")) == snap0 + 1,
-              "snapshots/=%s" % (os.listdir(snap_dir) if os.path.isdir(snap_dir) else "missing"))
-        sidx = next((x["index"] for x in c.snapshots(name) if x["name"] == "s1"), None)
-        check("snapshot found", sidx is not None)
-        if sidx is not None:
-            check("rename -> 202", c.snap_rename(name, sidx, "s1b")[0] == 202)
-            bc0 = next(x["branchCount"] for x in c.snapshots_full(name)["snapshots"] if x["index"] == sidx)
-            boot_online("from snapshot s1", snap_index=sidx, branch_name="br1")   # boots a branch off s1 to online
-            graceful_down("after snapshot boot")
-            snap = next(x for x in c.snapshots_full(name)["snapshots"] if x["index"] == sidx)
-            check("start-from-snapshot created a branch", snap["branchCount"] == bc0 + 1, "%s->%s" % (bc0, snap["branchCount"]))
-            branches = snap.get("branches", [])
-            bidx = next((b["index"] for b in branches if b["name"] == "br1"), max((b["index"] for b in branches), default=None))
-            if bidx is not None:
-                check("delete branch -> 202", c.snap_delete_branch(name, sidx, bidx)[0] == 202); time.sleep(2)
-            check("delete snapshot -> 202", c.snap_delete(name, sidx)[0] == 202); time.sleep(2)
-            check("snapshot count restored", len(c.snapshots(name)) == n0)
-            check("snapshot_*.vhdx removed from disk", len(snap_files("snapshot_")) == snap0,
+        # --- snapshots + branches (Windows-only; capability-gated). Validate the
+        #     on-disk artifacts, not just the API list: the base disk and a
+        #     per-snapshot differencing VHDX under <vm>\snapshots\. ---
+        vm_dir = helpers.vm_dir(name)
+        check("base %s exists on disk" % helpers.DISK_NAME,
+              os.path.isfile(os.path.join(vm_dir, helpers.DISK_NAME)))
+        if not caps.get("snapshots"):
+            check("snapshot list -> 501", c._req("GET", "/vms/%s/snapshots" % name)[0] == 501)
+        else:
+            snap_dir = os.path.join(vm_dir, "snapshots")
+            def snap_files(prefix):
+                here = os.listdir(snap_dir) if os.path.isdir(snap_dir) else []
+                return [f for f in here if f.lower().endswith(".vhdx") and f.lower().startswith(prefix)]
+            n0 = len(c.snapshots(name)); snap0 = len(snap_files("snapshot_"))
+            check("snap take -> 202", c.snap_take(name, "s1")[0] == 202); time.sleep(2)
+            check("snapshot count +1", len(c.snapshots(name)) == n0 + 1)
+            check("snapshot_*.vhdx created on disk", len(snap_files("snapshot_")) == snap0 + 1,
                   "snapshots/=%s" % (os.listdir(snap_dir) if os.path.isdir(snap_dir) else "missing"))
+            sidx = next((x["index"] for x in c.snapshots(name) if x["name"] == "s1"), None)
+            check("snapshot found", sidx is not None)
+            if sidx is not None:
+                check("rename -> 202", c.snap_rename(name, sidx, "s1b")[0] == 202)
+                bc0 = next(x["branchCount"] for x in c.snapshots_full(name)["snapshots"] if x["index"] == sidx)
+                boot_online("from snapshot s1", snap_index=sidx, branch_name="br1")   # boots a branch off s1 to online
+                graceful_down("after snapshot boot")
+                snap = next(x for x in c.snapshots_full(name)["snapshots"] if x["index"] == sidx)
+                check("start-from-snapshot created a branch", snap["branchCount"] == bc0 + 1, "%s->%s" % (bc0, snap["branchCount"]))
+                branches = snap.get("branches", [])
+                bidx = next((b["index"] for b in branches if b["name"] == "br1"), max((b["index"] for b in branches), default=None))
+                if bidx is not None:
+                    check("delete branch -> 202", c.snap_delete_branch(name, sidx, bidx)[0] == 202); time.sleep(2)
+                check("delete snapshot -> 202", c.snap_delete(name, sidx)[0] == 202); time.sleep(2)
+                check("snapshot count restored", len(c.snapshots(name)) == n0)
+                check("snapshot_*.vhdx removed from disk", len(snap_files("snapshot_")) == snap0,
+                      "snapshots/=%s" % (os.listdir(snap_dir) if os.path.isdir(snap_dir) else "missing"))
 
-        # --- base branches (snapIndex -2): boot a base branch to online; never the base node ---
-        check("base node delete refused -> 400", c._req("DELETE", "/vms/%s/snapshots/-2" % name)[0] == 400)
-        bb0 = len(c.snapshots_full(name).get("baseBranches", []))
-        boot_online("from base branch", snap_index=-2, branch_name="bb1")   # boots a base branch to online
-        graceful_down("after base-branch boot")
-        bbs = c.snapshots_full(name).get("baseBranches", [])
-        check("base branch created + listed", len(bbs) == bb0 + 1, "baseBranches=%s" % bbs)
-        bbidx = next((b["index"] for b in bbs if b["name"] == "bb1"), bbs[-1]["index"] if bbs else None)
-        if bbidx is not None:
-            check("rename base branch -> 202", c.snap_rename(name, -2, "bb1r", branch_index=bbidx)[0] == 202); time.sleep(2)
-            check("base branch rename persisted", any(b["name"] == "bb1r" for b in c.snapshots_full(name).get("baseBranches", [])))
-            check("delete base branch -> 202", c.snap_delete_branch(name, -2, bbidx)[0] == 202); time.sleep(2)
-            check("base branch count restored", len(c.snapshots_full(name).get("baseBranches", [])) == bb0)
+            # --- base branches (snapIndex -2): boot a base branch to online; never the base node ---
+            check("base node delete refused -> 400", c._req("DELETE", "/vms/%s/snapshots/-2" % name)[0] == 400)
+            bb0 = len(c.snapshots_full(name).get("baseBranches", []))
+            boot_online("from base branch", snap_index=-2, branch_name="bb1")   # boots a base branch to online
+            graceful_down("after base-branch boot")
+            bbs = c.snapshots_full(name).get("baseBranches", [])
+            check("base branch created + listed", len(bbs) == bb0 + 1, "baseBranches=%s" % bbs)
+            bbidx = next((b["index"] for b in bbs if b["name"] == "bb1"), bbs[-1]["index"] if bbs else None)
+            if bbidx is not None:
+                check("rename base branch -> 202", c.snap_rename(name, -2, "bb1r", branch_index=bbidx)[0] == 202); time.sleep(2)
+                check("base branch rename persisted", any(b["name"] == "bb1r" for b in c.snapshots_full(name).get("baseBranches", [])))
+                check("delete base branch -> 202", c.snap_delete_branch(name, -2, bbidx)[0] == 202); time.sleep(2)
+                check("base branch count restored", len(c.snapshots_full(name).get("baseBranches", [])) == bb0)
 
         # --- idempotency + the ONE dedicated FORCE-stop test (force is reserved for here) ---
         boot_online("idempotency")
@@ -250,7 +283,7 @@ def run_vm_lifecycle(spec):
         # --- delete -> no orphan ---
         check("delete -> 202", c.delete_vm(name)[0] in (200, 202)); time.sleep(3)
         check("removed from list", name not in {v["name"] for v in c.list()})
-        check("no orphan dir", not os.path.isdir(os.path.join(helpers.ASB_DIR, name)))
+        check("no orphan dir", not os.path.isdir(helpers.vm_dir(name)))
     except Exception as e:
         check("suite ran without unhandled exception", False, repr(e))
     finally:

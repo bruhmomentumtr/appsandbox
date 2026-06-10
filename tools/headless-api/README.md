@@ -22,23 +22,31 @@ c.delete_vm("dev")
 
 ## How it works
 
-`appsandbox.exe --headless` starts a **single-owner daemon**. It hosts the
-AppSandbox core (`appsandbox_core.dll`) for the lifetime of the process and
-exposes a Docker-style local HTTP/JSON API. The daemon *owns* the VMs: they run
-as long as it runs, and the API is just a remote control for the same core the
-GUI drives.
+`appsandbox.exe --headless` (Windows) or
+`sudo AppSandbox.app/Contents/MacOS/AppSandbox --headless` (macOS) starts a
+**single-owner daemon**. It hosts the AppSandbox core (`appsandbox_core.dll` /
+`AppSandboxCore.framework`) for the lifetime of the process and exposes the
+SAME Docker-style local HTTP/JSON API on both platforms. The daemon *owns* the
+VMs: they run as long as it runs (exit terminates them), and the API is just a
+remote control for the same core the GUI drives.
 
-- **Loopback only.** The listener binds `http://127.0.0.1:<port>` via `http.sys`.
-  Nothing is exposed off-box.
-- **Discovery file.** On startup the daemon writes
-  `%ProgramData%\AppSandbox\host.json` with the endpoint, port, and a random
-  per-run bearer token. `asb.connect()` reads it, so you never hard-code a port
-  or token.
-- **Single instance.** A global mutex guarantees one daemon at a time
-  (a second `--headless` exits with status 2). One owner, one source of truth.
+- **Loopback only.** The listener binds `http://127.0.0.1:<port>` (`http.sys`
+  on Windows; a plain BSD socket on macOS). Nothing is exposed off-box.
+- **Discovery file.** On startup the daemon writes `host.json`
+  (`%ProgramData%\AppSandbox\` on Windows;
+  `~/Library/Application Support/AppSandbox/` on macOS) with the endpoint,
+  port, and a random per-run bearer token. `asb.connect()` reads it, so you
+  never hard-code a port or token.
+- **Single instance.** A global mutex (Windows) / `flock` (macOS) guarantees
+  one AppSandbox at a time — GUI or daemon (a second `--headless` exits with
+  status 2). One owner, one source of truth.
 - **Serialized core.** The HTTP receive loop *is* the single command thread:
   one request runs to completion before the next, so all core calls are
   serialized — no interleaving, no races against the core.
+- **Capabilities, not API forks.** `version()["capabilities"]` advertises what
+  the host supports (snapshots/templates are Windows-only); unsupported routes
+  return `501`. Everything else — status model, validation, SSE, SSH key
+  deploy — is identical.
 
 ### Security model — read this before "hardening" it
 
@@ -54,7 +62,29 @@ doesn't justify.
 
 ---
 
+## Platform support at a glance
+
+The HTTP/JSON interface is identical on both hosts; what differs is the **guest
+OSes** each host can run and a few **host features**. Guest support is enforced
+in create-validation (wrong `osType` → `400`); the host-feature row mirrors
+`version()["capabilities"]` (unsupported routes → `501`).
+
+| | Windows host | macOS host |
+|---|:---:|:---:|
+| **Windows guest** | ✅ | ❌ |
+| **Linux guest** (Ubuntu) | ✅ | ❌ |
+| **macOS guest** | ❌ | ✅ (Apple silicon) |
+| Snapshots & branches | ✅ | ❌ `501` |
+| Templates (`isTemplate`, create-from-template) | ✅ | ❌ `501` |
+| GPU, NAT/network modes, SSH server, SSH-key auto-deploy, SSE events | ✅ | ✅ |
+
+Only `snapshots`/`templates` are advertised in the `capabilities` object; guest
+OS is host-fixed (Windows host → Windows + Linux; macOS host → macOS only), so
+a client picks its `osType` from `version()["hostOs"]`, not from `capabilities`.
+
 ## Requirements
+
+**Windows host** (runs Windows + Linux guests):
 
 | Requirement | Why |
 |---|---|
@@ -62,24 +92,41 @@ doesn't justify.
 | **Administrator** | HCS VM operations and the `http.sys` bind both require elevation. |
 | **`VirtualMachinePlatform` feature** | The HCS backend the core uses. Enable with `dism /online /Enable-Feature /FeatureName:VirtualMachinePlatform /All` then reboot. |
 
-If any of these is missing, `appsandbox.exe --headless` **fails fast with a clear
-message** (printed to the launching terminal, or shown in a dialog if launched
-from the GUI) and exits non-zero — it never half-starts:
+**macOS host** (runs macOS guests only — Virtualization.framework):
 
-- not elevated → "must be run as Administrator…"
-- unsupported OS → "unsupported OS — detected `<ver>` (requires Windows 11, build 22000 or newer)"
-- feature off → "requires the 'VirtualMachinePlatform' Windows feature…"
+| Requirement | Why |
+|---|---|
+| **macOS ≥ the build's minimum** (`LSMinimumSystemVersion`) | The daemon runtime-checks the OS version (a direct `--headless` launch bypasses the LaunchServices gate that protects the GUI). |
+| **Virtualization supported** | `VZVirtualMachine.isSupported` — Apple silicon + the Hypervisor entitlement. False on Intel Macs (no macOS-guest support). |
+| **`sudo`** | VM creation stages the guest disk as root, and a password prompt would not be scriptable — so the daemon requires elevation up front and is then fully non-interactive. It still operates on the **invoking user's** VM registry and restore-image cache (`SUDO_USER`), and hands every file it creates back to that user, so the GUI keeps working afterwards. |
+
+On either platform a missing prerequisite makes `--headless` **fail fast with a
+clear message** and a non-zero exit — it never half-starts:
+
+- Windows: not elevated → "must be run as Administrator…"; unsupported OS →
+  "requires Windows 11, build 22000 or newer"; feature off → "requires the
+  'VirtualMachinePlatform' Windows feature…"
+- macOS (each checked at runtime, exit 3): unsupported OS → "unsupported macOS —
+  detected `<ver>`, requires `<min>` or newer"; no virtualization → "Virtualization
+  is not supported on this Mac"; not root → "must be run elevated … run it with
+  sudo: …"; `SUDO_USER` set but unresolvable → aborts rather than using the wrong registry
+- a second instance (GUI or daemon already running) → exit 2
 
 ---
 
 ## Getting started
 
-1. **Start the daemon** (from an elevated shell):
+1. **Start the daemon**:
    ```
+   # Windows (elevated shell)
    appsandbox.exe --headless
+
+   # macOS
+   sudo /Applications/AppSandbox.app/Contents/MacOS/AppSandbox --headless
    ```
-   It runs in the foreground-less GUI subsystem; diagnostics go to
-   `%ProgramData%\AppSandbox\headless.log`.
+   On Windows it runs in the foreground-less GUI subsystem; on macOS it runs in
+   the foreground of your terminal (Ctrl-C = clean shutdown). Diagnostics go to
+   `headless.log` next to the discovery file.
 
 2. **Connect** from Python (stdlib only — no `pip install`):
    ```python
@@ -226,7 +273,8 @@ range rules, and **only while the VM is stopped**. `name` cannot be changed.
 ### SSH key deploy (password-less login)
 
 With `sshEnabled=True, sshDeployKey=True`, the daemon generates an **AppSandbox
-ed25519 keypair** once (under `%ProgramData%\AppSandbox\ssh\`) and the guest agent
+ed25519 keypair** once (under `<support dir>/ssh/` — `%ProgramData%\AppSandbox`
+on Windows, `~/Library/Application Support/AppSandbox` on macOS) and the guest agent
 writes the public key into the guest's `authorized_keys` (Windows:
 `administrators_authorized_keys` + the strict ACL sshd needs; Linux/macOS:
 `~/.ssh/authorized_keys`). The deployed key is saved in the VM's config. Once it
@@ -257,7 +305,8 @@ subprocess.run(["ssh", "-i", asb.key_path(), "-p", str(i["port"]),
 | `404 Not Found` | unknown VM/route |
 | `405 Method Not Allowed` | wrong verb for the route |
 | `409 Conflict` | state conflict: edit/snapshot while running (`vm_running`), delete while building (`vm_building`), daemon shutdown with active VMs (`vms_active`, lists them) |
-| `500 Internal Server Error` | the core returned a failure `HRESULT` (body has `error.hr`) |
+| `500 Internal Server Error` | the core returned a failure (`error.hr` on Windows, `error.rc` on macOS) |
+| `501 Not Implemented` | the feature doesn't exist on this host platform (`not_supported`) — snapshots/templates on macOS; mirror of `capabilities` |
 
 ---
 
