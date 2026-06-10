@@ -254,7 +254,10 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
         ui_log(L"[%s] IDD driver: %S", vm->name, buf + 11);
     } else if (strncmp(buf, "hyperv_video:", 13) == 0) {
         ui_log(L"[%s] Hyper-V Video: %S", vm->name, buf + 13);
-        if (strcmp(buf + 13, "disabled") == 0)
+        /* NULL-guard like notify_agent_status: headless never sets the HWND,
+           and PostMessageW(NULL, ...) would queue thread messages on this
+           never-pumped agent thread. */
+        if (g_agent_hwnd && strcmp(buf + 13, "disabled") == 0)
             PostMessageW(g_agent_hwnd, WM_VM_HYPERV_VIDEO_OFF, 0, (LPARAM)vm);
     } else if (strncmp(buf, "displays:", 9) == 0) {
         ui_log(L"[%s] Displays: %S", vm->name, buf + 9);

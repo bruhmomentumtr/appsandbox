@@ -417,8 +417,22 @@ static BOOL ensure_appsandbox_ssh_key(wchar_t *pubkey_out, int cap)
             asb_log(L"ssh key: ssh-keygen launch failed (%lu)", GetLastError());
             return FALSE;
         }
-        WaitForSingleObject(pi.hProcess, 30000);
-        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+        /* Check the outcome: a timed-out or failed ssh-keygen must not leave
+           partial key material behind to be trusted on the next run (the
+           regen check above keys only on the .pub existing). */
+        {
+            DWORD wait_rc = WaitForSingleObject(pi.hProcess, 30000);
+            DWORD exit_rc = 1;
+            if (wait_rc == WAIT_OBJECT_0)
+                GetExitCodeProcess(pi.hProcess, &exit_rc);
+            CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+            if (wait_rc != WAIT_OBJECT_0 || exit_rc != 0) {
+                asb_log(L"ssh key: ssh-keygen failed (wait=%lu exit=%lu)", wait_rc, exit_rc);
+                DeleteFileW(priv);
+                DeleteFileW(pub);
+                return FALSE;
+            }
+        }
         asb_log(L"ssh key: generated AppSandbox keypair at %s", priv);
     }
 
@@ -582,7 +596,10 @@ static void load_vm_list(void)
         else if (wcsncmp(line, L"SshDeployKey=", 13) == 0)
             vm->ssh_deploy_key = (_wtoi(line + 13) != 0);
         else if (wcsncmp(line, L"SshPubKey=", 10) == 0)
-            wcscpy_s(vm->ssh_pubkey, 512, line + 10);
+            /* Truncating copy: wcscpy_s ABORTS the process on overflow, and this
+               line comes from an editable config file. Generated ed25519 lines
+               are ~100 chars; anything longer is corrupt -- truncate, don't die. */
+            wcsncpy_s(vm->ssh_pubkey, 512, line + 10, _TRUNCATE);
         else if (wcsncmp(line, L"InstallComplete=", 16) == 0)
             vm->install_complete = (_wtoi(line + 16) != 0);
     }
@@ -727,6 +744,10 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
             instance->running = FALSE;
             instance->shutdown_requested = FALSE;
             instance->hyperv_video_off = FALSE;
+            /* Re-deploy on next boot: the guest disk may change while stopped
+               (snapshot/branch revert), so "deployed" is only valid per boot.
+               The guest-side write is idempotent. */
+            instance->ssh_key_deployed = FALSE;
             hcs_stop_monitor(instance);
             vm_ssh_proxy_stop(instance);
             vm_agent_stop(instance);
@@ -3003,6 +3024,11 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     wcscpy_s(inst->gpu_name, 256, cfg.gpu_mode == GPU_MIRROR ? L"Try all" :
                                   cfg.gpu_mode == GPU_DEFAULT ? L"Default GPU" : L"None");
     wcscpy_s(inst->resources_iso_path, MAX_PATH, cfg.resources_iso_path);
+    /* hcs_create_vm copies ssh_enabled onto the instance but not the deploy
+       fields, so the from-template path sets them here (the ISO and Linux
+       paths set them inline on their own instance copies). */
+    inst->ssh_deploy_key = cfg.ssh_deploy_key;
+    if (cfg.ssh_deploy_key) wcscpy_s(inst->ssh_pubkey, 512, ssh_pubkey);
 
     { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
       snapshot_init(&g_snap_trees[g_vm_count], sd); }
@@ -3161,6 +3187,7 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
     inst->running = FALSE;
     inst->shutdown_requested = FALSE;
     inst->hyperv_video_off = FALSE;
+    inst->ssh_key_deployed = FALSE;   /* disk may change while stopped (revert) -- re-deploy next boot */
     hcs_stop_monitor(inst);
     vm_ssh_proxy_stop(inst);
     vm_agent_stop(inst);

@@ -291,7 +291,11 @@ static void body_to_wide(PHTTP_REQUEST req, wchar_t *wout, int wcap)
         if (pos >= (int)sizeof(body) - 1) break;
     }
     body[pos] = 0;
-    MultiByteToWideChar(CP_UTF8, 0, body, -1, wout, wcap);
+    /* On failure (e.g. the converted body would exceed wcap) MultiByteToWideChar
+       leaves the buffer partially written WITHOUT a NUL -- treat that as an
+       empty body rather than parse garbage. */
+    if (!MultiByteToWideChar(CP_UTF8, 0, body, -1, wout, wcap))
+        wout[0] = 0;
 }
 
 static int auth_ok(PHTTP_REQUEST req)
@@ -301,7 +305,9 @@ static int auth_ok(PHTTP_REQUEST req)
     sprintf_s(expect, sizeof(expect), "Bearer %s", g_token);
     if (!h->pRawValue || h->RawValueLength == 0) return 0;
     if (h->RawValueLength != (USHORT)strlen(expect)) return 0;
-    return _strnicmp(h->pRawValue, expect, h->RawValueLength) == 0;
+    /* Case-sensitive: the token is lowercase hex; a case-insensitive compare
+       needlessly multiplies the accepted token space. */
+    return strncmp(h->pRawValue, expect, h->RawValueLength) == 0;
 }
 
 /* ---- SSE ---- */
@@ -1052,7 +1058,11 @@ int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
     mtx = CreateMutexW(NULL, FALSE, L"Global\\AppSandboxCoreHost");
     if (!mtx) { hlog(L"FATAL: CreateMutex failed (%lu).", GetLastError()); return 1; }
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        hlog(L"Another AppSandbox instance is already running. Exiting.");
+        /* cli_fail, not just hlog: the loser's open_log failed (the running
+           daemon holds headless.log with share-deny), so a log-only message
+           would vanish -- tell the launching console/user directly. */
+        cli_fail(L"AppSandbox is already running (the app window or another "
+                 L"headless daemon). Only one instance can run at a time.");
         return 2;
     }
     hlog(L"single-instance lock acquired.");
@@ -1069,11 +1079,11 @@ int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
     hlog(L"core initialized + reconnected (%d VMs).", asb_vm_count());
 
     gen_token();
-    if (!http_start(&port)) { asb_detach(); return 1; }
+    if (!http_start(&port)) { asb_cleanup(); return 1; }
     write_discovery(port);
 
     req = (PHTTP_REQUEST)malloc(req_buf_len);
-    if (!req) { hlog(L"OOM"); return 1; }
+    if (!req) { hlog(L"OOM"); delete_discovery(); asb_cleanup(); return 1; }
 
     hlog(L"entering request loop.");
     while (!stop) {
@@ -1098,7 +1108,7 @@ int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
 
     g_stop_all = 1;
     WakeAllConditionVariable(&g_ev_cv);   /* wake SSE threads so they exit */
-    hlog(L"stopping: removing url, deleting discovery, detaching.");
+    hlog(L"stopping: removing url, deleting discovery, terminating VMs.");
     delete_discovery();
     HttpRemoveUrlFromUrlGroup(g_url_group, NULL, HTTP_URL_FLAG_REMOVE_ALL);
     HttpCloseUrlGroup(g_url_group);
@@ -1107,8 +1117,15 @@ int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
     HttpTerminate(HTTP_INITIALIZE_SERVER, NULL);
     free(req);
 
-    asb_detach();
-    hlog(L"detached. exit 0.");
+    /* The daemon OWNS its VMs: exit terminates them (asb_cleanup stops the
+       per-VM monitor/agent/ssh-proxy threads, hcs_terminate_vm's every running
+       VM, and closes the handles) -- the same teardown the GUI runs on
+       WM_DESTROY. asb_detach (leave VMs running) is deliberately NOT used:
+       an unowned VM would have no callbacks, no agent channel, and the next
+       daemon start would rip its HCN network out from under it
+       (hcn_cleanup_stale_networks in asb_init). */
+    asb_cleanup();
+    hlog(L"cleaned up (VMs terminated). exit 0.");
     if (g_log) { fclose(g_log); g_log = NULL; }
     ReleaseMutex(mtx);
     CloseHandle(mtx);
