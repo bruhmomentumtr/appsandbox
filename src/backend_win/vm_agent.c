@@ -596,7 +596,7 @@ void vm_agent_stop(VmInstance *instance)
 }
 
 BOOL vm_agent_send(VmInstance *instance, const char *command,
-                   char *response, int response_max)
+                   char *response, int response_max, DWORD timeout_ms)
 {
     AgentConn *conn = find_conn(instance);
     BOOL ok;
@@ -606,13 +606,28 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
         return FALSE;
     }
 
-    /* Queue command for the connection thread */
+    /* Hand the command to the connection thread (it owns the socket and is the
+       sole sender). NOTE: this is a single slot per VM (conn->cmd), not a queue,
+       so concurrent callers for the SAME VM would clobber -- safe here because
+       per VM only one caller exists (shutdown). */
     ResetEvent(conn->cmd_done);
     strcpy_s(conn->cmd, sizeof(conn->cmd), command);
     conn->cmd_pending = TRUE;
 
-    /* Wait for response (up to 5 seconds) */
-    if (WaitForSingleObject(conn->cmd_done, 5000) != WAIT_OBJECT_0) {
+    /* timeout_ms == 0  =>  FIRE-AND-FORGET. Used for shutdown/restart, which ride
+       the guest powering off: the agent replies "ok" then kills itself, so there
+       is no reliable synchronous reply to wait for. The connection thread sends
+       the queued command and consumes the (ignored) reply on its OWN read loop;
+       we return immediately, so we never block the single-threaded HTTP request
+       loop / the GUI thread. Delivery is confirmed by the HCS SystemExited
+       monitor, not by this reply. */
+    if (timeout_ms == 0)
+        return TRUE;
+
+    /* Otherwise wait up to timeout_ms for the agent's tagged reply (idd_connect
+       expects a prompt "ok"). A real disconnect unblocks us: agent_thread_proc
+       SetEvent()s cmd_done with an empty rsp on recv<=0, so we return FALSE. */
+    if (WaitForSingleObject(conn->cmd_done, timeout_ms) != WAIT_OBJECT_0) {
         ui_log(L"Agent: command \"%S\" timed out", command);
         conn->cmd_pending = FALSE;
         return FALSE;
@@ -628,15 +643,15 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
 
 BOOL vm_agent_shutdown(VmInstance *instance)
 {
-    return vm_agent_send(instance, "shutdown", NULL, 0);
+    return vm_agent_send(instance, "shutdown", NULL, 0, 0);   /* 0 = fire-and-forget */
 }
 
 BOOL vm_agent_restart(VmInstance *instance)
 {
-    return vm_agent_send(instance, "restart", NULL, 0);
+    return vm_agent_send(instance, "restart", NULL, 0, 0);   /* 0 = fire-and-forget */
 }
 
 BOOL vm_agent_ping(VmInstance *instance)
 {
-    return vm_agent_send(instance, "ping", NULL, 0);
+    return vm_agent_send(instance, "ping", NULL, 0, 5000);
 }

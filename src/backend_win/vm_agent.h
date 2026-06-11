@@ -33,10 +33,13 @@ ASB_API void vm_agent_stop(VmInstance *instance);
    Posts WM_VM_AGENT_STATUS when agent_online changes. */
 ASB_API void vm_agent_set_hwnd(HWND hwnd);
 
-/* Send a command to the guest agent via the persistent connection.
-   Returns TRUE on "ok" reply. Thread-safe. */
+/* Send a command to the guest agent over the persistent connection. Waits up to
+   timeout_ms for the agent's tagged reply and returns TRUE on "ok"; timeout_ms == 0
+   is fire-and-forget -- the command is queued for the connection thread and TRUE is
+   returned without waiting for any reply (shutdown/restart, which ride the guest
+   powering off and have no reliable synchronous reply). Thread-safe. */
 ASB_API BOOL vm_agent_send(VmInstance *instance, const char *command,
-                           char *response, int response_max);
+                           char *response, int response_max, DWORD timeout_ms);
 
 BOOL vm_agent_shutdown(VmInstance *instance);
 BOOL vm_agent_restart(VmInstance *instance);

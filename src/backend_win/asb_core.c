@@ -3158,6 +3158,10 @@ ASB_API HRESULT asb_vm_shutdown(AsbVm vm)
     if (!inst->running) { asb_log(L"VM \"%s\" is not running.", inst->name); return S_FALSE; }
 
     asb_log(L"Sending shutdown signal to \"%s\"...", inst->name);
+    /* hcs_stop_vm fire-and-forgets the agent "shutdown" command (it does NOT wait
+       for the reply -- see vm_agent_send), so this returns promptly and never
+       blocks the single-threaded HTTP request loop / the GUI thread. The guest
+       acks then powers off; the HCS SystemExited monitor flips it to stopped. */
     hr = hcs_stop_vm(inst);
     if (FAILED(hr)) {
         asb_log(L"Shutdown failed (0x%08X). Use Force Stop.", hr);
