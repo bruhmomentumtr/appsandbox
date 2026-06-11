@@ -165,6 +165,13 @@ building → stopped → installing → booting → online → stopping → stop
 `building → installing → booting → online` on its own. Watch it with
 `wait()`/`status()` (poll-based and miss-proof) or `events()` (push, for UIs).
 
+> **Create VMs sequentially, not all at once.** A create runs a VHDX build that
+> prefetches the guest agent + build dependencies (over the network for Linux) and
+> stages them. Firing multiple creates simultaneously can make those concurrent
+> prefetch/staging steps race, and a build may fail (`iso-patch.exe exited with code
+> 1`) and get removed. It's generally advised to let one create clear its build phase
+> (or wait a short interval, e.g. ~30 s) before starting the next.
+
 ---
 
 ## API surface

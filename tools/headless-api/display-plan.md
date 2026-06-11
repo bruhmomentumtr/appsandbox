@@ -11,10 +11,11 @@ reflects that.
 >   the SDK has `open_display`/`close_display`/`display_status`/`display_ready`.
 >   Validated by hand: two VMs opened the instant readiness latched, close + reopen,
 >   then graceful shutdown + remove — the daemon stayed alive through every path.
-> - **Linux: implemented; validated after push.** Same host-side machinery; the
->   readiness signal is the Linux guest agent reporting `idd_status` once the user
->   session is up. The agent is built from the online branch on the guest, so this is
->   exercised once the branch is pushed.
+> - **Linux: implemented and validated.** Same host-side machinery; the readiness
+>   signal is the Linux guest agent reporting `idd_status:ok` once the user session is
+>   up (Mutter compositing). Validated on fresh Linux VMs built from the pushed
+>   `headless-api` branch — both latched ready via `idd_status` and opened their
+>   displays, daemon stable.
 > - **macOS: design only — UNVALIDATED.** We have no Mac to build/run it on. The
 >   macOS section is a worked design plus the one spike that must pass on real
 >   hardware (it swaps the daemon's run loop). Do not ship the macOS half on the
@@ -352,10 +353,10 @@ here. **Until that spike passes on a Mac, the macOS half is not done.**
 
 1. **Windows half (§4)** — implemented and validated (open-on-ready, close + reopen,
    graceful shutdown + remove; daemon stable throughout).
-2. **Linux half (§4)** — host-side machinery is shared and OS-agnostic; the only
-   Linux-specific code is the guest agent's `idd_status` push. It's implemented but
-   builds on the guest from the online branch, so it is **validated once the branch is
-   pushed** (a fresh Linux VM then auto-builds the new agent).
+2. **Linux half (§4)** — implemented and validated. The host-side machinery is shared
+   and OS-agnostic; the only Linux-specific code is the guest agent's `idd_status`
+   push, which builds on the guest from the pushed branch. Confirmed on fresh Linux
+   VMs: both latched ready via the agent's `idd_status` and opened their displays.
 3. **macOS half (§5)** — design only, to land behind the A-gate. A macOS daemon without
    a GUI session refuses `open_display`, so shipping the code inert is safe; trusting it
    requires the section-5 run-loop spike on a real Mac.
