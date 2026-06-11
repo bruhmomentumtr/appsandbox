@@ -131,6 +131,21 @@ class Client:
     def templates(self):         return self._req("GET", "/templates")[1].get("templates", [])
     def delete_template(self, name): return self._req("DELETE", "/templates/" + name)
     def ssh_info(self, name):    return self._req("GET", "/vms/%s/sshInfo" % name)[1]
+    def open_display(self, name):
+        """Open the VM's display window on the daemon's local desktop (the GUI's
+        Connect view). The VM must be running, and the daemon must be in an
+        interactive session that can show a window (a headless/SSH/service daemon
+        returns 409 "no_display"). Returns (status, body); status() reports
+        displayOpen, which also goes false if the user closes the window."""
+        return self._req("POST", "/vms/%s/display" % name)
+    def close_display(self, name): return self._req("DELETE", "/vms/%s/display" % name)
+    def display_status(self, name):
+        """{'open': bool, 'ready': bool}. 'ready' is the agent's own report that the
+        display driver is up (running + agentOnline + idd_status) -- a passive flag,
+        NOT a probe: polling it touches no window and no frame channel, so it can't
+        disturb the display. Wait for ready, then call open_display()."""
+        return self._req("GET", "/vms/%s/display" % name)[1]
+    def display_ready(self, name):  return bool(self.display_status(name).get("ready"))
     def snapshots(self, name):   return self._req("GET", "/vms/%s/snapshots" % name)[1].get("snapshots", [])
     def snapshots_full(self, name): return self._req("GET", "/vms/%s/snapshots" % name)[1]  # incl. "current"
     def snap_take(self, name, snapname=None):

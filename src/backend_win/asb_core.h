@@ -154,6 +154,12 @@ ASB_API const wchar_t *asb_vm_name(AsbVm vm);
 ASB_API const wchar_t *asb_vm_os_type(AsbVm vm);
 ASB_API BOOL    asb_vm_is_running(AsbVm vm);
 ASB_API BOOL    asb_vm_agent_online(AsbVm vm);
+/* TRUE when the VM is running, the guest agent is online, and the agent has reported
+   the display driver up (idd_status:ok, latched as idd_ready). All inputs are flags
+   read passively -- readiness NEVER probes the frame channel, because connecting to it
+   would itself become the single consumer and blank the display. Poll it on an interval
+   (it disturbs nothing) and gate display-open on it. */
+ASB_API BOOL    asb_vm_idd_ready(AsbVm vm);
 ASB_API BOOL    asb_vm_is_building(AsbVm vm);
 ASB_API DWORD   asb_vm_ram_mb(AsbVm vm);
 ASB_API DWORD   asb_vm_hdd_gb(AsbVm vm);

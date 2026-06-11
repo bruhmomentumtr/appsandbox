@@ -295,6 +295,12 @@ static DWORD WINAPI idd_probe_thread_proc(LPVOID param)
 
 static void idd_probe_start(VmInstance *vm)
 {
+    /* The probe exists only to AUTO-OPEN the display in the GUI: it posts
+       WM_VM_IDD_READY to g_idd_probe_hwnd when the VDD comes up. With no hwnd
+       (the headless daemon) there is nothing to notify, and auto-opening a window
+       the CLI caller didn't ask for would be wrong -- so don't run it. Headless
+       opens the display only on an explicit request, gated by asb_vm_idd_ready. */
+    if (!g_idd_probe_hwnd) return;
     if (vm->idd_probe_thread) return;
     if (vm->install_complete) return;
     if (vm->is_template) return;
@@ -3312,6 +3318,18 @@ ASB_API BOOL asb_vm_agent_online(AsbVm vm)
 {
     VmInstance *inst = vm_inst(vm);
     return inst ? inst->agent_online : FALSE;
+}
+
+ASB_API BOOL asb_vm_idd_ready(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    if (!inst || !inst->running) return FALSE;
+    /* Both inputs come from the guest agent, never from a frame-channel probe:
+       agent_online means the guest is up, and idd_ready is latched from the
+       agent's idd_status report (the display driver is "running"). Connecting to
+       the frame service to "check" would itself become the single consumer and
+       blank the display, so readiness is a passive read of these latched flags. */
+    return inst->agent_online && inst->idd_ready;
 }
 
 ASB_API BOOL asb_vm_is_building(AsbVm vm)

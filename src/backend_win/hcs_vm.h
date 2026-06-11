@@ -77,6 +77,7 @@ typedef struct {
     BOOL        running;
     BOOL        network_cleaned;  /* TRUE after network teardown (idempotent guard) */
     BOOL        agent_online;     /* TRUE when persistent agent connection is active */
+    BOOL        idd_ready;        /* TRUE once the agent reports the display driver is up (idd_status:ok) */
     BOOL        is_template;     /* TRUE = template VM (sysprep after install) */
     BOOL        install_complete; /* TRUE after guest agent first comes online */
     BOOL        test_mode;       /* TRUE = no Secure Boot (for test-signed drivers) */

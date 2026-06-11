@@ -231,6 +231,7 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
     } else if (strcmp(buf, "os_shutdown") == 0) {
         ui_log(L"Guest OS shutting down for \"%s\".", vm->name);
         vm->agent_online = FALSE;
+        vm->idd_ready = FALSE;
         vm->shutdown_requested = TRUE;
         vm->shutdown_time = GetTickCount64();
         notify_agent_status(vm);
@@ -251,6 +252,12 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
     } else if (strncmp(buf, "gpu_device_failed:", 18) == 0) {
         ui_log(L"[%s] GPU device still failing (problem %S).", vm->name, buf + 18);
     } else if (strncmp(buf, "idd_status:", 11) == 0) {
+        /* Latch display readiness from the guest's own driver-state report
+           ("running" via devcon). This is the non-destructive readiness
+           signal -- it never touches the frame channel, so polling it can't
+           steal the single consumer slot or blank the display. asb_vm_idd_ready
+           gates display-open on it. */
+        vm->idd_ready = (strcmp(buf + 11, "ok") == 0);
         ui_log(L"[%s] IDD driver: %S", vm->name, buf + 11);
     } else if (strncmp(buf, "hyperv_video:", 13) == 0) {
         ui_log(L"[%s] Hyper-V Video: %S", vm->name, buf + 13);
@@ -380,6 +387,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         }
 
         vm->agent_online = TRUE;
+        vm->idd_ready = FALSE;   /* re-evaluated by the agent's idd_status, sent right after hello */
         vm->shutdown_requested = FALSE;
         vm->last_heartbeat = GetTickCount64();
         ui_log(L"Agent online for \"%s\".", vm->name);
@@ -515,6 +523,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         disconnected:
         /* Connection lost */
         vm->agent_online = FALSE;
+        vm->idd_ready = FALSE;
         /* Atomically claim the socket so we never double-close a handle that
            vm_agent_stop() may have already closed (and whose value could have
            been recycled by another socket()/accept()). */
@@ -591,6 +600,7 @@ void vm_agent_stop(VmInstance *instance)
     }
 
     instance->agent_online = FALSE;
+    instance->idd_ready = FALSE;
     free_conn(conn);
     notify_agent_status(instance);
 }

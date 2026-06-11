@@ -76,6 +76,7 @@ in create-validation (wrong `osType` → `400`); the host-feature row mirrors
 | **macOS guest** | ❌ | ✅ (Apple silicon) |
 | Snapshots & branches | ✅ | ❌ `501` |
 | Templates (`isTemplate`, create-from-template) | ✅ | ❌ `501` |
+| Display window (`/vms/{n}/display`) | ✅ | planned ([`display-plan.md`](display-plan.md)) |
 | GPU, NAT/network modes, SSH server, SSH-key auto-deploy, SSE events | ✅ | ✅ |
 
 Only `snapshots`/`templates` are advertised in the `capabilities` object; guest
@@ -185,7 +186,7 @@ methods return `(http_status, body)` so you can branch on the status code.
 
 A **status object** has: `name, osType, state, running, agentOnline,
 installComplete, building, progress, sshState, sshPort, ramMb, hddGb, cpuCores,
-gpuMode, networkMode`.
+gpuMode, networkMode, displayOpen`.
 
 ### Lifecycle  *(return `(status, body)`)*
 | Method | Effect |
@@ -239,6 +240,46 @@ connection can never make you miss a transition.
 - `wait_online(name, timeout=900)` — shorthand for `wait(name, {"online"})`.
 
 `asb.RUNNING_STATES == {"booting", "online"}` — the powered-on states.
+
+### Display
+
+Open the VM's **display window** — the same IDD/Connect view the GUI shows — on
+the **daemon's local desktop**. It renders on demand; the daemon never auto-opens
+it (good in the GUI, wrong for a CLI).
+
+| Method | Returns |
+|---|---|
+| `display_status(name)` | `{open, ready}` — poll this; **no window is opened by polling** |
+| `display_ready(name)` | `bool` — shorthand for `display_status()["ready"]` |
+| `open_display(name)` | `(status, body)` — open (or focus) the window |
+| `close_display(name)` | `(status, body)` — close it |
+
+The pattern is **poll-then-open**:
+
+```python
+c.start("dev")
+while not c.display_ready("dev"):    # running + agentOnline + agent says display driver up
+    time.sleep(1)
+c.open_display("dev")                # a window appears on the daemon's desktop
+...
+c.close_display("dev")              # or the user just closes it with the [X]
+```
+
+- **`ready` gates the open.** It is `running && agentOnline && idd_ready`, where
+  `idd_ready` is the **guest agent's own report** that the display driver is up
+  (`idd_status:ok`) — a latched flag, **not** a probe: reading it touches no window and
+  no frame channel, so polling can't disturb the display. (Connecting to the frame
+  channel to "check" would itself become the display's single consumer.) Opening before
+  `ready` would show a black window, so `open_display` returns `409 display_not_ready`.
+- **`displayOpen`** (in every status object) reflects the *live* window, however
+  it closed — `close_display`, the window's `[X]`, VM delete, and daemon exit all
+  drive it false. `open_display` on an already-open VM just focuses the window.
+- **Local desktop only.** The window shows on the session the daemon runs in. A
+  non-interactive session (a service/SSH daemon with no visible desktop) can't
+  show one, so `open_display` returns `409 no_display` rather than spawning an
+  invisible window. Multiple VMs' displays can be open at once.
+- **Windows host only today** (Windows *and* Linux guests both supported); the
+  macOS design is captured in [`display-plan.md`](display-plan.md).
 
 ---
 
@@ -304,7 +345,7 @@ subprocess.run(["ssh", "-i", asb.key_path(), "-p", str(i["port"]),
 | `401 Unauthorized` | missing/bad bearer token (only `version` is open) |
 | `404 Not Found` | unknown VM/route |
 | `405 Method Not Allowed` | wrong verb for the route |
-| `409 Conflict` | state conflict: edit/snapshot while running (`vm_running`), delete while building (`vm_building`), daemon shutdown with active VMs (`vms_active`, lists them) |
+| `409 Conflict` | state conflict: edit/snapshot while running (`vm_running`), delete while building (`vm_building`), daemon shutdown with active VMs (`vms_active`, lists them), or open-display refused (`no_display` no interactive desktop · `not_running` · `display_not_ready` agent hasn't reported the display driver up yet) |
 | `500 Internal Server Error` | the core returned a failure (`error.hr` on Windows, `error.rc` on macOS) |
 | `501 Not Implemented` | the feature doesn't exist on this host platform (`not_supported`) — snapshots/templates on macOS; mirror of `capabilities` |
 

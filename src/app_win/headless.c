@@ -31,6 +31,7 @@
 #include "asb_core.h"          /* full API incl. internal VmInstance */
 #include "webview2_bridge.h"   /* json_get_string/int/bool for request bodies */
 #include "prereq.h"            /* prereq_check_all -> VirtualMachinePlatform check */
+#include "vm_display_idd.h"    /* IDD display window, opened on demand via the API */
 
 #pragma comment(lib, "httpapi.lib")
 
@@ -49,6 +50,56 @@ static CONDITION_VARIABLE g_ev_cv;
 static char              *g_ev_ring[EV_CAP];   /* recent event JSON (ring) */
 static LONG               g_ev_seq = 0;        /* total events ever produced */
 static volatile LONG      g_stop_all = 0;      /* signals SSE threads to exit */
+
+/* ---- IDD display windows (POST/DELETE /v1/vms/{name}/display) ---- */
+static HINSTANCE g_hinst;   /* captured in run_headless; passed to vm_display_idd */
+
+/* Per-VM display handles, keyed by VM unique_id (survives g_vms[] compaction). The
+   window runs on its own thread inside vm_display_idd, so it never blocks the
+   single-threaded request loop. Sized to ASB_MAX_VMS; concurrent VMs are capped at
+   16 by the agent table, so this never fills. */
+typedef struct { UINT64 vm_id; VmDisplayIdd *disp; } DisplayEntry;
+static DisplayEntry g_displays[ASB_MAX_VMS];
+
+static DisplayEntry *display_find(UINT64 vm_id)
+{
+    int i;
+    if (!vm_id) return NULL;
+    for (i = 0; i < ASB_MAX_VMS; i++)
+        if (g_displays[i].vm_id == vm_id) return &g_displays[i];
+    return NULL;
+}
+static void display_drop(DisplayEntry *e)   /* destroy the window + free the slot */
+{
+    if (!e) return;
+    if (e->disp) vm_display_idd_destroy(e->disp);
+    e->disp = NULL; e->vm_id = 0;
+}
+/* TRUE if this VM has a live (not user-closed) display window. */
+static BOOL display_is_open(UINT64 vm_id)
+{
+    DisplayEntry *e = display_find(vm_id);
+    return e && e->disp && vm_display_idd_is_open(e->disp);
+}
+/* If the user closed the window (X), vm_display_idd has already stopped its threads
+   and freed the vsock frame connection (WM_CLOSE handler); drop our now-dead handle
+   so the slot frees. Called before acting on any display request. */
+static void display_reap_stale(UINT64 vm_id)
+{
+    DisplayEntry *e = display_find(vm_id);
+    if (e && e->disp && !vm_display_idd_is_open(e->disp))
+        display_drop(e);
+}
+/* A-gate: can this process put a window on a visible desktop? FALSE in a service /
+   non-interactive session, so we refuse instead of spawning an invisible window. */
+static BOOL host_can_show_window(void)
+{
+    HWINSTA ws = GetProcessWindowStation();
+    USEROBJECTFLAGS uof; DWORD need = 0;
+    if (ws && GetUserObjectInformationW(ws, UOI_FLAGS, &uof, sizeof(uof), &need))
+        return (uof.dwFlags & WSF_VISIBLE) != 0;
+    return FALSE;
+}
 
 /* ---- Logging ---- */
 
@@ -189,7 +240,8 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos += sprintf_s(out + pos, cap - pos,
         ",\"state\":\"%s\",\"running\":%s,\"agentOnline\":%s,\"installComplete\":%s,"
         "\"building\":%s,\"progress\":%d,\"sshState\":%d,\"sshPort\":%lu,"
-        "\"ramMb\":%lu,\"hddGb\":%lu,\"cpuCores\":%lu,\"gpuMode\":%d,\"networkMode\":%d}",
+        "\"ramMb\":%lu,\"hddGb\":%lu,\"cpuCores\":%lu,\"gpuMode\":%d,\"networkMode\":%d,"
+        "\"displayOpen\":%s}",
         derive_state(v),
         v->running ? "true" : "false", v->agent_online ? "true" : "false",
         v->install_complete ? "true" : "false", v->building_vhdx ? "true" : "false",
@@ -197,7 +249,8 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
         (v->ssh_key_deployed && v->ssh_state == 2) ? 4 : v->ssh_state,   /* 4 = ready + key deployed */
         (unsigned long)v->ssh_port,
         (unsigned long)v->ram_mb, (unsigned long)v->hdd_gb, (unsigned long)v->cpu_cores,
-        v->gpu_mode, v->network_mode);
+        v->gpu_mode, v->network_mode,
+        display_is_open(v->unique_id) ? "true" : "false");
     return pos;
 }
 
@@ -731,6 +784,7 @@ static int handle_request(PHTTP_REQUEST req)
                          "wait for the build to finish, then delete");
                 return 0;
             }
+            if (dv) display_drop(display_find(dv->unique_id));   /* close its display window first */
             send_hr(req->RequestId, "delete", nu, asb_vm_delete(vm));
             return 0;
         }
@@ -748,6 +802,78 @@ static int handle_request(PHTTP_REQUEST req)
                 (unsigned long)v->ssh_port, user, ssh_rep, v->ssh_enabled ? "true" : "false",
                 v->ssh_key_deployed ? "true" : "false");
             send_json(req->RequestId, 200, "OK", buf);
+            return 0;
+        }
+
+        if (wcscmp(sub, L"display") == 0) {
+            VmInstance *v = asb_vm_instance(vm);
+            if (!v) { send_err(req->RequestId, 404, "Not Found", "not_found", "no such VM"); return 0; }
+            display_reap_stale(v->unique_id);   /* drop a self-closed (X) display first */
+            if (verb == HttpVerbPOST) {
+                DisplayEntry *e;
+                if (!host_can_show_window()) {
+                    send_err(req->RequestId, 409, "Conflict", "no_display",
+                             "no local interactive desktop is available to show the window "
+                             "(the daemon is in a non-interactive/service session)");
+                    return 0;
+                }
+                if (!v->running) {
+                    send_err(req->RequestId, 409, "Conflict", "not_running",
+                             "VM is not running; start it before opening the display");
+                    return 0;
+                }
+                /* Gate on display readiness -- a passive read of agent-online + the
+                   agent's latched idd_status (display driver up). It never probes the
+                   frame channel, so the check itself can't steal the single consumer
+                   slot or blank the display the way a connect-test would. */
+                if (!asb_vm_idd_ready(vm)) {
+                    send_err(req->RequestId, 409, "Conflict", "display_not_ready",
+                             "the VM's virtual display driver is not up yet; retry shortly");
+                    return 0;
+                }
+                e = display_find(v->unique_id);   /* present => still open (a closed one was reaped above) */
+                if (e) {
+                    vm_display_idd_focus(e->disp);            /* already open -> bring to front */
+                } else {
+                    int slot; for (slot = 0; slot < ASB_MAX_VMS && g_displays[slot].vm_id; slot++) {}
+                    if (slot == ASB_MAX_VMS) {
+                        send_err(req->RequestId, 503, "Service Unavailable", "too_many",
+                                 "no free display slot");
+                        return 0;
+                    }
+                    e = &g_displays[slot];
+                    e->disp = vm_display_idd_create(v, g_hinst, NULL);
+                    if (!e->disp) {
+                        e->vm_id = 0;
+                        send_err(req->RequestId, 500, "Internal Server Error", "display_failed",
+                                 "failed to create the display window");
+                        return 0;
+                    }
+                    e->vm_id = v->unique_id;
+                }
+                send_json(req->RequestId, 200, "OK", "{\"ok\":true,\"displayOpen\":true}");
+                return 0;
+            }
+            if (verb == HttpVerbDELETE) {
+                display_drop(display_find(v->unique_id));
+                send_json(req->RequestId, 200, "OK", "{\"ok\":true,\"displayOpen\":false}");
+                return 0;
+            }
+            if (verb == HttpVerbGET) {
+                /* Pollable state -- NO window, and NO frame-channel contact. "ready" is
+                   asb_vm_idd_ready: running + agent-online + the agent's latched
+                   idd_status flag, so a client can poll this on an interval (it disturbs
+                   nothing) and POST to open once ready. */
+                char b[160];
+                BOOL open = display_is_open(v->unique_id);
+                BOOL ready = open || asb_vm_idd_ready(vm);
+                sprintf_s(b, sizeof(b), "{\"open\":%s,\"ready\":%s}",
+                          open ? "true" : "false", ready ? "true" : "false");
+                send_json(req->RequestId, 200, "OK", b);
+                return 0;
+            }
+            send_err(req->RequestId, 405, "Method Not Allowed", "method",
+                     "use GET to poll state, POST to open the display, DELETE to close it");
             return 0;
         }
 
@@ -1068,6 +1194,7 @@ int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
     hlog(L"single-instance lock acquired.");
 
     asb_set_hinstance(hInst);
+    g_hinst = hInst;
     asb_set_log_callback(core_log_cb, NULL);
     asb_set_state_callback(state_cb, NULL);
     asb_set_progress_callback(progress_cb, NULL);
@@ -1116,6 +1243,8 @@ int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
     HttpCloseServerSession(g_session);
     HttpTerminate(HTTP_INITIALIZE_SERVER, NULL);
     free(req);
+
+    { int i; for (i = 0; i < ASB_MAX_VMS; i++) display_drop(&g_displays[i]); }   /* close display windows */
 
     /* The daemon OWNS its VMs: exit terminates them (asb_cleanup stops the
        per-VM monitor/agent/ssh-proxy threads, hcs_terminate_vm's every running

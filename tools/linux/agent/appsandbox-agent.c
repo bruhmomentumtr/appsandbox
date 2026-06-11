@@ -451,6 +451,7 @@ static void send_reply(int fd, const char *tag, const char *msg)
 static void *heartbeat_thread(void *arg)
 {
     (void)arg;
+    int idd_last = 0;   /* last reported display-driver readiness (so we only send on change) */
     while (!g_stop) {
         /* Sleep first so the very first heartbeat is at +5s, after hello. */
         for (int s = 0; s < HEARTBEAT_INTERVAL_SEC && !g_stop; s++)
@@ -461,6 +462,20 @@ static void *heartbeat_thread(void *arg)
         if (send_line(fd, "heartbeat") < 0) {
             agent_log("heartbeat: send failed, exiting thread");
             break;
+        }
+        /* Report display readiness to the host (the same idd_status the Windows
+         * agent sends). The display is serveable once the user session is up --
+         * Mutter is compositing, so asb_drm has an active framebuffer for a host
+         * consumer to capture. The host latches this as the display-open gate, so
+         * it never has to probe the frame channel to find out. send_line is
+         * mutex-locked, so this is safe alongside the command thread's replies. */
+        {
+            uid_t uid = find_graphical_session_uid();
+            int ready = (uid != 0 && is_user_session_ready(uid));
+            if (ready != idd_last) {
+                send_line(fd, ready ? "idd_status:ok" : "idd_status:not_found");
+                idd_last = ready;
+            }
         }
     }
     return NULL;
