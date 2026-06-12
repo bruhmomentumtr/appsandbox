@@ -95,8 +95,10 @@ static void open_log(void) {
 }
 
 static NSString *product_version(void) {
+    /* CFBundleShortVersionString is stamped from Directory.Build.props at build
+       time; the fallback is a sentinel so a missing stamp is obvious. */
     NSString *v = [NSBundle mainBundle].infoDictionary[@"CFBundleShortVersionString"];
-    return v.length ? v : @"0.1.2";
+    return v.length ? v : @"0.0.0";
 }
 
 /* ---- Single-instance lock (shared with the GUI, see headless.h) ---- */
