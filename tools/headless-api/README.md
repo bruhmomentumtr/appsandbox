@@ -1,10 +1,8 @@
 # AppSandbox headless SDK (`asb.py`)
 
 A small, dependency-free Python client for driving AppSandbox programmatically —
-create, configure, snapshot, and run GPU-enabled VMs without the GUI.
-
-> Design rationale, architecture, and the full daemon decision log live in
-> [`PLAN.md`](PLAN.md); this README is the usage/API reference.
+create, configure, snapshot, and run GPU-enabled VMs without the GUI. This README
+is the usage/API reference.
 
 ```python
 import asb
@@ -76,7 +74,7 @@ in create-validation (wrong `osType` → `400`); the host-feature row mirrors
 | **macOS guest** | ❌ | ✅ (Apple silicon) |
 | Snapshots & branches | ✅ | ❌ `501` |
 | Templates (`isTemplate`, create-from-template) | ✅ | ❌ `501` |
-| Display window (`/vms/{n}/display`) | ✅ | planned ([`display-plan.md`](display-plan.md)) |
+| Display window (`/vms/{n}/display`) | ✅ | ✅ (daemon in a console GUI session) |
 | GPU, NAT/network modes, SSH server, SSH-key auto-deploy, SSE events | ✅ | ✅ |
 
 Only `snapshots`/`templates` are advertised in the `capabilities` object; guest
@@ -272,21 +270,27 @@ c.open_display("dev")                # a window appears on the daemon's desktop
 c.close_display("dev")              # or the user just closes it with the [X]
 ```
 
-- **`ready` gates the open.** It is `running && agentOnline && idd_ready`, where
-  `idd_ready` is the **guest agent's own report** that the display driver is up
-  (`idd_status:ok`) — a latched flag, **not** a probe: reading it touches no window and
-  no frame channel, so polling can't disturb the display. (Connecting to the frame
-  channel to "check" would itself become the display's single consumer.) Opening before
-  `ready` would show a black window, so `open_display` returns `409 display_not_ready`.
+- **`ready` gates the open.** On **Windows/Linux** it is `running && agentOnline &&
+  idd_ready`, where `idd_ready` is the **guest agent's own report** that the display
+  driver is up (`idd_status:ok`) — a latched flag, **not** a probe: reading it touches no
+  window and no frame channel, so polling can't disturb the display. (Connecting to the
+  frame channel to "check" would itself become the display's single consumer.) On
+  **macOS** there is no frame channel or display driver — the view binds the in-process
+  VM framebuffer directly — so `ready` is simply `running && agentOnline`, with nothing
+  to probe. Either way, opening before `ready` would show a black window, so
+  `open_display` returns `409 display_not_ready`.
 - **`displayOpen`** (in every status object) reflects the *live* window, however
   it closed — `close_display`, the window's `[X]`, VM delete, and daemon exit all
-  drive it false. `open_display` on an already-open VM just focuses the window.
+  drive it false. `open_display` on an already-open VM just focuses the window
+  (foregrounding it).
 - **Local desktop only.** The window shows on the session the daemon runs in. A
   non-interactive session (a service/SSH daemon with no visible desktop) can't
   show one, so `open_display` returns `409 no_display` rather than spawning an
   invisible window. Multiple VMs' displays can be open at once.
-- **Windows host only today** (Windows *and* Linux guests both supported); the
-  macOS design is captured in [`display-plan.md`](display-plan.md).
+- **Both hosts** (Windows *and* macOS). On Windows it serves Windows and Linux
+  guests; on macOS the daemon must be in a **console GUI session** (the A-gate), so
+  a `sudo` daemon launched from a Terminal in the active desktop works, but a launchd
+  system daemon or SSH session is correctly refused (`409 no_display`).
 
 ---
 

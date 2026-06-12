@@ -76,7 +76,7 @@ COVERAGE = [
     ("delete-during-build guard (409)",         "per-VM (each thread, mid-build)"),
     ("GET .../sshInfo",                         "per-VM"),
     ("SSH key auto-deploy + key-only login",    "per-VM (sshEnabled+sshDeployKey, each OS)"),
-    ("GET/POST/DELETE .../display open+close",   "per-VM when online; skip on macOS / Linux-pre-push / no-desktop"),
+    ("GET/POST/DELETE .../display open+close",   "per-VM when online (Win+mac); skip on no-desktop / Linux-pre-push"),
     ("snapshots take/rename/delete + GET tree", "per-VM"),
     ("branches: start-from-snapshot + delete",  "per-VM"),
     ("GET /events (SSE) per VM",                "per-VM (each thread, concurrent SSE)"),

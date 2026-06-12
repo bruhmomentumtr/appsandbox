@@ -22,6 +22,8 @@ extern "C" {
 #define BACKEND_ERR_NOT_IMPLEMENTED -4
 #define BACKEND_ERR_ALREADY_RUNNING -5
 #define BACKEND_ERR_NOT_RUNNING     -6
+#define BACKEND_ERR_NO_DISPLAY      -7   /* no console GUI session to show a window in */
+#define BACKEND_ERR_NOT_READY       -8   /* VM running but the guest agent isn't online yet */
 
 #define CORE_VM_NAME_MAX       128
 #define CORE_VM_OS_TYPE_MAX     32

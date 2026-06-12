@@ -96,6 +96,27 @@ void asb_mac_set_event_cb(AsbMacEventCallback cb);
  * activate under --headless. */
 void asb_mac_set_headless(BOOL headless);
 
+/* ---- Display window (opened on demand by the headless daemon) ----
+ * In the GUI the per-VM display NSWindow is created automatically on the Running
+ * transition; under --headless it is created only on an explicit request, after
+ * two gates. All three run ON THE MAIN QUEUE (the caller marshals) -- the window
+ * and the in-process VZVirtualMachine both live there. */
+
+/* A-gate: is there a console (on-console) Aqua login session this process can
+ * show a window in? FALSE over SSH / in a launchd service session, where the
+ * daemon must refuse to open a display rather than spawn an invisible window. */
+BOOL asb_mac_have_gui_session(void);
+
+/* Open (or focus, if already open) the VM's display window. Returns BACKEND_OK,
+ * or: BACKEND_ERR_NO_DISPLAY (no GUI session), BACKEND_ERR_NOT_FOUND,
+ * BACKEND_ERR_NOT_RUNNING, BACKEND_ERR_NOT_READY (agent not online yet). macOS
+ * binds the in-process framebuffer directly (no frame channel / display driver),
+ * so readiness is simply running && agent_online -- nothing to probe. */
+int  asb_mac_open_display(const char *name);
+
+/* Close the VM's display window if open (no-op otherwise). */
+void asb_mac_close_display(const char *name);
+
 /* Path of the AppSandbox SSH private key (~/Library/Application Support/
  * AppSandbox/ssh/id_appsandbox); pair .pub is deployed into guests created
  * with ssh_deploy_key. Returns the path whether or not the key exists yet. */

@@ -161,37 +161,36 @@ def run_vm_lifecycle(spec):
         check("guest installComplete", bool(son) and son["installComplete"], "state=%s" % (son and son["state"]))
 
         # --- display: a quick programmatic open + close now that the VM is online.
-        #     Readiness is the agent's own idd_status report (running + agentOnline +
-        #     display driver up), latched on the host -- never a frame-channel probe.
-        #     SKIPped (not failed) so CI stays green in three cases:
-        #       * macOS host -- the display is design-only there;
+        #     Readiness (running + agentOnline + the display driver up) is a latched,
+        #     passive flag -- never a frame-channel probe. On macOS there is no frame
+        #     channel/driver (VZVirtualMachineView binds the in-process framebuffer),
+        #     so readiness is just running + agentOnline. SKIPped (not failed) so CI
+        #     stays green in two cases:
         #       * Linux guest whose deployed agent predates the idd_status push, so
-        #         readiness never latches -- exercised once this branch is pushed and a
-        #         fresh Linux VM auto-builds the updated agent;
+        #         readiness never latches -- exercised once a fresh Linux VM auto-builds
+        #         the updated agent;
         #       * a daemon in a non-interactive session that can't show a window
-        #         (409 no_display). ---
-        if sys.platform == "darwin":
-            print("  SKIP  [%s] display open/close -- not implemented on this host (macOS planned)" % name, flush=True)
+        #         (409 no_display) -- e.g. a sudo/launchd daemon with no console Aqua
+        #         session, on either Windows or macOS. ---
+        check("display not open before open", son.get("displayOpen") is False)
+        deadline = time.time() + 90
+        while time.time() < deadline and not c.display_ready(name):
+            time.sleep(2)
+        ready = c.display_ready(name)
+        if not ready and os_type == "Linux":
+            print("  SKIP  [%s] display open/close -- Linux guest readiness needs the pushed agent" % name, flush=True)
         else:
-            check("display not open before open", son.get("displayOpen") is False)
-            deadline = time.time() + 90
-            while time.time() < deadline and not c.display_ready(name):
-                time.sleep(2)
-            ready = c.display_ready(name)
-            if not ready and os_type == "Linux":
-                print("  SKIP  [%s] display open/close -- Linux guest readiness needs the pushed agent" % name, flush=True)
+            check("display ready when online", ready, "display_status=%s" % c.display_status(name))
+            oc, ob = c.open_display(name)
+            if oc == 409 and ob.get("error", {}).get("code") == "no_display":
+                print("  SKIP  [%s] display open/close -- no interactive desktop on daemon session" % name, flush=True)
             else:
-                check("display ready when online", ready, "display_status=%s" % c.display_status(name))
-                oc, ob = c.open_display(name)
-                if oc == 409 and ob.get("error", {}).get("code") == "no_display":
-                    print("  SKIP  [%s] display open/close -- no interactive desktop on daemon session" % name, flush=True)
-                else:
-                    check("display open -> 200", oc == 200, "%s %s" % (oc, ob))
-                    check("displayOpen true after open", bool(st()) and st().get("displayOpen") is True)
-                    cc, cb = c.close_display(name)
-                    check("display close -> 200", cc == 200, "%s %s" % (cc, cb))
-                    check("displayOpen false after close", bool(st()) and st().get("displayOpen") is False)
-                check("daemon alive after display open/close", bool(c.version().get("product")))
+                check("display open -> 200", oc == 200, "%s %s" % (oc, ob))
+                check("displayOpen true after open", bool(st()) and st().get("displayOpen") is True)
+                cc, cb = c.close_display(name)
+                check("display close -> 200", cc == 200, "%s %s" % (cc, cb))
+                check("displayOpen false after close", bool(st()) and st().get("displayOpen") is False)
+            check("daemon alive after display open/close", bool(c.version().get("product")))
 
         # --- duplicate name rejected ---
         check("duplicate name -> 400", c._req("POST", "/vms", dict(cfg))[0] == 400)

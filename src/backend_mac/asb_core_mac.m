@@ -8,6 +8,7 @@
  */
 
 #import "asb_core_mac.h"
+#import <CoreGraphics/CoreGraphics.h>   /* CGSessionCopyCurrentDictionary (A-gate) */
 #import "vm_dir.h"
 #import "vz_vm.h"
 #import "vz_display.h"
@@ -986,6 +987,59 @@ void asb_mac_vm_set_audio_muted(const char *name, BOOL muted) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         [agent sendCommand:cmd timeout:3.0];
     });
+}
+
+/* ---- Display window (headless daemon, opened on demand) ----
+ * The same window the GUI auto-creates on the Running transition, but opened
+ * only on an explicit API request. macOS has no separate frame channel/driver
+ * (VZVirtualMachineView binds the in-process framebuffer), so there is nothing
+ * to probe: readiness is running && agent_online. These run on the main queue
+ * (the daemon marshals via on_main); window + VZ live there. */
+
+BOOL asb_mac_have_gui_session(void) {
+    CFDictionaryRef info = CGSessionCopyCurrentDictionary();
+    if (!info) return NO;   /* no Aqua session at all (launchd system daemon) */
+    CFBooleanRef on = CFDictionaryGetValue(info, kCGSessionOnConsoleKey);
+    BOOL ok = (on != NULL && CFBooleanGetValue(on));
+    CFRelease(info);
+    return ok;
+}
+
+int asb_mac_open_display(const char *name) {
+    if (!name) return BACKEND_ERR_INVALID_ARG;
+    if (!asb_mac_have_gui_session()) return BACKEND_ERR_NO_DISPLAY;   /* A-gate */
+    int idx = vm_index_of(name);
+    if (idx < 0) return BACKEND_ERR_NOT_FOUND;
+    /* Reap a window the user closed with the X button: its controller lingers
+       (g_display_refs holds the only strong ref) until something clears it.
+       Doing it here -- on a later request, off the WM close call stack -- is
+       safe, unlike clearing it inside windowWillClose:. */
+    if (g_display_refs[idx] && ((VzDisplayWindow *)g_display_refs[idx]).userClosed) {
+        g_display_refs[idx] = nil;
+        g_vms[idx].display  = nil;
+    }
+    if (!g_vms[idx].running || !g_vms[idx].vz_handle) return BACKEND_ERR_NOT_RUNNING;
+    if (!g_vms[idx].agent_online)                     return BACKEND_ERR_NOT_READY;
+    if (g_display_refs[idx]) {   /* already open -> focus */
+        [[(VzDisplayWindow *)g_display_refs[idx] window] makeKeyAndOrderFront:nil];
+        return BACKEND_OK;
+    }
+    VzDisplayWindow *display = [[VzDisplayWindow alloc] initWithVzVm:g_vms[idx].vz_handle];
+    g_display_refs[idx] = display;
+    g_vms[idx].display  = display;
+    [display showDisplay];
+    return BACKEND_OK;
+}
+
+void asb_mac_close_display(const char *name) {
+    if (!name) return;
+    int idx = vm_index_of(name);
+    if (idx < 0 || !g_display_refs[idx]) return;
+    VzDisplayWindow *display = g_display_refs[idx];   /* local strong ref keeps it
+                                                         alive across the close */
+    g_display_refs[idx] = nil;
+    g_vms[idx].display  = nil;
+    [display.window close];                           /* fires windowWillClose: */
 }
 
 int asb_mac_vm_stop(const char *name, int force) {

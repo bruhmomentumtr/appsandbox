@@ -31,8 +31,10 @@
  */
 
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>           /* NSApplication run loop (display windows in a GUI session) */
 #import <Virtualization/Virtualization.h>
 #import "asb_core_mac.h"
+#import "vz_display.h"              /* VzDisplayWindow.userClosed (displayOpen status) */
 #import "host_info.h"
 #import "vm_dir.h"
 #include "headless.h"
@@ -190,8 +192,8 @@ static NSString *json_str(id obj) {
 }
 
 /* ---- Core event callback ----
- * Fires on the main queue for everything data-bearing (verified line by line
- * in PLAN.md s12.2). NOTE: AGENT_STATUS's int_value is overloaded (online
+ * Fires on the main queue for everything data-bearing. NOTE: AGENT_STATUS's
+ * int_value is overloaded (online
  * flag / ssh state / proxy event), so the daemon never interprets it -- GET
  * reads the live core fields instead; SSE forwards the same three event kinds
  * the Windows daemon emits (state/progress/alert). */
@@ -263,7 +265,7 @@ static void delete_discovery(void) {
     [[NSFileManager defaultManager] removeItemAtPath:discovery_path() error:nil];
 }
 
-/* ---- Derived state (PLAN.md s6, macOS column) ---- */
+/* ---- Derived state (macOS) ---- */
 
 static const char *derive_state(const AsbVmMac *v) {
     if (!v->install_complete && v->install_progress >= 0) return "installing";
@@ -300,6 +302,9 @@ static NSDictionary *vm_status_dict(const AsbVmMac *v) {
         @"cpuCores":        @(v->cpu_cores),
         @"gpuMode":         @(v->gpu_mode),
         @"networkMode":     @(v->network_mode),
+        /* Live window state: nil ref or a user-(X)-closed one both read false,
+           mirroring the Windows daemon's is_open. */
+        @"displayOpen":     (v->display != nil && !v->display.userClosed) ? @YES : @NO,
     };
 }
 
@@ -883,6 +888,58 @@ static int handle_request(int fd, HttpReq *r) {
             return 0;
         }
 
+        if ([sub isEqualToString:@"display"]) {
+            BOOL isDELETE = strcmp(r->method, "DELETE") == 0;
+            if (isPOST) {   /* open (or focus) the display window */
+                __block int rc = BACKEND_OK;
+                on_main(^{ rc = asb_mac_open_display(name.UTF8String); });
+                if (rc == BACKEND_OK)
+                    send_json(fd, 200, "OK",
+                              json_str(@{ @"ok": @YES, @"displayOpen": @YES }));
+                else if (rc == BACKEND_ERR_NO_DISPLAY)
+                    send_err(fd, 409, "Conflict", @"no_display",
+                             @"no local interactive desktop is available to show the "
+                             @"window (the daemon is in a non-interactive/service session)");
+                else if (rc == BACKEND_ERR_NOT_RUNNING)
+                    send_err(fd, 409, "Conflict", @"not_running",
+                             @"VM is not running; start it before opening the display");
+                else if (rc == BACKEND_ERR_NOT_READY)
+                    send_err(fd, 409, "Conflict", @"display_not_ready",
+                             @"the VM's guest agent is not online yet; retry shortly");
+                else if (rc == BACKEND_ERR_NOT_FOUND)
+                    send_err(fd, 404, "Not Found", @"not_found", @"no such VM");
+                else
+                    send_json(fd, 500, "Internal Server Error",
+                              json_str(@{ @"ok": @NO, @"error": @{ @"rc": @(rc) } }));
+                return 0;
+            }
+            if (isDELETE) {   /* close the window (no-op if already closed) */
+                on_main(^{ asb_mac_close_display(name.UTF8String); });
+                send_json(fd, 200, "OK",
+                          json_str(@{ @"ok": @YES, @"displayOpen": @NO }));
+                return 0;
+            }
+            if (isGET) {
+                /* Pollable + passive: reads flags, opens no window, touches no
+                   frame channel. macOS binds the in-process framebuffer directly,
+                   so ready == running && agent_online -- nothing to probe. */
+                __block BOOL open = NO, ready = NO;
+                on_main(^{
+                    AsbVmMac *v = asb_mac_vm_find(name.UTF8String);
+                    if (!v) return;
+                    open  = (v->display != nil && !v->display.userClosed);
+                    ready = open || (v->running && v->agent_online);
+                });
+                send_json(fd, 200, "OK",
+                          json_str(@{ @"open": open ? @YES : @NO,
+                                      @"ready": ready ? @YES : @NO }));
+                return 0;
+            }
+            send_err(fd, 405, "Method Not Allowed", @"method",
+                     @"use GET to poll state, POST to open the display, DELETE to close it");
+            return 0;
+        }
+
         if ([sub hasPrefix:@"snapshots"]) {
             send_501(fd, @"snapshots");
             return 0;
@@ -1103,11 +1160,24 @@ int run_headless(int argc, const char *argv[]) {
         return 1;
     }
 
-    hlog(@"entering main run loop.");
-    /* Drains the main dispatch queue -- where every VZ op, agent callback, and
-       core mutation runs. iso-patch-mac uses the same bare-CFRunLoop model for
-       VZ, so no NSApplication (and no window server) is needed. */
-    CFRunLoopRun();
+    /* Main run loop. Both [NSApp run] and CFRunLoopRun drain the MAIN DISPATCH
+       QUEUE -- where every VZ op, agent callback, and core mutation runs -- so
+       the daemon behaves identically either way (and the SIGINT/SIGTERM dispatch
+       sources still fire). We use AppKit's loop ONLY in a console GUI session,
+       because the display window (a VZVirtualMachineView in an NSWindow) needs the
+       window server; with no session we keep the bare CFRunLoop so the daemon
+       still runs over SSH / launchd (display-open is then refused by the same
+       A-gate). cleanup_and_exit calls exit() directly, so neither loop needs an
+       explicit stop. iso-patch-mac proves VZ runs fine under a bare CFRunLoop. */
+    if (asb_mac_have_gui_session()) {
+        hlog(@"entering AppKit run loop (console GUI session -- display windows available).");
+        [NSApplication sharedApplication];
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        [NSApp run];
+    } else {
+        hlog(@"entering bare CFRunLoop (no GUI session -- display unavailable).");
+        CFRunLoopRun();
+    }
 
     /* Not normally reached (exit paths call cleanup_and_exit). */
     cleanup_and_exit(0);
