@@ -88,7 +88,22 @@ PKG_ZIP=""
 publish_package() {
     rm -rf "$PACKAGE_DIR"
     mkdir -p "$PACKAGE_DIR"
-    ditto -c -k --keepParent "$APP_PATH" "$PKG_ZIP"
+    # Zip the (already signed/notarized/stapled) .app alongside the headless-api SDK
+    # so BOTH sit at the zip root -- AppSandbox.app + headless-api/ -- with no tools/
+    # parent. ditto copies the bundle verbatim, preserving its signature and staple.
+    local stage; stage="$(mktemp -d)"
+    ditto "$APP_PATH" "$stage/$(basename "$APP_PATH")"
+    local sdk="$ROOT/tools/headless-api"
+    local dst="$stage/headless-api"
+    mkdir -p "$dst"
+    cp "$sdk/asb.py" "$sdk/README.md" "$dst/"
+    ditto "$sdk/examples" "$dst/examples"
+    ditto "$sdk/tests"    "$dst/tests"
+    # __pycache__/*.pyc are local build cruft, never shipped.
+    find "$dst" -type d -name __pycache__ -prune -exec rm -rf {} +
+    find "$dst" -type f -name '*.pyc' -delete
+    ditto -c -k "$stage" "$PKG_ZIP"
+    rm -rf "$stage"
     rm -f "$SUBMIT_ZIP"
 }
 

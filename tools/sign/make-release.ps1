@@ -356,13 +356,32 @@ foreach ($sub in @('resources', 'drivers', 'web')) {
     $global:LASTEXITCODE = 0   # robocopy 0..7 = success
 }
 
+# Ship the headless-api SDK as a sibling folder at the zip root: the Python SDK +
+# examples + tests that script the daemon over the HTTP API. The folder is named
+# "headless-api" - the tools\ parent is intentionally NOT shipped. __pycache__ and
+# *.pyc are local build cruft and are excluded.
+$sdkSrc = Join-Path $repo 'tools\headless-api'
+$sdkDst = Join-Path $stage 'headless-api'
+New-Item -ItemType Directory -Force -Path $sdkDst | Out-Null
+foreach ($f in @('asb.py', 'README.md')) {
+    $fsrc = Join-Path $sdkSrc $f
+    if (-not (Test-Path $fsrc)) { throw "Missing headless-api file $f under $sdkSrc." }
+    Copy-Item $fsrc (Join-Path $sdkDst $f) -Force
+}
+foreach ($sub in @('examples', 'tests')) {
+    robocopy (Join-Path $sdkSrc $sub) (Join-Path $sdkDst $sub) /E /XD __pycache__ /XF *.pyc | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "robocopy headless-api\$sub failed (exit $LASTEXITCODE)." }
+    $global:LASTEXITCODE = 0
+}
+
 # Tripwire: the signed drivers come from the deposit (not the build) - fail loudly if any
 # expected artifact is missing rather than shipping a partial zip.
 $required = @(
     'AppSandbox.exe', 'appsandbox_core.dll', 'iso-patch.exe', 'WebView2Loader.dll',
     'drivers\AppSandboxVDD.dll', 'drivers\AppSandboxVDD.inf', 'drivers\AppSandboxVDD.cat',
     'drivers\AppSandboxVAD.sys', 'drivers\AppSandboxVAD.inf', 'drivers\AppSandboxVAD.cat',
-    'drivers\devcon.exe', 'resources', 'web'
+    'drivers\devcon.exe', 'resources', 'web',
+    'headless-api\asb.py', 'headless-api\README.md', 'headless-api\examples', 'headless-api\tests'
 )
 $missing = @($required | Where-Object { -not (Test-Path (Join-Path $stage $_)) })
 if ($missing.Count) { throw "Refusing to package - missing expected artifacts: $($missing -join ', ')" }
