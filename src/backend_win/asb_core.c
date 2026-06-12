@@ -2220,7 +2220,7 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
         /* Branch must match the branch this binary was built from, so the Linux
            guest builds its agent/driver source from the SAME revision. */
         swprintf_s(args_buf, 2048,
-            L"--prefetch-repo --branch \"headless-api\" --out-dir \"%s\"",
+            L"--prefetch-repo --branch \"main\" --out-dir \"%s\"",
             extras);
         if (spawn_iso_patch_prefetch(args_buf) != 0)
             asb_log(L"WARN: prefetch-repo failed (agent + DKMS build will fail)");
