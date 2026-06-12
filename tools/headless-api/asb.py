@@ -122,6 +122,9 @@ class Client:
         return self._req("POST", "/vms", cfg)
 
     def edit(self, name, **fields):
+        """Change config on a STOPPED VM. Honors ramMb/cpuCores/gpuMode/networkMode
+        (same ranges as create); name is fixed at create and any other key is ignored.
+        Returns (status, body) -- 409 if the VM is running."""
         if isinstance(fields.get("ramMb"), int):
             fields["ramMb"] -= fields["ramMb"] % 2   # 2 MB-aligned, like the GUI
         return self._req("PUT", "/vms/%s" % name, fields)
@@ -149,6 +152,7 @@ class Client:
     def snapshots(self, name):   return self._req("GET", "/vms/%s/snapshots" % name)[1].get("snapshots", [])
     def snapshots_full(self, name): return self._req("GET", "/vms/%s/snapshots" % name)[1]  # incl. "current"
     def snap_take(self, name, snapname=None):
+        """Take a snapshot -- the VM must be STOPPED (409 vm_running otherwise)."""
         return self._req("POST", "/vms/%s/snapshots" % name, {"name": snapname} if snapname else {})
     def snap_delete(self, name, index):
         return self._req("DELETE", "/vms/%s/snapshots/%d" % (name, index))
