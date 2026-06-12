@@ -32,4 +32,13 @@
       <PreprocessorDefinitions>ASB_VERSION_COMMA=$(AsbVersionComma);ASB_VERSION_STR=$(AsbVersion);ASB_ORIG_FILENAME=$(TargetFileName);ASB_INTERNAL_NAME=$(TargetName);ASB_FILE_TYPE=$(AsbFileType);%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ResourceCompile>
   </ItemDefinitionGroup>
+
+  <!-- Make the version string available to C/C++ sources from the same single source, for
+       code that reports it at runtime (e.g. the headless API's /version response). Passed
+       UNQUOTED and stringized in the source, mirroring the version.rc injection above. -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PreprocessorDefinitions>ASB_VERSION_SHORT=$(AsbVersionShort);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
 </Project>

@@ -36,7 +36,16 @@
 #pragma comment(lib, "httpapi.lib")
 
 #define ASB_API_VERSION  "v1"
-#define ASB_PRODUCT_VER  "0.1.2"
+/* Product version derives from Directory.Build.props (the single source of truth):
+   Directory.Build.targets passes AsbVersionShort in as the unquoted ASB_VERSION_SHORT
+   define, stringized here exactly as build\version.rc does for the binary VERSIONINFO.
+   The fallback keeps a standalone compile (without the MSBuild define) valid. */
+#define ASB_VER_STR2(x) #x
+#define ASB_VER_STR(x)  ASB_VER_STR2(x)
+#ifndef ASB_VERSION_SHORT
+#define ASB_VERSION_SHORT 0.0.0
+#endif
+#define ASB_PRODUCT_VER  ASB_VER_STR(ASB_VERSION_SHORT)
 #define DEFAULT_PORT     8787
 
 /* forward decls (used by the event callbacks defined below) */
