@@ -17,7 +17,9 @@
 #include <sys/types.h>
 #include <sys/select.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#include <pwd.h>
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
@@ -89,11 +91,44 @@ static void agent_log(const char *fmt, ...) {
     fclose(f);
 }
 
+/* Serializes the two send()s of a line so a background worker's reply (e.g.
+ * the async ssh_deploy_key thread) can't interleave its bytes with the accept
+ * loop's heartbeats/replies on the shared command socket. g_conn_gen bumps on
+ * every command-connection start/end so a worker can tell its connection is
+ * gone (and the fd possibly reused by a new client) and skip the stale write. */
+static pthread_mutex_t g_send_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t        g_conn_gen = 0;
+
 static int send_line(int s, const char *msg) {
     size_t len = strlen(msg);
+    pthread_mutex_lock(&g_send_mu);
     ssize_t n = send(s, msg, len, 0);
-    if (n <= 0) return (int)n;
-    return (int)send(s, "\n", 1, 0);
+    if (n > 0) n = send(s, "\n", 1, 0);
+    pthread_mutex_unlock(&g_send_mu);
+    return (int)n;
+}
+
+/* Send a line ONLY if the command connection is still the one identified by
+ * `gen` -- a detached worker must not write into a reconnected session that
+ * reused the same fd number. */
+static int send_line_gen(int s, const char *msg, uint64_t gen) {
+    size_t len = strlen(msg);
+    ssize_t n = -1;
+    pthread_mutex_lock(&g_send_mu);
+    if (gen == g_conn_gen) {
+        n = send(s, msg, len, 0);
+        if (n > 0) n = send(s, "\n", 1, 0);
+    }
+    pthread_mutex_unlock(&g_send_mu);
+    return (int)n;
+}
+
+static uint64_t conn_gen_bump(void) {
+    uint64_t g;
+    pthread_mutex_lock(&g_send_mu);
+    g = ++g_conn_gen;
+    pthread_mutex_unlock(&g_send_mu);
+    return g;
 }
 
 static int recv_line(int s, char *buf, int buf_size) {
@@ -399,8 +434,100 @@ static void handle_ssh_enable(int client, const char *tag) {
     send_reply(client, tag, "ssh_ready");
 }
 
+/* Find the primary interactive macOS account (uid >= 501, home under /Users). */
+static int find_primary_user(char *home, size_t hsz, uid_t *uid, gid_t *gid) {
+    struct passwd *pw;
+    int found = 0;
+    setpwent();
+    while ((pw = getpwent())) {
+        if (pw->pw_uid < 501) continue;
+        if (!pw->pw_dir || strncmp(pw->pw_dir, "/Users/", 7) != 0) continue;
+        snprintf(home, hsz, "%s", pw->pw_dir);
+        *uid = pw->pw_uid; *gid = pw->pw_gid; found = 1;
+        break;
+    }
+    endpwent();
+    return found;
+}
+
+/* ssh_deploy_key: write the AppSandbox public key into the primary user's
+ * ~/.ssh/authorized_keys (0700 dir, 0600 file, owned by the user). */
+static int deploy_ssh_key(const char *pubkey) {
+    char home[256], sshdir[320], authk[400];
+    uid_t uid; gid_t gid;
+    FILE *f;
+    if (!pubkey || !*pubkey) return 0;
+    if (!find_primary_user(home, sizeof(home), &uid, &gid)) {
+        agent_log("ssh key: no primary /Users user found");
+        return 0;
+    }
+    snprintf(sshdir, sizeof(sshdir), "%s/.ssh", home);
+    snprintf(authk, sizeof(authk), "%s/authorized_keys", sshdir);
+    mkdir(sshdir, 0700);
+    f = fopen(authk, "w");
+    if (!f) { agent_log("ssh key: cannot write %s", authk); return 0; }
+    fprintf(f, "%s\n", pubkey);
+    fclose(f);
+    chmod(sshdir, 0700);
+    chmod(authk, 0600);
+    /* chown is load-bearing: sshd's StrictModes rejects an authorized_keys not
+       owned by the user (we run as root, so the files start root-owned). Don't
+       short-circuit (both must run) and don't report success on failure. */
+    {
+        int dir_rc = chown(sshdir, uid, gid);
+        int key_rc = chown(authk, uid, gid);
+        if (dir_rc != 0 || key_rc != 0) {
+            agent_log("ssh key: chown failed (%s) -- key auth would be rejected",
+                      strerror(errno));
+            return 0;
+        }
+    }
+    agent_log("ssh key: deployed to %s", authk);
+    return 1;
+}
+
+/* Run deploy_ssh_key OFF the accept loop: on a cold first boot the
+ * getpwent/OpenDirectory lookup in find_primary_user can take several seconds,
+ * and blocking the single-threaded accept loop that long starves heartbeats
+ * and other command replies -- which makes the host's tagged commands time out
+ * and tear the connection down. Reply (ssh_key_deployed/ssh_key_failed) is sent
+ * from the worker via the send-locked socket. */
+typedef struct { int fd; uint64_t gen; char tag[40]; char pubkey[512]; } DeployArgs;
+
+static void *deploy_key_worker(void *arg) {
+    DeployArgs *a = (DeployArgs *)arg;
+    int ok = deploy_ssh_key(a->pubkey);
+    /* Reply via the generation-checked send: if the connection dropped while
+       we were working, g_conn_gen has moved on and the write is suppressed
+       (so we never inject into a reconnected session that reused the fd). */
+    char line[64];
+    snprintf(line, sizeof(line), "%s%s", a->tag,
+             ok ? "ssh_key_deployed" : "ssh_key_failed");
+    send_line_gen(a->fd, line, a->gen);
+    free(a);
+    return NULL;
+}
+
+static void spawn_deploy_key(int client, uint64_t gen, const char *tag, const char *pubkey) {
+    DeployArgs *a = calloc(1, sizeof(DeployArgs));
+    if (!a) { send_reply(client, tag, "ssh_key_failed"); return; }
+    a->fd = client;
+    a->gen = gen;
+    snprintf(a->tag, sizeof(a->tag), "%s", tag ? tag : "");
+    snprintf(a->pubkey, sizeof(a->pubkey), "%s", pubkey);
+    pthread_t t;
+    if (pthread_create(&t, NULL, deploy_key_worker, a) != 0) {
+        /* fall back to inline if the thread won't spawn */
+        free(a);
+        send_reply(client, tag, deploy_ssh_key(pubkey) ? "ssh_key_deployed" : "ssh_key_failed");
+        return;
+    }
+    pthread_detach(t);
+}
+
 static void handle_client(int client) {
     char buf[512];
+    uint64_t gen = conn_gen_bump();   /* this connection's identity for deploy workers */
 
     agent_log("Client connected.");
     g_client_sock = client;
@@ -497,6 +624,8 @@ static void handle_client(int client) {
             send_reply(client, tag, "ok");
         } else if (strcmp(cmd, "ssh_enable") == 0) {
             handle_ssh_enable(client, tag);
+        } else if (strncmp(cmd, "ssh_deploy_key ", 15) == 0) {
+            spawn_deploy_key(client, gen, tag, cmd + 15);   /* async; reply when done */
         } else if (strcmp(cmd, "shutdown") == 0) {
             /* Reply first so the host hears "ok" before shutdown kills us.
              * Then fork+exec /sbin/shutdown -h now so it runs independently
@@ -532,6 +661,7 @@ static void handle_client(int client) {
     }
 
 done:
+    conn_gen_bump();   /* invalidate any in-flight deploy worker before the fd is freed/reused */
     close(client);
     g_client_sock = -1;
 }

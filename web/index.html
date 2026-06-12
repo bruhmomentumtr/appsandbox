@@ -6,7 +6,10 @@
 <title>App Sandbox</title>
 <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<!-- spellcheck="false" inherits to all descendants; the per-field
+     autocorrect/autocapitalize attrs (WebKit/Safari extensions) stop macOS from
+     rewriting VM names, usernames, paths, and snapshot names as you type. -->
+<body spellcheck="false" autocorrect="off" autocapitalize="off">
 
 <!-- Virtual Machines -->
 <section id="vm-section">
@@ -74,13 +77,13 @@
 
             <label for="vm-name">VM Name:</label>
             <div class="form-row">
-                <input type="text" id="vm-name" value="MyAppSandbox" class="input-md">
+                <input type="text" id="vm-name" value="MyAppSandbox" class="input-md" autocorrect="off" autocapitalize="off" spellcheck="false">
                 <span class="field-warn" id="vm-name-warn"></span>
             </div>
 
             <label class="needs-iso">OS Image:</label>
             <div class="image-row needs-iso">
-                <input type="text" id="image-path" placeholder="Path to ISO or VHDX...">
+                <input type="text" id="image-path" placeholder="Path to ISO or VHDX..." autocorrect="off" autocapitalize="off" spellcheck="false">
                 <button id="btn-browse" onclick="sendCmd('browseImage')">Browse...</button>
                 <span class="or-separator win-only">OR</span>
                 <label class="win-only" style="text-align:left">Template:</label>
@@ -140,7 +143,7 @@
 
             <label>Username:</label>
             <div class="cred-row">
-                <input type="text" id="admin-user" value="user" class="input-md" autocomplete="off">
+                <input type="text" id="admin-user" value="user" class="input-md" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
                 <span class="field-warn" id="admin-user-warn"></span>
             </div>
 
@@ -156,7 +159,8 @@
             <label>Options:</label>
             <div class="form-row">
                 <label class="win-only" title="Disable Secure Boot and enable test-signing"><input type="checkbox" id="test-mode"> Test Mode</label>
-                <label title="Exposes the VM's sshd on a host-loopback port, tunnelled over vsock"><input type="checkbox" id="ssh-enabled"> SSH Server</label>
+                <label title="Exposes the VM's sshd on a host-loopback port, tunnelled over vsock"><input type="checkbox" id="ssh-enabled" onchange="onSshToggle()"> SSH Server</label>
+                <label title="Deploy the AppSandbox SSH public key so you can connect with key auth (requires SSH Server)"><input type="checkbox" id="ssh-deploy-key" disabled> Deploy SSH key</label>
             </div>
         </div>
         <div class="modal-buttons">
@@ -177,7 +181,7 @@
         </label>
         <div id="modal-input-row" style="display:none; margin-bottom:12px;">
             <label style="font-size:12px; color:var(--text-dim);" id="modal-input-label">Name:</label>
-            <input type="text" id="modal-input" style="width:100%; margin-top:4px;">
+            <input type="text" id="modal-input" style="width:100%; margin-top:4px;" autocorrect="off" autocapitalize="off" spellcheck="false">
         </div>
         <div class="modal-buttons">
             <button onclick="modalResolve(false)">Cancel</button>

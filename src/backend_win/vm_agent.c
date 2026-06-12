@@ -204,6 +204,21 @@ static void notify_agent_status(VmInstance *vm)
         PostMessageW(g_agent_hwnd, WM_VM_AGENT_STATUS, 0, (LPARAM)vm);
 }
 
+/* Fire-and-forget: ask the guest agent to write the AppSandbox public key into
+   authorized_keys. The guest replies async (untagged) "ssh_key_deployed" or
+   "ssh_key_failed" (handled in process_async_message). Sent once SSH is ready;
+   no-op if not requested, already done, or the key is missing. */
+static void vm_agent_send_deploy_key(SOCKET s, VmInstance *vm)
+{
+    char cmd[640], pubkey_a[512];
+    if (!vm->ssh_deploy_key || !vm->ssh_pubkey[0] || vm->ssh_key_deployed)
+        return;
+    WideCharToMultiByte(CP_UTF8, 0, vm->ssh_pubkey, -1, pubkey_a, sizeof(pubkey_a), NULL, NULL);
+    sprintf_s(cmd, sizeof(cmd), "ssh_deploy_key %s", pubkey_a);
+    send_line(s, cmd);
+    ui_log(L"Requested SSH key deploy for \"%s\".", vm->name);
+}
+
 /* Process an untagged (async) message from the agent.
    Returns: 0 = handled, 1 = os_shutdown (caller should break),
             2 = service_stopping (caller should break and let the reconnect
@@ -216,6 +231,7 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
     } else if (strcmp(buf, "os_shutdown") == 0) {
         ui_log(L"Guest OS shutting down for \"%s\".", vm->name);
         vm->agent_online = FALSE;
+        vm->idd_ready = FALSE;
         vm->shutdown_requested = TRUE;
         vm->shutdown_time = GetTickCount64();
         notify_agent_status(vm);
@@ -236,10 +252,19 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
     } else if (strncmp(buf, "gpu_device_failed:", 18) == 0) {
         ui_log(L"[%s] GPU device still failing (problem %S).", vm->name, buf + 18);
     } else if (strncmp(buf, "idd_status:", 11) == 0) {
+        /* Latch display readiness from the guest's own driver-state report
+           ("running" via devcon). This is the non-destructive readiness
+           signal -- it never touches the frame channel, so polling it can't
+           steal the single consumer slot or blank the display. asb_vm_idd_ready
+           gates display-open on it. */
+        vm->idd_ready = (strcmp(buf + 11, "ok") == 0);
         ui_log(L"[%s] IDD driver: %S", vm->name, buf + 11);
     } else if (strncmp(buf, "hyperv_video:", 13) == 0) {
         ui_log(L"[%s] Hyper-V Video: %S", vm->name, buf + 13);
-        if (strcmp(buf + 13, "disabled") == 0)
+        /* NULL-guard like notify_agent_status: headless never sets the HWND,
+           and PostMessageW(NULL, ...) would queue thread messages on this
+           never-pumped agent thread. */
+        if (g_agent_hwnd && strcmp(buf + 13, "disabled") == 0)
             PostMessageW(g_agent_hwnd, WM_VM_HYPERV_VIDEO_OFF, 0, (LPARAM)vm);
     } else if (strncmp(buf, "displays:", 9) == 0) {
         ui_log(L"[%s] Displays: %S", vm->name, buf + 9);
@@ -272,6 +297,14 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
         vm->ssh_state = 2;
         vm_ssh_proxy_start(vm);
         ui_log(L"SSH ready for \"%s\".", vm->name);
+        vm_agent_send_deploy_key(s, vm);   /* deploy the AppSandbox key now SSH is up */
+        notify_agent_status(vm);
+    } else if (strcmp(buf, "ssh_key_deployed") == 0) {
+        vm->ssh_key_deployed = TRUE;
+        ui_log(L"SSH key deployed for \"%s\".", vm->name);
+        notify_agent_status(vm);
+    } else if (strcmp(buf, "ssh_key_failed") == 0) {
+        ui_log(L"SSH key deploy FAILED for \"%s\".", vm->name);
         notify_agent_status(vm);
     } else if (strcmp(buf, "ssh_failed") == 0) {
         vm->ssh_state = 3;
@@ -354,6 +387,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         }
 
         vm->agent_online = TRUE;
+        vm->idd_ready = FALSE;   /* re-evaluated by the agent's idd_status, sent right after hello */
         vm->shutdown_requested = FALSE;
         vm->last_heartbeat = GetTickCount64();
         ui_log(L"Agent online for \"%s\".", vm->name);
@@ -414,6 +448,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                 vm->ssh_state = 2;
                 vm_ssh_proxy_start(vm);
                 ui_log(L"SSH ready for \"%s\".", vm->name);
+                vm_agent_send_deploy_key(s, vm);   /* deploy the AppSandbox key now SSH is up */
             } else if (strcmp(buf, "ssh_installing") == 0) {
                 vm->ssh_state = 1;
                 ui_log(L"SSH installing for \"%s\"...", vm->name);
@@ -488,6 +523,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         disconnected:
         /* Connection lost */
         vm->agent_online = FALSE;
+        vm->idd_ready = FALSE;
         /* Atomically claim the socket so we never double-close a handle that
            vm_agent_stop() may have already closed (and whose value could have
            been recycled by another socket()/accept()). */
@@ -564,12 +600,13 @@ void vm_agent_stop(VmInstance *instance)
     }
 
     instance->agent_online = FALSE;
+    instance->idd_ready = FALSE;
     free_conn(conn);
     notify_agent_status(instance);
 }
 
 BOOL vm_agent_send(VmInstance *instance, const char *command,
-                   char *response, int response_max)
+                   char *response, int response_max, DWORD timeout_ms)
 {
     AgentConn *conn = find_conn(instance);
     BOOL ok;
@@ -579,13 +616,28 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
         return FALSE;
     }
 
-    /* Queue command for the connection thread */
+    /* Hand the command to the connection thread (it owns the socket and is the
+       sole sender). NOTE: this is a single slot per VM (conn->cmd), not a queue,
+       so concurrent callers for the SAME VM would clobber -- safe here because
+       per VM only one caller exists (shutdown). */
     ResetEvent(conn->cmd_done);
     strcpy_s(conn->cmd, sizeof(conn->cmd), command);
     conn->cmd_pending = TRUE;
 
-    /* Wait for response (up to 5 seconds) */
-    if (WaitForSingleObject(conn->cmd_done, 5000) != WAIT_OBJECT_0) {
+    /* timeout_ms == 0  =>  FIRE-AND-FORGET. Used for shutdown/restart, which ride
+       the guest powering off: the agent replies "ok" then kills itself, so there
+       is no reliable synchronous reply to wait for. The connection thread sends
+       the queued command and consumes the (ignored) reply on its OWN read loop;
+       we return immediately, so we never block the single-threaded HTTP request
+       loop / the GUI thread. Delivery is confirmed by the HCS SystemExited
+       monitor, not by this reply. */
+    if (timeout_ms == 0)
+        return TRUE;
+
+    /* Otherwise wait up to timeout_ms for the agent's tagged reply (idd_connect
+       expects a prompt "ok"). A real disconnect unblocks us: agent_thread_proc
+       SetEvent()s cmd_done with an empty rsp on recv<=0, so we return FALSE. */
+    if (WaitForSingleObject(conn->cmd_done, timeout_ms) != WAIT_OBJECT_0) {
         ui_log(L"Agent: command \"%S\" timed out", command);
         conn->cmd_pending = FALSE;
         return FALSE;
@@ -601,15 +653,15 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
 
 BOOL vm_agent_shutdown(VmInstance *instance)
 {
-    return vm_agent_send(instance, "shutdown", NULL, 0);
+    return vm_agent_send(instance, "shutdown", NULL, 0, 0);   /* 0 = fire-and-forget */
 }
 
 BOOL vm_agent_restart(VmInstance *instance)
 {
-    return vm_agent_send(instance, "restart", NULL, 0);
+    return vm_agent_send(instance, "restart", NULL, 0, 0);   /* 0 = fire-and-forget */
 }
 
 BOOL vm_agent_ping(VmInstance *instance)
 {
-    return vm_agent_send(instance, "ping", NULL, 0);
+    return vm_agent_send(instance, "ping", NULL, 0, 5000);
 }

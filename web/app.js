@@ -442,8 +442,18 @@ function gatherConfig() {
         adminPass:   document.getElementById('admin-pass').value,
         adminConfirm: document.getElementById('admin-confirm').value,
         testMode:    document.getElementById('test-mode').checked,
-        sshEnabled:  document.getElementById('ssh-enabled').checked
+        sshEnabled:  document.getElementById('ssh-enabled').checked,
+        sshDeployKey: document.getElementById('ssh-deploy-key').checked
     };
+}
+
+/* "Deploy SSH key" depends on "SSH Server": grey it out (and clear it) unless
+   SSH is enabled. The core also gates deploy on ssh_enabled as a backstop. */
+function onSshToggle() {
+    var ssh = document.getElementById('ssh-enabled').checked;
+    var dep = document.getElementById('ssh-deploy-key');
+    dep.disabled = !ssh;
+    if (!ssh) dep.checked = false;
 }
 
 function clearCreateForm() {
@@ -573,6 +583,8 @@ function openCreateModal() {
     document.getElementById('admin-confirm').value = 'test123';
     document.getElementById('test-mode').checked = false;
     document.getElementById('ssh-enabled').checked = false;
+    document.getElementById('ssh-deploy-key').checked = false;
+    onSshToggle();   /* re-grey "Deploy SSH key" to match the cleared SSH checkbox */
     /* Reset OS type to Windows on each open (skip on macOS host — it's locked) */
     if (!hostBridge.isMac) document.getElementById('os-type').value = 'Windows';
 
@@ -704,11 +716,12 @@ function buildRowCells(vm, i, statusTd) {
     var bld = vm.buildingVhdx;
     var snapVal = selectedSnap[i] || 'current';
 
-    var sshActive = vm.sshEnabled && vm.sshState === 2 && vm.running && !bld;
+    var sshActive = vm.sshEnabled && (vm.sshState === 2 || vm.sshState === 4) && vm.running && !bld;
     var sshCell = makeIconCell('ssh', '>_', sshActive, (function(idx) { return function() { sendCmd('sshConnect', {vmIndex: idx}); }; })(i), !vm.sshEnabled ? 'hidden' : '');
     if (vm.sshEnabled) {
         var sshBtn = sshCell.querySelector('.icon-btn');
         if (vm.sshState === 1) sshBtn.title = 'Installing OpenSSH in the guest...';
+        else if (vm.sshState === 4) sshBtn.title = 'Open an SSH terminal (localhost:' + vm.sshPort + '; AppSandbox key deployed — key auth works)';
         else if (vm.sshState === 2) sshBtn.title = 'Open an SSH terminal to the VM (localhost:' + vm.sshPort + ', tunneled over HvSocket)';
         else if (vm.sshState === 3) sshBtn.title = 'SSH install failed';
         else sshBtn.title = 'SSH: waiting for the in-VM agent to come online';

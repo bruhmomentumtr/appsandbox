@@ -210,7 +210,9 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_bool(jb, L"installComplete", v->install_complete);
     jb_bool(jb, L"sshEnabled", v->ssh_enabled);
     jb_int(jb, L"sshPort", (int)v->ssh_port);
-    jb_int(jb, L"sshState", v->ssh_state);
+    jb_int(jb, L"sshState", (v->ssh_key_deployed && v->ssh_state == 2) ? 4 : v->ssh_state);
+    jb_bool(jb, L"sshDeployKey", v->ssh_deploy_key);
+    jb_bool(jb, L"sshKeyDeployed", v->ssh_key_deployed);
 
     /* Snapshot tree */
     {
@@ -919,6 +921,7 @@ static void on_webview2_message(const wchar_t *json)
         if (json_get_int(json, L"networkMode", &val)) cfg.network_mode = val;
         json_get_bool(json, L"testMode", &cfg.test_mode);
         json_get_bool(json, L"sshEnabled", &cfg.ssh_enabled);
+        json_get_bool(json, L"sshDeployKey", &cfg.ssh_deploy_key);
 
         asb_vm_create(&cfg);
         SecureZeroMemory(pass_buf, sizeof(pass_buf));
@@ -966,20 +969,38 @@ static void on_webview2_message(const wchar_t *json)
         if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
             VmInstance *inst = asb_vm_instance(asb_vm_get(idx));
             if (inst && inst->ssh_enabled && inst->ssh_port) {
-                wchar_t cmd[512];
+                wchar_t cmd[1024], keyopt[700] = L"";
                 STARTUPINFOW si_;
                 PROCESS_INFORMATION pi_;
                 ZeroMemory(&si_, sizeof(si_));
                 si_.cb = sizeof(si_);
                 ZeroMemory(&pi_, sizeof(pi_));
+                /* If this VM had the AppSandbox key deployed, use it (-i) so the
+                   terminal logs in with key auth instead of a password prompt.
+                   IdentitiesOnly avoids offering the user's other keys, and -- since
+                   these are ephemeral loopback VMs -- StrictHostKeyChecking=no +
+                   a throwaway known_hosts skips the host-key fingerprint prompt and
+                   keeps it out of the user's real known_hosts. Password logins (no
+                   key) keep the normal fingerprint prompt. */
+                if (inst->ssh_deploy_key) {
+                    wchar_t base[MAX_PATH], tmp[MAX_PATH];
+                    if (!GetEnvironmentVariableW(L"ProgramData", base, MAX_PATH))
+                        wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
+                    if (!GetTempPathW(MAX_PATH, tmp))
+                        wcscpy_s(tmp, MAX_PATH, L"C:\\Windows\\Temp\\");
+                    _snwprintf_s(keyopt, 700, _TRUNCATE,
+                        L"-i \"%s\\AppSandbox\\ssh\\id_appsandbox\" -o IdentitiesOnly=yes "
+                        L"-o StrictHostKeyChecking=no -o \"UserKnownHostsFile=%sappsandbox_known_hosts\" ",
+                        base, tmp);
+                }
                 if (inst->admin_user[0])
-                    _snwprintf_s(cmd, 512, _TRUNCATE,
-                        L"cmd.exe /k ssh -p %lu %s@localhost",
-                        inst->ssh_port, inst->admin_user);
+                    _snwprintf_s(cmd, 1024, _TRUNCATE,
+                        L"cmd.exe /k ssh %s-p %lu %s@localhost",
+                        keyopt, inst->ssh_port, inst->admin_user);
                 else
-                    _snwprintf_s(cmd, 512, _TRUNCATE,
-                        L"cmd.exe /k ssh -p %lu localhost",
-                        inst->ssh_port);
+                    _snwprintf_s(cmd, 1024, _TRUNCATE,
+                        L"cmd.exe /k ssh %s-p %lu localhost",
+                        keyopt, inst->ssh_port);
                 ui_log(L"SSH: %s", cmd);
                 if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE,
                                     CREATE_NEW_CONSOLE, NULL, NULL, &si_, &pi_)) {

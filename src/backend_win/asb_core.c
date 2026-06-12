@@ -295,6 +295,12 @@ static DWORD WINAPI idd_probe_thread_proc(LPVOID param)
 
 static void idd_probe_start(VmInstance *vm)
 {
+    /* The probe exists only to AUTO-OPEN the display in the GUI: it posts
+       WM_VM_IDD_READY to g_idd_probe_hwnd when the VDD comes up. With no hwnd
+       (the headless daemon) there is nothing to notify, and auto-opening a window
+       the CLI caller didn't ask for would be wrong -- so don't run it. Headless
+       opens the display only on an explicit request, gated by asb_vm_idd_ready. */
+    if (!g_idd_probe_hwnd) return;
     if (vm->idd_probe_thread) return;
     if (vm->install_complete) return;
     if (vm->is_template) return;
@@ -383,6 +389,72 @@ static void get_config_path(wchar_t *out, size_t out_len)
     swprintf_s(out, out_len, L"%s\\AppSandbox\\vms.cfg", base);
 }
 
+/* Ensure the AppSandbox SSH keypair exists under %ProgramData%\AppSandbox\ssh\,
+   creating an ed25519 pair (via the system ssh-keygen) if absent, and return its
+   public-key line in pubkey_out (newline-trimmed). ed25519 keeps the public key
+   short enough to fit the agent's command buffer. The private key stays host-side
+   so clients can connect with `ssh -i id_appsandbox`. Returns TRUE on success. */
+static BOOL ensure_appsandbox_ssh_key(wchar_t *pubkey_out, int cap)
+{
+    wchar_t base[MAX_PATH], ssh_dir[MAX_PATH], priv[MAX_PATH], pub[MAX_PATH];
+    char line[1024] = {0};
+    FILE *f = NULL;
+
+    if (cap > 0) pubkey_out[0] = 0;
+    if (!GetEnvironmentVariableW(L"ProgramData", base, MAX_PATH))
+        wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
+    swprintf_s(ssh_dir, MAX_PATH, L"%s\\AppSandbox\\ssh", base);
+    swprintf_s(priv, MAX_PATH, L"%s\\id_appsandbox", ssh_dir);
+    swprintf_s(pub,  MAX_PATH, L"%s\\id_appsandbox.pub", ssh_dir);
+
+    if (GetFileAttributesW(pub) == INVALID_FILE_ATTRIBUTES) {
+        wchar_t dir1[MAX_PATH], sysdir[MAX_PATH], keygen[MAX_PATH], cmdline[1280];
+        STARTUPINFOW si; PROCESS_INFORMATION pi;
+        swprintf_s(dir1, MAX_PATH, L"%s\\AppSandbox", base);
+        CreateDirectoryW(dir1, NULL);
+        CreateDirectoryW(ssh_dir, NULL);
+        DeleteFileW(priv);   /* avoid ssh-keygen's interactive overwrite prompt on a partial key */
+        GetSystemDirectoryW(sysdir, MAX_PATH);
+        swprintf_s(keygen, MAX_PATH, L"%s\\OpenSSH\\ssh-keygen.exe", sysdir);
+        swprintf_s(cmdline, 1280, L"\"%s\" -t ed25519 -f \"%s\" -N \"\" -C appsandbox -q", keygen, priv);
+        ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
+        ZeroMemory(&pi, sizeof(pi));
+        if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            asb_log(L"ssh key: ssh-keygen launch failed (%lu)", GetLastError());
+            return FALSE;
+        }
+        /* Check the outcome: a timed-out or failed ssh-keygen must not leave
+           partial key material behind to be trusted on the next run (the
+           regen check above keys only on the .pub existing). */
+        {
+            DWORD wait_rc = WaitForSingleObject(pi.hProcess, 30000);
+            DWORD exit_rc = 1;
+            if (wait_rc == WAIT_OBJECT_0)
+                GetExitCodeProcess(pi.hProcess, &exit_rc);
+            CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+            if (wait_rc != WAIT_OBJECT_0 || exit_rc != 0) {
+                asb_log(L"ssh key: ssh-keygen failed (wait=%lu exit=%lu)", wait_rc, exit_rc);
+                DeleteFileW(priv);
+                DeleteFileW(pub);
+                return FALSE;
+            }
+        }
+        asb_log(L"ssh key: generated AppSandbox keypair at %s", priv);
+    }
+
+    if (_wfopen_s(&f, pub, L"r") != 0 || !f) {
+        asb_log(L"ssh key: cannot read public key %s", pub);
+        return FALSE;
+    }
+    if (fgets(line, sizeof(line), f)) {
+        int n = (int)strlen(line);
+        while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = 0;
+    }
+    fclose(f);
+    MultiByteToWideChar(CP_UTF8, 0, line, -1, pubkey_out, cap);
+    return pubkey_out[0] != 0;
+}
+
 /* ---- Persistence: save VM list ---- */
 
 static void save_vm_list(void)
@@ -433,6 +505,10 @@ static void save_vm_list(void)
             fwprintf(f, L"SshEnabled=1\n");
         if (g_vms[i].ssh_port)
             fwprintf(f, L"SshPort=%lu\n", g_vms[i].ssh_port);
+        if (g_vms[i].ssh_deploy_key)
+            fwprintf(f, L"SshDeployKey=1\n");
+        if (g_vms[i].ssh_pubkey[0])
+            fwprintf(f, L"SshPubKey=%s\n", g_vms[i].ssh_pubkey);
         if (g_vms[i].install_complete)
             fwprintf(f, L"InstallComplete=1\n");
         fwprintf(f, L"\n");
@@ -523,6 +599,13 @@ static void load_vm_list(void)
             vm->ssh_enabled = (_wtoi(line + 11) != 0);
         else if (wcsncmp(line, L"SshPort=", 8) == 0)
             vm->ssh_port = (DWORD)_wtoi(line + 8);
+        else if (wcsncmp(line, L"SshDeployKey=", 13) == 0)
+            vm->ssh_deploy_key = (_wtoi(line + 13) != 0);
+        else if (wcsncmp(line, L"SshPubKey=", 10) == 0)
+            /* Truncating copy: wcscpy_s ABORTS the process on overflow, and this
+               line comes from an editable config file. Generated ed25519 lines
+               are ~100 chars; anything longer is corrupt -- truncate, don't die. */
+            wcsncpy_s(vm->ssh_pubkey, 512, line + 10, _TRUNCATE);
         else if (wcsncmp(line, L"InstallComplete=", 16) == 0)
             vm->install_complete = (_wtoi(line + 16) != 0);
     }
@@ -650,26 +733,6 @@ static void remove_dir_recursive(const wchar_t *dir)
     RemoveDirectoryW(dir);
 }
 
-/* Delete all files in a directory (non-recursive, skips subdirectories) */
-static void delete_files_in_dir(const wchar_t *dir)
-{
-    WIN32_FIND_DATAW fd;
-    wchar_t pat[MAX_PATH];
-    HANDLE hFind;
-    swprintf_s(pat, MAX_PATH, L"%s\\*", dir);
-    hFind = FindFirstFileW(pat, &fd);
-    if (hFind != INVALID_HANDLE_VALUE) {
-        do {
-            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                wchar_t fp[MAX_PATH];
-                swprintf_s(fp, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
-                DeleteFileW(fp);
-            }
-        } while (FindNextFileW(hFind, &fd));
-        FindClose(hFind);
-    }
-}
-
 /* ---- HCS state callback (called from HCS worker thread) ---- */
 
 static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
@@ -687,6 +750,10 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
             instance->running = FALSE;
             instance->shutdown_requested = FALSE;
             instance->hyperv_video_off = FALSE;
+            /* Re-deploy on next boot: the guest disk may change while stopped
+               (snapshot/branch revert), so "deployed" is only valid per boot.
+               The guest-side write is idempotent. */
+            instance->ssh_key_deployed = FALSE;
             hcs_stop_monitor(instance);
             vm_ssh_proxy_stop(instance);
             vm_agent_stop(instance);
@@ -2150,6 +2217,8 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
            50-appsandbox-gpu, org.gnome.Shell-no-gpu.conf, appsandbox-gpu,
            wsl-mesa.tar.zst directly into <staging>/extras/. */
         asb_log(L"Prefetch 1/3: cloning repo source from GitHub...");
+        /* Branch must match the branch this binary was built from, so the Linux
+           guest builds its agent/driver source from the SAME revision. */
         swprintf_s(args_buf, 2048,
             L"--prefetch-repo --branch \"main\" --out-dir \"%s\"",
             extras);
@@ -2538,6 +2607,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     VmInstance *inst;
     wchar_t vhdx_dir[MAX_PATH];
     wchar_t endpoint_guid_str[64] = { 0 };
+    wchar_t ssh_pubkey[512] = { 0 };
     HRESULT hr;
     int existing_idx;
     BOOL is_template_create;
@@ -2564,6 +2634,13 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     cfg.network_mode = config->network_mode;
     cfg.test_mode = config->test_mode;
     cfg.ssh_enabled = config->ssh_enabled;
+    /* Key deploy needs SSH; prepare the AppSandbox keypair now so the build path
+       stores the public key on the instance (the agent deploys it at runtime). */
+    cfg.ssh_deploy_key = config->ssh_deploy_key && config->ssh_enabled;
+    if (cfg.ssh_deploy_key && !ensure_appsandbox_ssh_key(ssh_pubkey, 512)) {
+        asb_log(L"ssh key: could not prepare AppSandbox key; creating without key deploy.");
+        cfg.ssh_deploy_key = FALSE;
+    }
     is_template_create = config->is_template;
     cfg.is_template = is_template_create;
 
@@ -2720,6 +2797,8 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             inst->test_mode = cfg.test_mode;
             wcscpy_s(inst->admin_user, 128, cfg.admin_user);
             inst->ssh_enabled = cfg.ssh_enabled;
+            inst->ssh_deploy_key = cfg.ssh_deploy_key;
+            if (cfg.ssh_deploy_key) wcscpy_s(inst->ssh_pubkey, 512, ssh_pubkey);
             inst->building_vhdx = TRUE;
             inst->vhdx_progress = 0;
             memcpy(&inst->gpu_shares, &cfg.gpu_shares, sizeof(GpuDriverShareList));
@@ -2787,6 +2866,8 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             inst->test_mode = cfg.test_mode;
             wcscpy_s(inst->admin_user, 128, cfg.admin_user);
             inst->ssh_enabled = cfg.ssh_enabled;
+            inst->ssh_deploy_key = cfg.ssh_deploy_key;
+            if (cfg.ssh_deploy_key) wcscpy_s(inst->ssh_pubkey, 512, ssh_pubkey);
             inst->building_vhdx = TRUE;
             inst->vhdx_progress = 0;
             memcpy(&inst->gpu_shares, &cfg.gpu_shares, sizeof(GpuDriverShareList));
@@ -2949,6 +3030,11 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     wcscpy_s(inst->gpu_name, 256, cfg.gpu_mode == GPU_MIRROR ? L"Try all" :
                                   cfg.gpu_mode == GPU_DEFAULT ? L"Default GPU" : L"None");
     wcscpy_s(inst->resources_iso_path, MAX_PATH, cfg.resources_iso_path);
+    /* hcs_create_vm copies ssh_enabled onto the instance but not the deploy
+       fields, so the from-template path sets them here (the ISO and Linux
+       paths set them inline on their own instance copies). */
+    inst->ssh_deploy_key = cfg.ssh_deploy_key;
+    if (cfg.ssh_deploy_key) wcscpy_s(inst->ssh_pubkey, 512, ssh_pubkey);
 
     { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
       snapshot_init(&g_snap_trees[g_vm_count], sd); }
@@ -3078,6 +3164,10 @@ ASB_API HRESULT asb_vm_shutdown(AsbVm vm)
     if (!inst->running) { asb_log(L"VM \"%s\" is not running.", inst->name); return S_FALSE; }
 
     asb_log(L"Sending shutdown signal to \"%s\"...", inst->name);
+    /* hcs_stop_vm fire-and-forgets the agent "shutdown" command (it does NOT wait
+       for the reply -- see vm_agent_send), so this returns promptly and never
+       blocks the single-threaded HTTP request loop / the GUI thread. The guest
+       acks then powers off; the HCS SystemExited monitor flips it to stopped. */
     hr = hcs_stop_vm(inst);
     if (FAILED(hr)) {
         asb_log(L"Shutdown failed (0x%08X). Use Force Stop.", hr);
@@ -3107,6 +3197,7 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
     inst->running = FALSE;
     inst->shutdown_requested = FALSE;
     inst->hyperv_video_off = FALSE;
+    inst->ssh_key_deployed = FALSE;   /* disk may change while stopped (revert) -- re-deploy next boot */
     hcs_stop_monitor(inst);
     vm_ssh_proxy_stop(inst);
     vm_agent_stop(inst);
@@ -3165,17 +3256,10 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
             dir[dlen - 10] = L'\0';
     }
 
-    /* Delete all files in snapshots/ */
-    {
-        wchar_t snap_dir[MAX_PATH];
-        swprintf_s(snap_dir, MAX_PATH, L"%s\\snapshots", dir);
-        delete_files_in_dir(snap_dir);
-        RemoveDirectoryW(snap_dir);
-    }
-
-    /* Delete all files in VM root */
-    delete_files_in_dir(dir);
-    RemoveDirectoryW(dir);
+    /* Recursively remove the whole VM folder, including subdirectories
+       (snapshots\ and the build's _vhdx_staging\); a file-only delete would
+       leave those and orphan the dir. */
+    remove_dir_recursive(dir);
 
     /* Compact arrays */
     EnterCriticalSection(&g_cs);
@@ -3234,6 +3318,18 @@ ASB_API BOOL asb_vm_agent_online(AsbVm vm)
 {
     VmInstance *inst = vm_inst(vm);
     return inst ? inst->agent_online : FALSE;
+}
+
+ASB_API BOOL asb_vm_idd_ready(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    if (!inst || !inst->running) return FALSE;
+    /* Both inputs come from the guest agent, never from a frame-channel probe:
+       agent_online means the guest is up, and idd_ready is latched from the
+       agent's idd_status report (the display driver is "running"). Connecting to
+       the frame service to "check" would itself become the single consumer and
+       blank the display, so readiness is a passive read of these latched flags. */
+    return inst->agent_online && inst->idd_ready;
 }
 
 ASB_API BOOL asb_vm_is_building(AsbVm vm)
@@ -3451,6 +3547,13 @@ ASB_API int asb_snap_count(AsbVm vm)
     int idx = vm_index_of(vm);
     if (idx < 0) return 0;
     return g_snap_trees[idx].count;
+}
+
+ASB_API int asb_snap_base_branch_count(AsbVm vm)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0) return 0;
+    return g_snap_trees[idx].base_branch_count;
 }
 
 ASB_API BOOL asb_snap_get_info(AsbVm vm, int snap_idx, AsbSnapshotInfo *out)

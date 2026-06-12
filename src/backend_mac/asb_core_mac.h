@@ -32,7 +32,12 @@ typedef struct {
     uint64_t agent_last_heartbeat_ms;
     BOOL    ssh_enabled;            /* user-configured at create time */
     int     ssh_port;               /* host loopback port, 0 = unassigned */
-    int     ssh_state;              /* 0=off 1=installing 2=ready 3=failed */
+    int     ssh_state;              /* 0=off 1=installing 2=ready 3=failed
+                                       (reported as 4 when ready && ssh_key_deployed) */
+    BOOL    ssh_deploy_key;         /* TRUE = deploy the AppSandbox public key to the guest */
+    BOOL    ssh_key_deployed;       /* TRUE once the guest agent has written authorized_keys
+                                       (volatile: reset on stop -- re-deployed each boot) */
+    char    ssh_pubkey[512];        /* AppSandbox public-key line to deploy (ed25519) */
     int     install_progress;
     char    install_status[128];
     VzVm            *__unsafe_unretained vz_handle;
@@ -54,7 +59,8 @@ int  asb_mac_vm_create(const char *name, const char *os_type,
                         const char *image_path,
                         const char *admin_user,
                         const char *admin_pass,
-                        BOOL ssh_enabled);
+                        BOOL ssh_enabled,
+                        BOOL ssh_deploy_key);
 int  asb_mac_vm_start(const char *name);
 int  asb_mac_vm_stop(const char *name, int force);
 int  asb_mac_vm_delete(const char *name);
@@ -76,5 +82,44 @@ void asb_mac_vm_set_clipboard_sync(const char *name, BOOL enabled);
 typedef void (*AsbMacEventCallback)(int type, const char *vm_name,
                                      int int_value, const char *str_value);
 void asb_mac_set_event_cb(AsbMacEventCallback cb);
+
+/* Headless mode -- call BEFORE asb_mac_init / any VM start. Gates the parts of
+ * the core that need a GUI login session:
+ *   - the per-VM NSWindow + VZVirtualMachineView created on the Running
+ *     transition (the one window-server dependency in the VM path);
+ *   - the clipboard channel (NSPasteboard is per-Aqua-session, and the host
+ *     poll/serve machinery must not run in a daemon);
+ *   - the VM's audio devices (host microphone capture would hang on a TCC
+ *     prompt no daemon can show, and output would play on the host speakers).
+ * Display/clipboard teardown paths are nil-guarded no-ops. Mirrors Windows,
+ * where the display/clipboard layers live in the GUI app and simply never
+ * activate under --headless. */
+void asb_mac_set_headless(BOOL headless);
+
+/* ---- Display window (opened on demand by the headless daemon) ----
+ * In the GUI the per-VM display NSWindow is created automatically on the Running
+ * transition; under --headless it is created only on an explicit request, after
+ * two gates. All three run ON THE MAIN QUEUE (the caller marshals) -- the window
+ * and the in-process VZVirtualMachine both live there. */
+
+/* A-gate: is there a console (on-console) Aqua login session this process can
+ * show a window in? FALSE over SSH / in a launchd service session, where the
+ * daemon must refuse to open a display rather than spawn an invisible window. */
+BOOL asb_mac_have_gui_session(void);
+
+/* Open (or focus, if already open) the VM's display window. Returns BACKEND_OK,
+ * or: BACKEND_ERR_NO_DISPLAY (no GUI session), BACKEND_ERR_NOT_FOUND,
+ * BACKEND_ERR_NOT_RUNNING, BACKEND_ERR_NOT_READY (agent not online yet). macOS
+ * binds the in-process framebuffer directly (no frame channel / display driver),
+ * so readiness is simply running && agent_online -- nothing to probe. */
+int  asb_mac_open_display(const char *name);
+
+/* Close the VM's display window if open (no-op otherwise). */
+void asb_mac_close_display(const char *name);
+
+/* Path of the AppSandbox SSH private key (~/Library/Application Support/
+ * AppSandbox/ssh/id_appsandbox); pair .pub is deployed into guests created
+ * with ssh_deploy_key. Returns the path whether or not the key exists yet. */
+NSString *asb_mac_ssh_key_path(void);
 
 #endif

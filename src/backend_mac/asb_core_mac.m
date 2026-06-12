@@ -8,6 +8,7 @@
  */
 
 #import "asb_core_mac.h"
+#import <CoreGraphics/CoreGraphics.h>   /* CGSessionCopyCurrentDictionary (A-gate) */
 #import "vm_dir.h"
 #import "vz_vm.h"
 #import "vz_display.h"
@@ -29,6 +30,10 @@ static AsbVmMac g_vms[ASB_MAX_VMS];
 static int g_vm_count = 0;
 static char g_last_ipsw_path[1024] = {0};
 static AsbMacEventCallback g_event_cb = NULL;
+
+/* Headless daemon mode: suppress the per-VM display window, the clipboard
+ * channel, and the VM audio devices (see asb_mac_set_headless in the header). */
+static BOOL g_headless = NO;
 
 /* Strong references to ObjC objects whose lifetime is tied to g_vms[].
  * The struct stores __unsafe_unretained pointers; these arrays keep them alive. */
@@ -99,6 +104,62 @@ static NSURL *config_file_url(void) {
     return [[root URLByDeletingLastPathComponent] URLByAppendingPathComponent:@"vms.cfg"];
 }
 
+/* ---- AppSandbox SSH keypair (mirrors ensure_appsandbox_ssh_key on Windows) ---- */
+
+NSString *asb_mac_ssh_key_path(void) {
+    NSURL *root = [VmDir vmsRootDirectory];   /* .../AppSandbox/VMs */
+    return [[[root URLByDeletingLastPathComponent]
+                URLByAppendingPathComponent:@"ssh/id_appsandbox"] path];
+}
+
+/* Ensure the AppSandbox ed25519 keypair exists (generating it via the system
+ * ssh-keygen if absent) and return its public-key line, newline-trimmed.
+ * ed25519 keeps the line short enough for the agents' command buffers; the
+ * private key stays host-side for `ssh -i`. Returns NO on any failure, and
+ * never leaves partial key material behind to be trusted on a later run. */
+static BOOL ensure_appsandbox_ssh_key(char *pubkey_out, size_t cap) {
+    if (cap > 0) pubkey_out[0] = '\0';
+    NSString *priv = asb_mac_ssh_key_path();
+    NSString *pub  = [priv stringByAppendingString:@".pub"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    if (![fm fileExistsAtPath:pub]) {
+        [fm createDirectoryAtPath:[priv stringByDeletingLastPathComponent]
+      withIntermediateDirectories:YES attributes:nil error:nil];
+        /* A leftover private half would make ssh-keygen prompt interactively. */
+        [fm removeItemAtPath:priv error:nil];
+
+        NSTask *t = [[NSTask alloc] init];
+        t.launchPath = @"/usr/bin/ssh-keygen";
+        t.arguments  = @[@"-t", @"ed25519", @"-f", priv, @"-N", @"", @"-C", @"appsandbox", @"-q"];
+        NSError *err = nil;
+        if (![t launchAndReturnError:&err]) {
+            post_log("ssh key: ssh-keygen launch failed: %s",
+                     err.localizedDescription.UTF8String ?: "?");
+            return NO;
+        }
+        [t waitUntilExit];
+        if (t.terminationStatus != 0 || ![fm fileExistsAtPath:pub]) {
+            post_log("ssh key: ssh-keygen failed (exit %d)", t.terminationStatus);
+            [fm removeItemAtPath:priv error:nil];
+            [fm removeItemAtPath:pub error:nil];
+            return NO;
+        }
+        post_log("ssh key: generated AppSandbox keypair at %s", priv.UTF8String);
+    }
+
+    NSString *line = [NSString stringWithContentsOfFile:pub
+                                               encoding:NSUTF8StringEncoding error:nil];
+    line = [line stringByTrimmingCharactersInSet:
+                [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!line.length) {
+        post_log("ssh key: cannot read public key %s", pub.UTF8String);
+        return NO;
+    }
+    strlcpy(pubkey_out, line.UTF8String, cap);
+    return pubkey_out[0] != '\0';
+}
+
 static void save_vm_list(void) {
     NSURL *url = config_file_url();
     if (!url) return;
@@ -127,6 +188,10 @@ static void save_vm_list(void) {
             fprintf(f, "SshEnabled=1\n");
         if (g_vms[i].ssh_port > 0)
             fprintf(f, "SshPort=%d\n", g_vms[i].ssh_port);
+        if (g_vms[i].ssh_deploy_key)
+            fprintf(f, "SshDeployKey=1\n");
+        if (g_vms[i].ssh_pubkey[0])
+            fprintf(f, "SshPubKey=%s\n", g_vms[i].ssh_pubkey);
         if (g_vms[i].install_complete)
             fprintf(f, "InstallComplete=1\n");
         fprintf(f, "\n");
@@ -194,6 +259,10 @@ static void load_vm_list(void) {
             vm->ssh_enabled = (atoi(line + 11) != 0);
         else if (strncmp(line, "SshPort=", 8) == 0)
             vm->ssh_port = atoi(line + 8);
+        else if (strncmp(line, "SshDeployKey=", 13) == 0)
+            vm->ssh_deploy_key = (atoi(line + 13) != 0);
+        else if (strncmp(line, "SshPubKey=", 10) == 0)
+            strlcpy(vm->ssh_pubkey, line + 10, sizeof(vm->ssh_pubkey));
         else if (strncmp(line, "InstallComplete=", 16) == 0)
             vm->install_complete = (atoi(line + 16) != 0);
     }
@@ -293,6 +362,9 @@ static void stop_clipboard_for(int idx) {
 
 static void start_clipboard_for(int idx) {
     if (idx < 0 || idx >= g_vm_count) return;
+    /* Headless: NSPasteboard is per-Aqua-session and the channel both reads
+       and serves the host pasteboard -- a daemon must not touch it. */
+    if (g_headless) return;
     if (g_clipboard_refs[idx]) return;
     VzVm *vzvm = g_vz_refs[idx];
     if (!vzvm || !vzvm.machine) return;
@@ -429,9 +501,26 @@ static void start_agent_for(int idx) {
         post_event(CORE_VM_EVENT_AGENT_STATUS, g_vms[i].name, state, NULL);
         post_list_changed();
         if (state == 2) start_ssh_proxy_for(i);
+        /* SSH key deploy is driven by the agent itself (fire-and-forget on
+           ssh_ready -> agent.onKeyDeployed below), mirroring Windows. */
     };
     agent.onLog = ^(NSString *line) {
         post_diag("agent: %s", line.UTF8String);
+    };
+
+    /* SSH key deploy (fire-and-forget on ssh_ready, mirrors Windows). The
+       agent sends ssh_deploy_key itself and reports the guest's async reply
+       here -- set BEFORE start so it's ready when ssh comes up. */
+    if (g_vms[idx].ssh_deploy_key && g_vms[idx].ssh_pubkey[0])
+        agent.deployKeyLine = [NSString stringWithUTF8String:g_vms[idx].ssh_pubkey];
+    agent.onKeyDeployed = ^(BOOL ok) {
+        int i = vm_index_of(nsName.UTF8String);
+        if (i < 0) return;
+        g_vms[i].ssh_key_deployed = ok;
+        post_log("[%s] SSH key %s.", g_vms[i].name, ok ? "deployed" : "deploy FAILED");
+        post_event(CORE_VM_EVENT_AGENT_STATUS, g_vms[i].name,
+                   g_vms[i].agent_online ? 1 : 0, NULL);
+        post_list_changed();
     };
 
     g_agent_refs[idx] = agent;
@@ -469,6 +558,10 @@ static void handle_vm_state_change(int idx, VZVirtualMachineState state) {
     } else if (state == VZVirtualMachineStateStopped) {
         g_vms[idx].shutting_down = NO;
         g_vms[idx].running = NO;
+        /* Re-deploy on next boot: the guest disk may change while stopped, so
+           "deployed" is only valid per boot (the guest write is idempotent).
+           Mirrors the Windows reset in asb_hcs_state_changed/asb_vm_stop. */
+        g_vms[idx].ssh_key_deployed = NO;
 
         stop_agent_for(idx);
 
@@ -488,7 +581,10 @@ static void handle_vm_state_change(int idx, VZVirtualMachineState state) {
         g_vms[idx].shutting_down = NO;
         g_vms[idx].running = YES;
 
-        if (g_vms[idx].vz_handle && !g_display_refs[idx]) {
+        /* Headless: the NSWindow + VZVirtualMachineView is the core's one
+           window-server dependency -- skip it entirely. The Stopped/Delete
+           teardown paths nil-check g_display_refs, so they become no-ops. */
+        if (!g_headless && g_vms[idx].vz_handle && !g_display_refs[idx]) {
             VzDisplayWindow *display = [[VzDisplayWindow alloc] initWithVzVm:g_vms[idx].vz_handle];
             g_display_refs[idx] = display;
             g_vms[idx].display = display;
@@ -518,6 +614,49 @@ static void update_install_progress(int idx, double frac, NSString *stage) {
         post_event(CORE_VM_EVENT_INSTALL_STATUS, g_vms[idx].name, pct, [stage UTF8String]);
     }
     post_list_changed();
+}
+
+/* Is the VM's disk image still attached by hdiutil? The stage step attaches it
+ * (to mount the APFS Data volume and copy the agent in) and detaches it before
+ * exiting, but the kernel device release can lag a beat -- VZ cannot attach the
+ * disk for boot until it is fully free, so the auto-start below polls this. */
+static BOOL disk_image_attached(NSString *path) {
+    NSTask *t = [[NSTask alloc] init];
+    t.launchPath = @"/usr/bin/hdiutil";
+    t.arguments  = @[@"info", @"-plist"];
+    NSPipe *outp = [NSPipe pipe];
+    t.standardOutput = outp;
+    t.standardError  = [NSPipe pipe];
+    if (![t launchAndReturnError:nil]) return NO;
+    NSData *d = [outp.fileHandleForReading readDataToEndOfFile];
+    [t waitUntilExit];
+    id pl = [NSPropertyListSerialization propertyListWithData:d options:0 format:NULL error:nil];
+    if (![pl isKindOfClass:[NSDictionary class]]) return NO;
+    for (NSDictionary *img in pl[@"images"]) {
+        if ([img isKindOfClass:[NSDictionary class]] &&
+            [img[@"image-path"] isEqualToString:path])
+            return YES;
+    }
+    return NO;
+}
+
+/* After install + agent stage, transition the VM straight from "Install
+ * complete" into booting -- parity with the Windows create path and the SDK's
+ * documented "create() is async and auto-starts". The wait for the disk to be
+ * released runs OFF the main queue (so the run loop stays live), then the start
+ * is marshalled back to main. No-op if the VM was deleted or already started. */
+static void autostart_after_install(NSString *nsName, NSURL *diskURL) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:20.0];
+        while (disk_image_attached(diskURL.path) && [deadline timeIntervalSinceNow] > 0)
+            usleep(300000);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            int i = vm_index_of(nsName.UTF8String);
+            if (i < 0 || g_vms[i].running) return;
+            post_log("[%s] Install complete -- starting VM.", g_vms[i].name);
+            asb_mac_vm_start(g_vms[i].name);
+        });
+    });
 }
 
 static void finish_install(int idx, NSError *error) {
@@ -554,6 +693,7 @@ static void finish_install(int idx, NSError *error) {
         save_vm_list();
         post_event(CORE_VM_EVENT_INSTALL_STATUS, g_vms[idx].name, 100, "Install complete");
         post_list_changed();
+        autostart_after_install(nsName, diskURL);   /* boot once the disk is free */
         return;
     }
 
@@ -599,6 +739,7 @@ static void finish_install(int idx, NSError *error) {
         save_vm_list();
         post_event(CORE_VM_EVENT_INSTALL_STATUS, g_vms[i].name, 100, "Install complete");
         post_list_changed();
+        autostart_after_install(nsName, diskURL);   /* boot once the disk is free */
     }];
 
     post_list_changed();
@@ -640,7 +781,8 @@ int asb_mac_vm_create(const char *name, const char *os_type,
                        const char *image_path,
                        const char *admin_user,
                        const char *admin_pass,
-                       BOOL ssh_enabled) {
+                       BOOL ssh_enabled,
+                       BOOL ssh_deploy_key) {
     if (!name || !os_type) return BACKEND_ERR_INVALID_ARG;
     if (vm_index_of(name) >= 0) {
         post_alert(name, "A VM named '%s' already exists", name);
@@ -678,6 +820,19 @@ int asb_mac_vm_create(const char *name, const char *os_type,
             (admin_pass && admin_pass[0]) ? admin_pass : "test123",
             sizeof(vm->admin_pass));
     vm->ssh_enabled = ssh_enabled;
+    /* Key deploy needs SSH; prepare the AppSandbox keypair now so the instance
+       carries the public key (the guest agent deploys it at runtime once the
+       guest reports ssh_ready). Mirrors asb_vm_create on Windows. */
+    vm->ssh_deploy_key = (ssh_deploy_key && ssh_enabled);
+    if (vm->ssh_deploy_key) {
+        char pubkey[512];
+        if (ensure_appsandbox_ssh_key(pubkey, sizeof(pubkey))) {
+            strlcpy(vm->ssh_pubkey, pubkey, sizeof(vm->ssh_pubkey));
+        } else {
+            post_log("ssh key: could not prepare AppSandbox key; creating without key deploy.");
+            vm->ssh_deploy_key = NO;
+        }
+    }
     vm->install_progress = 0;
     strlcpy(vm->install_status, "Preparing", sizeof(vm->install_status));
     g_vm_count++;
@@ -753,8 +908,13 @@ int asb_mac_vm_start(const char *name) {
         post_alert(name, "Cannot start: install has not completed");
         return BACKEND_ERR_FAILED;
     }
-    if (g_vms[idx].running) {
-        post_alert(name, "VM is already running");
+    /* Idempotent against an in-flight start: a VZ machine exists (vz_handle set)
+       from the moment loadVmNamed runs until the Stopped transition, but
+       g_vms[].running only flips true on the later Running transition. Guarding
+       on BOTH closes the window where an explicit start (client / test) could
+       race the post-install auto-start and spin up a SECOND VZ machine on the
+       same disk. */
+    if (g_vms[idx].running || g_vms[idx].vz_handle) {
         return BACKEND_ERR_ALREADY_RUNNING;
     }
 
@@ -827,6 +987,59 @@ void asb_mac_vm_set_audio_muted(const char *name, BOOL muted) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         [agent sendCommand:cmd timeout:3.0];
     });
+}
+
+/* ---- Display window (headless daemon, opened on demand) ----
+ * The same window the GUI auto-creates on the Running transition, but opened
+ * only on an explicit API request. macOS has no separate frame channel/driver
+ * (VZVirtualMachineView binds the in-process framebuffer), so there is nothing
+ * to probe: readiness is running && agent_online. These run on the main queue
+ * (the daemon marshals via on_main); window + VZ live there. */
+
+BOOL asb_mac_have_gui_session(void) {
+    CFDictionaryRef info = CGSessionCopyCurrentDictionary();
+    if (!info) return NO;   /* no Aqua session at all (launchd system daemon) */
+    CFBooleanRef on = CFDictionaryGetValue(info, kCGSessionOnConsoleKey);
+    BOOL ok = (on != NULL && CFBooleanGetValue(on));
+    CFRelease(info);
+    return ok;
+}
+
+int asb_mac_open_display(const char *name) {
+    if (!name) return BACKEND_ERR_INVALID_ARG;
+    if (!asb_mac_have_gui_session()) return BACKEND_ERR_NO_DISPLAY;   /* A-gate */
+    int idx = vm_index_of(name);
+    if (idx < 0) return BACKEND_ERR_NOT_FOUND;
+    /* Reap a window the user closed with the X button: its controller lingers
+       (g_display_refs holds the only strong ref) until something clears it.
+       Doing it here -- on a later request, off the WM close call stack -- is
+       safe, unlike clearing it inside windowWillClose:. */
+    if (g_display_refs[idx] && ((VzDisplayWindow *)g_display_refs[idx]).userClosed) {
+        g_display_refs[idx] = nil;
+        g_vms[idx].display  = nil;
+    }
+    if (!g_vms[idx].running || !g_vms[idx].vz_handle) return BACKEND_ERR_NOT_RUNNING;
+    if (!g_vms[idx].agent_online)                     return BACKEND_ERR_NOT_READY;
+    if (g_display_refs[idx]) {   /* already open -> focus */
+        [[(VzDisplayWindow *)g_display_refs[idx] window] makeKeyAndOrderFront:nil];
+        return BACKEND_OK;
+    }
+    VzDisplayWindow *display = [[VzDisplayWindow alloc] initWithVzVm:g_vms[idx].vz_handle];
+    g_display_refs[idx] = display;
+    g_vms[idx].display  = display;
+    [display showDisplay];
+    return BACKEND_OK;
+}
+
+void asb_mac_close_display(const char *name) {
+    if (!name) return;
+    int idx = vm_index_of(name);
+    if (idx < 0 || !g_display_refs[idx]) return;
+    VzDisplayWindow *display = g_display_refs[idx];   /* local strong ref keeps it
+                                                         alive across the close */
+    g_display_refs[idx] = nil;
+    g_vms[idx].display  = nil;
+    [display.window close];                           /* fires windowWillClose: */
 }
 
 int asb_mac_vm_stop(const char *name, int force) {
@@ -994,4 +1207,9 @@ void asb_mac_save(void) {
 
 void asb_mac_set_event_cb(AsbMacEventCallback cb) {
     g_event_cb = cb;
+}
+
+void asb_mac_set_headless(BOOL headless) {
+    g_headless = headless;
+    vz_vm_set_no_audio(headless);
 }

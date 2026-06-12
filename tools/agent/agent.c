@@ -408,6 +408,37 @@ static void run_quiet(wchar_t *cmd)
     }
 }
 
+/* Deploy the AppSandbox public key into administrators_authorized_keys -- the file
+   Windows OpenSSH uses for members of the Administrators group (the guest account
+   is an admin). sshd's StrictModes requires that file be writable only by the
+   Administrators group + SYSTEM with inheritance removed, so we fix the ACL too. */
+static BOOL deploy_ssh_key(const char *pubkey)
+{
+    wchar_t base[MAX_PATH], ssh_dir[MAX_PATH], authk[MAX_PATH], cmd[MAX_PATH + 256];
+    FILE *f = NULL;
+
+    if (!pubkey || !*pubkey) return FALSE;
+    if (!GetEnvironmentVariableW(L"ProgramData", base, MAX_PATH))
+        wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
+    swprintf_s(ssh_dir, MAX_PATH, L"%s\\ssh", base);
+    swprintf_s(authk, MAX_PATH, L"%s\\administrators_authorized_keys", ssh_dir);
+    CreateDirectoryW(ssh_dir, NULL);
+
+    if (_wfopen_s(&f, authk, L"w") != 0 || !f) {
+        agent_log("SSH key: cannot open authorized_keys (%lu)", GetLastError());
+        return FALSE;
+    }
+    fprintf(f, "%s\n", pubkey);
+    fclose(f);
+
+    swprintf_s(cmd, MAX_PATH + 256,
+               L"icacls \"%s\" /inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:F",
+               authk);
+    run_quiet(cmd);
+    agent_log("SSH key: deployed to administrators_authorized_keys");
+    return TRUE;
+}
+
 /* File size in bytes, or (ULONGLONG)-1 if the file is absent. */
 static ULONGLONG file_size_w(const wchar_t *path)
 {
@@ -1859,6 +1890,9 @@ static void handle_client(SOCKET client)
 
         if (strcmp(cmd, "ping") == 0) {
             REPLY("ok");
+        }
+        else if (strncmp(cmd, "ssh_deploy_key ", 15) == 0) {
+            REPLY(deploy_ssh_key(cmd + 15) ? "ssh_key_deployed" : "ssh_key_failed");
         }
         else if (strcmp(cmd, "shutdown") == 0) {
             REPLY("ok");

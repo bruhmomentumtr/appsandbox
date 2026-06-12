@@ -1533,7 +1533,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     /* Tell the agent to respawn input helper in console session */
     if (!d->stop && d->vm && d->vm->agent_online) {
         idd_log(d, L"Sending idd_connect to agent...");
-        vm_agent_send(d->vm, "idd_connect", NULL, 0);
+        vm_agent_send(d->vm, "idd_connect", NULL, 0, 5000);
     }
 
     /* Input socket lives independently of the frame channel — survives

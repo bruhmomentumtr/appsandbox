@@ -36,6 +36,10 @@
 
 - (void)showDisplay {
     [self showWindow:nil];
+    /* Bring the window to the front. The headless daemon is an Accessory app, so
+       its window would otherwise open behind the active app; activating brings it
+       forward and gives it key focus. Harmless in the GUI (already the active app). */
+    [NSApp activateIgnoringOtherApps:YES];
     [self.window makeKeyAndOrderFront:nil];
     /* VZ doesn't surface view-attach events to the guest, so the host
      * pushes mute / clipboard-sync commands to the guest agent on
@@ -47,6 +51,7 @@
 #pragma mark - NSWindowDelegate
 
 - (void)windowWillClose:(NSNotification *)notification {
+    self.userClosed = YES;   /* mark closed (X button or programmatic) before teardown */
     asb_mac_vm_set_audio_muted(self.vm.name.UTF8String, YES);
     asb_mac_vm_set_clipboard_sync(self.vm.name.UTF8String, NO);
 }

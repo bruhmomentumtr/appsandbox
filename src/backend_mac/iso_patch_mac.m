@@ -121,6 +121,10 @@ static dispatch_source_t g_authKeepAlive = NULL;
 }
 
 + (BOOL)preauthorize:(NSError **)error {
+    /* Already root (the headless daemon runs under sudo): no AuthorizationRef
+     * needed -- runPrivilegedArgs launches the stage step directly. Keeps
+     * headless fully non-interactive (no username/password prompt). */
+    if (geteuid() == 0) return YES;
     return [self ensureAuthorization:error];
 }
 
@@ -269,6 +273,14 @@ static dispatch_source_t g_authKeepAlive = NULL;
         completion([NSError errorWithDomain:@"IsoPatchMac" code:1
                      userInfo:@{NSLocalizedDescriptionKey:
                                 @"iso-patch-mac binary not found"}]);
+        return;
+    }
+
+    /* Already root (headless daemon under sudo): a plain NSTask child IS
+     * privileged -- skip AuthorizationExecuteWithPrivileges entirely, so no
+     * interactive prompt can ever appear in headless mode. */
+    if (geteuid() == 0) {
+        [self runUnprivilegedArgs:args progress:progressBlock completion:completion];
         return;
     }
 
