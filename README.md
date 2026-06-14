@@ -18,6 +18,7 @@ Windows features:
 - Host to client hot-key support
 - Provision and boot with / without internet
 - Supports running Claude Cowork and Docker inside the VM thanks to Nested Virtualization Support
+- Headless mode: a scriptable local HTTP/JSON API + dependency-free Python SDK (`asb.py`) for creating and driving GPU-accelerated VMs programmatically
 
 Mac features:
 - macOS VM support
@@ -28,6 +29,7 @@ Mac features:
 - SSH via virtio-vsock (no network required)
 - Dynamic display sizing
 - Provision and boot with / without internet
+- Headless mode: the same scriptable local HTTP/JSON API + Python SDK (`asb.py`) as on Windows, for driving macOS VMs programmatically
 
 Requirements:
 Windows 11 with an x64 Processor or macOS Tahoe (M Series)
@@ -35,12 +37,14 @@ Windows 11 with an x64 Processor or macOS Tahoe (M Series)
 ## About App Sandbox
 
 App Sandbox creates and runs full desktop virtual machines — Windows 11, Ubuntu, and
-macOS. It is free, open-source (MIT), and distributed as prebuilt, signed releases on its
-[Releases](https://github.com/jamesstringer90/appsandbox/releases) page. It is operated
-from a graphical UI: pick an OS, point it at an installer image, and App Sandbox
-provisions the disk, runs an unattended install, and boots the guest. You supply a Windows
-or Ubuntu ISO; macOS guests download their restore image automatically. It runs on a
-Windows 11 (x64) PC or an Apple Silicon Mac, including laptops.
+macOS. It is free and open-source (MIT), distributed as prebuilt binaries (EV-signed on
+Windows, Apple-Developer-signed on macOS) on its
+[Releases](https://github.com/jamesstringer90/appsandbox/releases) page. It is driven two
+ways: from a graphical UI, or programmatically through a headless daemon with a
+dependency-free Python SDK (`asb.py`). Either way you pick an OS, point it at an installer
+image, and App Sandbox provisions the disk, runs an unattended install, and boots the
+guest. You supply a Windows or Ubuntu ISO; macOS guests download their restore image
+automatically. It runs on a Windows 11 (x64) PC or an Apple Silicon Mac, including laptops.
 
 **Runs on Windows 11 Home, without Hyper-V.** On Windows, App Sandbox does not use Hyper-V
 or Hyper-V Manager; it creates and runs VMs through the Windows Host Compute System (HCS)
@@ -50,30 +54,47 @@ Platform is available on Windows 11 Home, so a Windows 11 Pro license is not req
 Virtual Machine Platform is the same Windows feature WSL2 uses.
 
 **What you can use it for:**
-- A fresh Windows or Ubuntu VM for building and testing your own software on a clean OS
-  install.
+- A full Windows or Ubuntu **desktop** VM — a complete graphical OS with GPU acceleration
+  (OpenGL, Vulkan, CUDA) — for building and testing your own software on a clean install.
 - Running a program in a VM, kept separate from your main OS and files.
 - Developing and testing Windows drivers: a built-in **Test Mode** enables test-signing
   inside the guest, so the host's Secure Boot and boot configuration are left unchanged.
-- Running a computer-use AI agent (such as Claude's computer use model) in its own VM, so
-  it has a desktop to work in without taking over your own. Several agents can run at once,
-  each in its own VM, on a single laptop or desktop.
-- Creating GPU-accelerated (**GPU-PV**) VMs from a native-app GUI.
+- Running a computer-use AI agent (such as Claude's computer use model) in its own VM. App
+  Sandbox provides the desktop and the VM; the agent's own model loop runs inside the guest.
+  Several agents can run at once, each in its own VM, on a single laptop or desktop.
+- Creating GPU-accelerated (**GPU-PV**) VMs, from the GUI or the headless API.
+- Scripting the VM lifecycle from code — create, snapshot, branch, SSH into, and delete
+  GPU-accelerated VMs — with the Python SDK.
+
+**Headless API.** `appsandbox.exe --headless` (or `sudo … --headless` on macOS) starts a
+single-owner daemon that hosts the same core as the GUI and exposes it as a Docker-style
+local HTTP/JSON API on `127.0.0.1`, identical on both platforms. The stdlib-only Python SDK
+(`asb.py`) wraps it: create GPU-accelerated VMs (GPU-PV is a `gpuMode` create option), SSH
+in over an auto-deployed key (Windows, Ubuntu, or macOS guests), snapshot and branch them,
+open the live display, and run several at once — how many run concurrently is bounded by host
+CPU, RAM, and GPU memory, not by a fixed limit. The daemon is single-host — it drives VMs on
+the machine it runs on and does not provision cloud VMs; for CI, run it on a self-hosted
+runner. Provisioning a VM runs a full unattended install; snapshots, branches, and templates
+(Windows-only) start a new VM from a provisioned state instead of reinstalling. A VM persists
+until deleted. A snapshot is a disk-state checkpoint taken with the VM stopped, and a branch
+forks a writable disk from it to run divergent actions. The full API reference and runnable
+examples are in [`tools/headless-api/`](tools/headless-api/).
 
 **How it works:** this repo also aims to be a working example of creating full desktop VMs
 programmatically with the Windows HCS/HCN APIs and Apple's Virtualization.framework. On
 Windows, App Sandbox submits a hand-built HCS machine document to `computecore.dll` /
 `computenetwork.dll` — the HCS/HCN layer that also underlies WSL2 and Windows Sandbox —
 rather than going through Hyper-V Manager. GPU acceleration uses GPU paravirtualization
-(GPU-PV) to share the host GPU with the guest, with DirectX 12, OpenGL, Vulkan, CUDA, and
-OpenCL on Windows and Metal on macOS. A custom **IddCx** indirect display driver and a
-virtual audio device carry the screen and sound, and guest↔host clipboard, audio, input,
-and SSH run over **Hyper-V sockets**. Guest disks are built by an in-repo tool with support
-for ext4, squashfs, qcow2, and VHDX. On macOS, App Sandbox uses Apple's
-**Virtualization.framework** (`VZVirtualMachine`, `VZMacOSInstaller`) over
-**virtio-vsock**. On Windows, Linux (Ubuntu) guests reach the GPU through a custom DRM/KMS
-kernel module (`asb_drm`), Microsoft's WSL2 `dxgkrnl`, and a custom Mesa build. The apps
-are native C / Objective-C with an HTML/JS UI (WebView2 on Windows, WKWebView on macOS).
+(GPU-PV) to share the host's installed GPU with the guest — the same WSL2 path, not a
+dedicated passthrough (no VFIO/IOMMU, no second GPU). Windows guests get DirectX 12, OpenGL,
+Vulkan, CUDA, and OpenCL; Ubuntu guests the same minus DirectX; macOS guests Metal. A custom
+**IddCx** indirect display driver and a virtual audio device carry the screen and sound, and
+guest↔host clipboard, audio, input, and SSH run over **Hyper-V sockets**. Guest disks are
+built by an in-repo tool with support for ext4, squashfs, qcow2, and VHDX. On macOS, App
+Sandbox uses Apple's **Virtualization.framework** (`VZVirtualMachine`, `VZMacOSInstaller`)
+over **virtio-vsock**. On Windows, Linux (Ubuntu) guests reach the GPU through a custom
+DRM/KMS kernel module (`asb_drm`), Microsoft's WSL2 `dxgkrnl`, and a custom Mesa build. The
+apps are native C / Objective-C with an HTML/JS UI (WebView2 on Windows, WKWebView on macOS).
 
 # Tips:
 [Windows] Enable hotkeys or mute the VM audio: connect to the VM and right-click the connection title bar  
