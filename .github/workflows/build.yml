@@ -23,7 +23,7 @@ jobs:
           C:\Program Files (x86)\Windows Kits
           C:\wdk_registry_1.reg
           C:\wdk_registry_2.reg
-        key: wdk-10.0.26100-v4
+        key: wdk-10.0.26100-v5
 
     - name: Restore WDK Registry
       if: steps.wdk-cache.outputs.cache-hit == 'true'
@@ -38,6 +38,14 @@ jobs:
         winget install --id Microsoft.WindowsWDK.10.0.26100 --accept-package-agreements --accept-source-agreements --silent
         reg export "HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots" C:\wdk_registry_1.reg /y
         reg export "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots" C:\wdk_registry_2.reg /y
+        
+        # Workaround for Visual Studio 18 / MSBuild 18.0 missing DriverKit tasks dll in WDK 26100
+        $binPath = "C:\Program Files (x86)\Windows Kits\10\build\10.0.26100.0\bin"
+        if (Test-Path "$binPath\Microsoft.DriverKit.Build.Tasks.17.0.dll") {
+            Copy-Item "$binPath\Microsoft.DriverKit.Build.Tasks.17.0.dll" "$binPath\Microsoft.DriverKit.Build.Tasks.18.0.dll" -Force
+            Write-Host "Copied 17.0.dll to 18.0.dll as workaround"
+        }
+        
         exit 0
       shell: powershell
     - name: Install WDK VSIX
