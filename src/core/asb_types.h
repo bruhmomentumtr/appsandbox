@@ -36,6 +36,7 @@ typedef struct CoreVmConfig {
     const char *os_type;        /* "macOS", "Windows", "Linux" */
     const char *image_path;     /* installer .ipsw/.iso, or NULL */
     const char *template_name;  /* template to clone, or NULL */
+    const char *install_dir;    /* Base directory to install the VM */
     int         ram_mb;
     int         hdd_gb;
     int         cpu_cores;

@@ -50,6 +50,7 @@ typedef struct {
     const wchar_t *os_type;        /* L"Windows" or L"Linux" */
     const wchar_t *image_path;     /* ISO path, or NULL for template */
     const wchar_t *template_name;  /* template name, or NULL for image */
+    const wchar_t *install_dir;    /* Base directory to install the VM, or NULL for default */
     DWORD  ram_mb;
     DWORD  hdd_gb;
     DWORD  cpu_cores;
@@ -63,6 +64,10 @@ typedef struct {
     BOOL   ssh_deploy_key;         /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
     BOOL   is_template;            /* TRUE = create as template VM */
 } AsbVmConfig;
+
+/* ---- Export & Import ---- */
+ASB_API int asb_export_vm(const wchar_t *vm_name, const wchar_t *export_path);
+ASB_API int asb_import_vm(const wchar_t *archive_path);
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */
 

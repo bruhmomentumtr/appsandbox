@@ -2744,17 +2744,30 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     /* Create VHDX directory */
     {
         wchar_t base_dir[MAX_PATH];
-        if (!GetEnvironmentVariableW(L"ProgramData", base_dir, MAX_PATH))
-            wcscpy_s(base_dir, MAX_PATH, L"C:\\ProgramData");
-        swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox", base_dir);
-        CreateDirectoryW(vhdx_dir, NULL);
-
-        if (is_template_create) {
-            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\templates", base_dir);
+        if (config->install_dir && config->install_dir[0] != L'\0') {
+            wcscpy_s(base_dir, MAX_PATH, config->install_dir);
+            swprintf_s(vhdx_dir, MAX_PATH, L"%s", base_dir);
             CreateDirectoryW(vhdx_dir, NULL);
-            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\templates\\%s", base_dir, cfg.name);
+            if (is_template_create) {
+                swprintf_s(vhdx_dir, MAX_PATH, L"%s\\templates", base_dir);
+                CreateDirectoryW(vhdx_dir, NULL);
+                swprintf_s(vhdx_dir, MAX_PATH, L"%s\\templates\\%s", base_dir, cfg.name);
+            } else {
+                swprintf_s(vhdx_dir, MAX_PATH, L"%s\\%s", base_dir, cfg.name);
+            }
         } else {
-            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\%s", base_dir, cfg.name);
+            if (!GetEnvironmentVariableW(L"ProgramData", base_dir, MAX_PATH))
+                wcscpy_s(base_dir, MAX_PATH, L"C:\\ProgramData");
+            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox", base_dir);
+            CreateDirectoryW(vhdx_dir, NULL);
+
+            if (is_template_create) {
+                swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\templates", base_dir);
+                CreateDirectoryW(vhdx_dir, NULL);
+                swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\templates\\%s", base_dir, cfg.name);
+            } else {
+                swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\%s", base_dir, cfg.name);
+            }
         }
     }
     CreateDirectoryW(vhdx_dir, NULL);
@@ -3781,3 +3794,143 @@ static HINSTANCE g_hInstance_core = NULL;
 ASB_API HINSTANCE ui_get_instance(void) { return g_hInstance_core; }
 
 ASB_API void asb_set_hinstance(HINSTANCE hInst) { g_hInstance_core = hInst; }
+
+/* ---- Import & Export ---- */
+
+ASB_API int asb_export_vm(const wchar_t *vm_name, const wchar_t *export_path)
+{
+    VmInstance *inst;
+    wchar_t vhdx_dir[MAX_PATH];
+    wchar_t *last_slash;
+    wchar_t cmdline[2048];
+    wchar_t config_path[MAX_PATH];
+    FILE *f;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+
+    inst = asb_vm_instance(asb_vm_find(vm_name));
+    if (!inst) return BACKEND_ERR_NOT_FOUND;
+    if (inst->running) return BACKEND_ERR_ALREADY_RUNNING;
+
+    wcscpy_s(vhdx_dir, MAX_PATH, inst->vhdx_path);
+    last_slash = wcsrchr(vhdx_dir, L'\\');
+    if (last_slash) *last_slash = L'\0';
+
+    /* Write config to json */
+    swprintf_s(config_path, MAX_PATH, L"%s\\vm_config.json", vhdx_dir);
+    if (_wfopen_s(&f, config_path, L"w") == 0 && f) {
+        fprintf(f, "{\n");
+        fprintf(f, "  \"name\": \"%ls\",\n", inst->name);
+        fprintf(f, "  \"os_type\": \"%ls\",\n", inst->os_type);
+        fprintf(f, "  \"ram_mb\": %lu,\n", inst->ram_mb);
+        fprintf(f, "  \"hdd_gb\": %lu,\n", inst->hdd_gb);
+        fprintf(f, "  \"cpu_cores\": %lu,\n", inst->cpu_cores);
+        fprintf(f, "  \"gpu_mode\": %d,\n", inst->gpu_mode);
+        fprintf(f, "  \"network_mode\": %d\n", inst->network_mode);
+        fprintf(f, "}\n");
+        fclose(f);
+    }
+
+    swprintf_s(cmdline, 2048, L"tar.exe -a -c -f \"%s\" -C \"%s\" .", export_path, vhdx_dir);
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        asb_log(L"export: tar launch failed (%lu)", GetLastError());
+        return BACKEND_ERR_FAILED;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    DeleteFileW(config_path);
+    return BACKEND_OK;
+}
+
+ASB_API int asb_import_vm(const wchar_t *archive_path)
+{
+    wchar_t base_dir[MAX_PATH];
+    wchar_t target_dir[MAX_PATH];
+    wchar_t archive_name[MAX_PATH];
+    wchar_t *name_ext;
+    wchar_t cmdline[2048];
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    wchar_t config_path[MAX_PATH];
+    FILE *f;
+    char line[256];
+    VmInstance *inst;
+
+    if (!GetEnvironmentVariableW(L"ProgramData", base_dir, MAX_PATH))
+        wcscpy_s(base_dir, MAX_PATH, L"C:\\ProgramData");
+
+    /* Extract name from archive path */
+    wcscpy_s(archive_name, MAX_PATH, archive_path);
+    name_ext = wcsrchr(archive_name, L'\\');
+    if (name_ext) wcscpy_s(archive_name, MAX_PATH, name_ext + 1);
+    name_ext = wcsrchr(archive_name, L'.');
+    if (name_ext) *name_ext = L'\0';
+
+    swprintf_s(target_dir, MAX_PATH, L"%s\\AppSandbox\\%s", base_dir, archive_name);
+    CreateDirectoryW(target_dir, NULL);
+
+    swprintf_s(cmdline, 2048, L"tar.exe -x -f \"%s\" -C \"%s\"", archive_path, target_dir);
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        asb_log(L"import: tar launch failed (%lu)", GetLastError());
+        return BACKEND_ERR_FAILED;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (g_vm_count >= ASB_MAX_VMS) return BACKEND_ERR_FAILED;
+
+    inst = &g_vms[g_vm_count];
+    ZeroMemory(inst, sizeof(VmInstance));
+    inst->unique_id = g_next_vm_id++;
+    wcscpy_s(inst->name, 256, archive_name);
+    swprintf_s(inst->vhdx_path, MAX_PATH, L"%s\\disk.vhdx", target_dir);
+    inst->ram_mb = 4096;
+    inst->hdd_gb = 64;
+    inst->cpu_cores = 4;
+    wcscpy_s(inst->os_type, 32, L"Windows");
+
+    swprintf_s(config_path, MAX_PATH, L"%s\\vm_config.json", target_dir);
+    if (_wfopen_s(&f, config_path, L"r") == 0 && f) {
+        while (fgets(line, sizeof(line), f)) {
+            char *p;
+            if ((p = strstr(line, "\"os_type\": \""))) {
+                char *end = strchr(p + 12, '\"');
+                if (end) {
+                    *end = '\0';
+                    MultiByteToWideChar(CP_UTF8, 0, p + 12, -1, inst->os_type, 32);
+                }
+            } else if ((p = strstr(line, "\"ram_mb\": "))) {
+                inst->ram_mb = atoi(p + 10);
+            } else if ((p = strstr(line, "\"hdd_gb\": "))) {
+                inst->hdd_gb = atoi(p + 10);
+            } else if ((p = strstr(line, "\"cpu_cores\": "))) {
+                inst->cpu_cores = atoi(p + 13);
+            } else if ((p = strstr(line, "\"gpu_mode\": "))) {
+                inst->gpu_mode = atoi(p + 12);
+            } else if ((p = strstr(line, "\"network_mode\": "))) {
+                inst->network_mode = atoi(p + 16);
+            }
+        }
+        fclose(f);
+        DeleteFileW(config_path);
+    }
+
+    g_vm_count++;
+    save_vm_list();
+    return BACKEND_OK;
+}

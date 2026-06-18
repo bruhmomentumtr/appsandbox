@@ -766,8 +766,29 @@ function buildRowCells(vm, i, statusTd) {
         makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
         makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
         makeIconCell('edit', editModeRow === i ? '\u2714\uFE0F' : '\u270F\uFE0F', !vm.running && !bld, function() { toggleEditMode(i); }, '', 'Edit VM configuration (CPU, RAM, GPU, network) — VM must be stopped'),
+        makeIconCell('export', '\uD83D\uDCE4', !vm.running && !bld, function() { onExportVm(i); }, '', 'Export VM to an archive (.asb.zip)'),
     );
     return cells;
+}
+
+function onExportVm(idx) {
+    var vm = vms[idx];
+    if (!vm || vm.running) return;
+    showModal('Export VM', 'Exporting "' + vm.name + '" will create a .asb.zip archive that you can copy to another computer.', 'Export', {
+        input: { label: 'Export Path:', value: 'C:\\AppSandboxExport\\' + vm.name + '.asb.zip' }
+    }).then(function(result) {
+        if (result === false) return;
+        sendCmd('exportVm', { name: vm.name, exportPath: result });
+    });
+}
+
+function importVmPrompt() {
+    showModal('Import VM', 'Enter the full path to the .asb.zip archive to import:', 'Import', {
+        input: { label: 'Archive Path:', value: 'C:\\AppSandboxExport\\MyAppSandbox.asb.zip' }
+    }).then(function(result) {
+        if (result === false) return;
+        sendCmd('importVm', { archivePath: result });
+    });
 }
 
 function renderVmTable() {

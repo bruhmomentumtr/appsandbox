@@ -15,7 +15,10 @@
 <section id="vm-section">
     <div class="section-header">
         <h2>Sandboxes</h2>
-        <button id="btn-new-sandbox" class="primary" onclick="openCreateModal()">+ New Sandbox</button>
+        <div style="display: inline-block;">
+            <button id="btn-import-sandbox" onclick="importVmPrompt()">Import VM</button>
+            <button id="btn-new-sandbox" class="primary" onclick="openCreateModal()">+ New Sandbox</button>
+        </div>
     </div>
     <div class="vm-table-wrap">
         <table id="vm-table">
@@ -36,6 +39,7 @@
                 <th class="icon-col">&#x23FB;</th>
                 <th class="icon-col">&#x2715;&#xFE0F;</th>
                 <th class="icon-col">&#x1F5D1;&#xFE0F;</th>
+                <th class="icon-col" title="Export VM">&#x1F4E4;</th>
                 <th class="icon-col">&#x270F;&#xFE0F;</th>
             </tr></thead>
             <tbody id="vm-tbody"></tbody>
@@ -79,6 +83,12 @@
             <div class="form-row">
                 <input type="text" id="vm-name" value="MyAppSandbox" class="input-md" autocorrect="off" autocapitalize="off" spellcheck="false">
                 <span class="field-warn" id="vm-name-warn"></span>
+            </div>
+
+            <label for="install-dir">Install Location:</label>
+            <div class="form-row">
+                <input type="text" id="install-dir" placeholder="Default (%ProgramData%\AppSandbox)" class="input-lg" autocorrect="off" autocapitalize="off" spellcheck="false">
+                <span class="host-info">Leave blank for default location</span>
             </div>
 
             <label class="needs-iso">OS Image:</label>

@@ -891,7 +891,7 @@ static void on_webview2_message(const wchar_t *json)
         AsbVmConfig cfg;
         wchar_t name_buf[256] = {0}, os_buf[32] = {0}, img_buf[MAX_PATH] = {0};
         wchar_t tpl_buf[256] = {0}, user_buf[128] = {0}, pass_buf[128] = {0};
-        wchar_t adapter_buf[256] = {0};
+        wchar_t adapter_buf[256] = {0}, install_dir_buf[MAX_PATH] = {0};
         int val;
         BOOL is_tpl = FALSE;
 
@@ -902,6 +902,7 @@ static void on_webview2_message(const wchar_t *json)
         json_get_string(json, L"adminUser", user_buf, 128);
         json_get_string(json, L"adminPass", pass_buf, 128);
         json_get_string(json, L"netAdapter", adapter_buf, 256);
+        json_get_string(json, L"installDir", install_dir_buf, MAX_PATH);
         json_get_bool(json, L"isTemplate", &is_tpl);
 
         ZeroMemory(&cfg, sizeof(cfg));
@@ -912,6 +913,7 @@ static void on_webview2_message(const wchar_t *json)
         cfg.username = user_buf;
         cfg.password = pass_buf;
         cfg.net_adapter = adapter_buf;
+        cfg.install_dir = install_dir_buf;
         cfg.is_template = is_tpl;
 
         if (json_get_int(json, L"hddGb", &val)) cfg.hdd_gb = (DWORD)val;
@@ -926,6 +928,19 @@ static void on_webview2_message(const wchar_t *json)
         asb_vm_create(&cfg);
         SecureZeroMemory(pass_buf, sizeof(pass_buf));
         send_vm_list();
+    } else if (wcscmp(action, L"exportVm") == 0) {
+        wchar_t name_buf[256] = {0};
+        wchar_t path_buf[MAX_PATH] = {0};
+        if (json_get_string(json, L"name", name_buf, 256) &&
+            json_get_string(json, L"exportPath", path_buf, MAX_PATH)) {
+            asb_export_vm(name_buf, path_buf);
+        }
+    } else if (wcscmp(action, L"importVm") == 0) {
+        wchar_t path_buf[MAX_PATH] = {0};
+        if (json_get_string(json, L"archivePath", path_buf, MAX_PATH)) {
+            asb_import_vm(path_buf);
+            send_vm_list();
+        }
     } else if (wcscmp(action, L"startVm") == 0) {
         if (!g_prereq_ok) {
             webview2_post(g_prereq_reboot_pending
