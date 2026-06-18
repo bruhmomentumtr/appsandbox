@@ -17,7 +17,7 @@ jobs:
       uses: microsoft/setup-msbuild@v2
     - name: Install WDK
       run: |
-        Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2270329" -OutFile wdksetup.exe
+        curl.exe -sL "https://go.microsoft.com/fwlink/?linkid=2270329" -o wdksetup.exe
         Start-Process -FilePath "wdksetup.exe" -ArgumentList "/q" -Wait -NoNewWindow
       shell: powershell
 
