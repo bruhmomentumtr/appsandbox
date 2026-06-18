@@ -15,14 +15,47 @@ jobs:
     - uses: actions/checkout@v4
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v2
+    - name: Install WDK
+      run: |
+        Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2270329" -OutFile wdksetup.exe
+        Start-Process -FilePath "wdksetup.exe" -ArgumentList "/q" -Wait -NoNewWindow
+      shell: powershell
+
     - name: Build AppSandbox
-      run: msbuild AppSandbox.sln /t:AppSandbox /p:Configuration=Release /p:Platform=x64
+      run: msbuild AppSandbox.sln /p:Configuration=Release /p:Platform=x64
       
+    - name: Package Release
+      shell: powershell
+      run: |
+        $stage = "bin\Release\_package\AppSandbox"
+        New-Item -ItemType Directory -Force -Path $stage | Out-Null
+        
+        $rootBins = @('AppSandbox.exe', 'appsandbox_core.dll', 'iso-patch.exe', 'WebView2Loader.dll')
+        foreach ($b in $rootBins) { Copy-Item "bin\Release\$b" "$stage\$b" -Force }
+        
+        New-Item -ItemType Directory -Force -Path "$stage\drivers" | Out-Null
+        Copy-Item "x64\Release\AppSandboxVDD.dll" "$stage\drivers\AppSandboxVDD.dll" -Force -ErrorAction SilentlyContinue
+        Copy-Item "x64\Release\AppSandboxVAD.sys" "$stage\drivers\AppSandboxVAD.sys" -Force -ErrorAction SilentlyContinue
+        Copy-Item "tools\vdd\AppSandboxVDD.inf" "$stage\drivers\AppSandboxVDD.inf" -Force -ErrorAction SilentlyContinue
+        Copy-Item "tools\vad\AppSandboxVAD.inf" "$stage\drivers\AppSandboxVAD.inf" -Force -ErrorAction SilentlyContinue
+        
+        robocopy "bin\Release\resources" "$stage\resources" /E /XF *.pdb *.lib *.exp *.ilk *.iobj *.ipdb *.log *.cer | Out-Null
+        robocopy "bin\Release\web" "$stage\web" /E /XF *.pdb *.lib *.exp *.ilk *.iobj *.ipdb *.log *.cer | Out-Null
+        
+        $sdkDst = "$stage\headless-api"
+        New-Item -ItemType Directory -Force -Path $sdkDst | Out-Null
+        Copy-Item "tools\headless-api\asb.py" "$sdkDst\asb.py" -Force -ErrorAction SilentlyContinue
+        Copy-Item "tools\headless-api\README.md" "$sdkDst\README.md" -Force -ErrorAction SilentlyContinue
+        robocopy "tools\headless-api\examples" "$sdkDst\examples" /E /XD __pycache__ /XF *.pyc | Out-Null
+        robocopy "tools\headless-api\tests" "$sdkDst\tests" /E /XD __pycache__ /XF *.pyc | Out-Null
+        
+        exit 0
+
     - name: Upload AppSandbox Artifact
       uses: actions/upload-artifact@v4
       with:
         name: AppSandbox-Windows
-        path: bin/Release/
+        path: bin/Release/_package/AppSandbox/
   build-macos:
     runs-on: macos-13
     if: github.event_name == 'workflow_dispatch'
