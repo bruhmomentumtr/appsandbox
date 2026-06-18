@@ -36,7 +36,7 @@ jobs:
       if: steps.wdk-cache.outputs.cache-hit != 'true'
       run: |
         curl.exe -sL "https://go.microsoft.com/fwlink/?linkid=2196230" -o wdksetup.exe
-        Start-Process -FilePath "wdksetup.exe" -ArgumentList "/q" -Wait -NoNewWindow
+        Start-Process -FilePath "wdksetup.exe" -ArgumentList "/quiet", "/features", "OptionId.WindowsDriverKitComplete", "/norestart" -Wait -NoNewWindow
         reg export "HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots" C:\wdk_registry_1.reg /y
         reg export "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots" C:\wdk_registry_2.reg /y
         exit 0
