@@ -41,6 +41,16 @@ jobs:
         reg export "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots" C:\wdk_registry_2.reg /y
         exit 0
       shell: powershell
+    - name: Install WDK VSIX
+      run: |
+        $vsixPath = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Vsix" -Recurse -Filter "WDK.vsix" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+        if ($vsixPath) {
+          $vsixInstaller = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\VSIXInstaller.exe"
+          if (Test-Path $vsixInstaller) {
+            Start-Process -FilePath $vsixInstaller -ArgumentList "/q", "/admin", $vsixPath -Wait -NoNewWindow
+          }
+        }
+      shell: powershell
 
     - name: Build AppSandbox
       run: msbuild AppSandbox.sln /p:Configuration=Release /p:Platform=x64
