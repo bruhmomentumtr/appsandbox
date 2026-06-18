@@ -1,0 +1,27 @@
+name: Build AppSandbox
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+    - name: Build AppSandbox
+      run: msbuild AppSandbox.sln /p:Configuration=Release /p:Platform=x64
+
+  build-macos:
+    runs-on: macos-13
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build AppSandbox (macOS)
+      run: xcodebuild -project AppSandbox.xcodeproj -scheme AppSandbox -configuration Release
