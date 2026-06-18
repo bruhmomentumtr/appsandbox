@@ -23,7 +23,7 @@ jobs:
           C:\Program Files (x86)\Windows Kits
           C:\wdk_registry_1.reg
           C:\wdk_registry_2.reg
-        key: wdk-10.0.22621-v3
+        key: wdk-10.0.26100-v4
 
     - name: Restore WDK Registry
       if: steps.wdk-cache.outputs.cache-hit == 'true'
@@ -35,8 +35,7 @@ jobs:
     - name: Install WDK
       if: steps.wdk-cache.outputs.cache-hit != 'true'
       run: |
-        curl.exe -sL "https://go.microsoft.com/fwlink/?linkid=2196230" -o wdksetup.exe
-        Start-Process -FilePath "wdksetup.exe" -ArgumentList "/quiet", "/features", "OptionId.WindowsDriverKitComplete", "/norestart" -Wait -NoNewWindow
+        winget install --id Microsoft.WindowsWDK.10.0.26100 --accept-package-agreements --accept-source-agreements --silent
         reg export "HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots" C:\wdk_registry_1.reg /y
         reg export "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots" C:\wdk_registry_2.reg /y
         exit 0
@@ -53,7 +52,7 @@ jobs:
       shell: powershell
 
     - name: Build AppSandbox
-      run: msbuild AppSandbox.sln /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.22621.0 /p:TargetPlatformVersion=10.0.22621.0
+      run: msbuild AppSandbox.sln /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.26100.0 /p:TargetPlatformVersion=10.0.26100.0
       
     - name: Package Release
       shell: powershell
