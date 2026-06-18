@@ -66,8 +66,8 @@ typedef struct {
 } AsbVmConfig;
 
 /* ---- Export & Import ---- */
-ASB_API int asb_export_vm(const wchar_t *vm_name, const wchar_t *export_path);
-ASB_API int asb_import_vm(const wchar_t *archive_path);
+ASB_API HRESULT asb_export_vm(const wchar_t *vm_name, const wchar_t *export_path);
+ASB_API HRESULT asb_import_vm(const wchar_t *archive_path);
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */
 

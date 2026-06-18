@@ -3790,6 +3790,201 @@ ASB_API int asb_vm_index(AsbVm vm) { return vm_index_of(vm); }
 /* ---- HINSTANCE accessor (UI compatibility) ---- */
 
 static HINSTANCE g_hInstance_core = NULL;
+        if (branch_idx < 0 || branch_idx >= g_snap_trees[idx].nodes[snap_idx].branch_count) return FALSE;
+        br = &g_snap_trees[idx].nodes[snap_idx].branches[branch_idx];
+    }
+
+    if (!br->valid) return FALSE;
+    out->index = branch_idx;
+    wcscpy_s(out->name, 128, br->friendly_name);
+    wcscpy_s(out->guid, 64, br->guid);
+    return TRUE;
+}
+
+ASB_API void asb_snap_get_current(AsbVm vm, int *snap_idx, int *branch_idx)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0 || !snap_idx || !branch_idx) {
+        if (snap_idx) *snap_idx = -1;
+        if (branch_idx) *branch_idx = -1;
+        return;
+    }
+    snapshot_find_current(&g_snap_trees[idx], g_vms[idx].vhdx_path, snap_idx, branch_idx);
+}
+
+/* ---- Templates ---- */
+
+ASB_API int asb_template_count(void) { return g_template_count; }
+
+ASB_API const wchar_t *asb_template_name(int index)
+{
+    if (index < 0 || index >= g_template_count) return L"";
+    return g_templates[index].name;
+}
+
+ASB_API const wchar_t *asb_template_os_type(int index)
+{
+    if (index < 0 || index >= g_template_count) return L"";
+    return g_templates[index].os_type;
+}
+
+ASB_API HRESULT asb_template_delete(const wchar_t *name)
+{
+    wchar_t base_dir[MAX_PATH], tpl_dir[MAX_PATH];
+    wchar_t json_path[MAX_PATH], vhdx_path[MAX_PATH];
+    wchar_t vmgs[MAX_PATH], vmrs[MAX_PATH], res[MAX_PATH], snap_dir[MAX_PATH];
+
+    if (!name || name[0] == L'\0') return E_INVALIDARG;
+
+    if (!GetEnvironmentVariableW(L"ProgramData", base_dir, MAX_PATH))
+        wcscpy_s(base_dir, MAX_PATH, L"C:\\ProgramData");
+    swprintf_s(tpl_dir, MAX_PATH, L"%s\\AppSandbox\\templates\\%s", base_dir, name);
+
+    swprintf_s(json_path, MAX_PATH, L"%s\\%s.json", tpl_dir, name);
+    swprintf_s(vhdx_path, MAX_PATH, L"%s\\disk.vhdx", tpl_dir);
+    swprintf_s(vmgs, MAX_PATH, L"%s\\vm.vmgs", tpl_dir);
+    swprintf_s(vmrs, MAX_PATH, L"%s\\vm.vmrs", tpl_dir);
+    swprintf_s(res, MAX_PATH, L"%s\\resources.iso", tpl_dir);
+    DeleteFileW(json_path);
+    DeleteFileW(vhdx_path);
+    DeleteFileW(vmgs); DeleteFileW(vmrs); DeleteFileW(res);
+
+    swprintf_s(snap_dir, MAX_PATH, L"%s\\snapshots", tpl_dir);
+    RemoveDirectoryW(snap_dir);
+    RemoveDirectoryW(tpl_dir);
+
+    asb_log(L"Template \"%s\" deleted.", name);
+    scan_templates();
+    return S_OK;
+}
+
+ASB_API void asb_template_rescan(void)
+{
+    scan_templates();
+}
+
+/* ---- Wait helpers ---- */
+
+ASB_API HRESULT asb_vm_wait_running(AsbVm vm, DWORD timeout_ms)
+{
+    VmInstance *inst = vm_inst(vm);
+    ULONGLONG start;
+    if (!inst) return E_INVALIDARG;
+    start = GetTickCount64();
+    while (!inst->running && !inst->building_vhdx) {
+        if (GetTickCount64() - start > timeout_ms) return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+        Sleep(200);
+        /* Check if VM was removed from list */
+        if (vm_index_of(vm) < 0) return E_HANDLE;
+    }
+    /* If still building, wait until building finishes */
+    while (inst->building_vhdx) {
+        if (GetTickCount64() - start > timeout_ms) return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+        Sleep(500);
+        if (vm_index_of(vm) < 0) return E_HANDLE;
+    }
+    return inst->running ? S_OK : E_FAIL;
+}
+
+ASB_API HRESULT asb_vm_wait_agent(AsbVm vm, DWORD timeout_ms)
+{
+    VmInstance *inst = vm_inst(vm);
+    ULONGLONG start;
+    if (!inst) return E_INVALIDARG;
+    start = GetTickCount64();
+    while (!inst->agent_online) {
+        if (!inst->running) return E_FAIL;
+        if (GetTickCount64() - start > timeout_ms) return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+        Sleep(500);
+        if (vm_index_of(vm) < 0) return E_HANDLE;
+    }
+    return S_OK;
+}
+
+ASB_API HRESULT asb_vm_wait_stopped(AsbVm vm, DWORD timeout_ms)
+{
+    VmInstance *inst = vm_inst(vm);
+    ULONGLONG start;
+    if (!inst) return E_INVALIDARG;
+    start = GetTickCount64();
+    while (inst->running) {
+        if (GetTickCount64() - start > timeout_ms) return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+        Sleep(200);
+        if (vm_index_of(vm) < 0) return S_OK; /* VM deleted = stopped */
+    }
+    return S_OK;
+}
+
+/* ---- Reconnect to running VMs ---- */
+
+ASB_API void asb_reconnect_running(void)
+{
+    int i;
+    for (i = 0; i < g_vm_count; i++) {
+        if (g_vms[i].running) continue;  /* already tracked */
+        if (hcs_try_open_vm(&g_vms[i])) {
+            /* Full reconnect: we have a handle, so register callback + monitor */
+            hcs_register_vm_callback(&g_vms[i]);
+            hcs_start_monitor(&g_vms[i]);
+            vm_agent_start(&g_vms[i]);
+            idd_probe_start(&g_vms[i]);
+        } else if (hcs_is_running_by_enum(g_vms[i].name)) {
+            /* HCS open failed (stale handle from dead process) but enumeration
+               confirms the VM is running.  Mark it so queries return the right
+               state.  We don't have a handle so we can't register callbacks
+               or monitor - the start path will destroy the stale system and
+               recreate it when needed. */
+            g_vms[i].running = TRUE;
+            asb_log(L"Reconnect: \"%s\" is running (via enumeration, no handle).",
+                    g_vms[i].name);
+        }
+    }
+}
+
+/* ---- Persistence ---- */
+
+ASB_API void asb_save(void) { save_vm_list(); }
+
+/* ---- Settings accessors ---- */
+
+ASB_API void asb_set_last_iso_path(const wchar_t *path)
+{
+    if (path) wcscpy_s(g_last_iso_path, MAX_PATH, path);
+}
+
+ASB_API const wchar_t *asb_get_last_iso_path(void)
+{
+    return g_last_iso_path;
+}
+
+ASB_API void asb_set_suppress_tray_warn(BOOL suppress)
+{
+    g_suppress_tray_warn = suppress;
+}
+
+ASB_API BOOL asb_get_suppress_tray_warn(void)
+{
+    return g_suppress_tray_warn;
+}
+
+/* ---- Internal access (for UI layer) ---- */
+
+ASB_API VmInstance *asb_vm_instance(AsbVm vm) { return vm_inst(vm); }
+
+ASB_API SnapshotTree *asb_vm_snap_tree(AsbVm vm)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0) return NULL;
+    return &g_snap_trees[idx];
+}
+
+ASB_API GpuList *asb_gpu_list(void) { return &g_gpu_list; }
+
+ASB_API int asb_vm_index(AsbVm vm) { return vm_index_of(vm); }
+
+/* ---- HINSTANCE accessor (UI compatibility) ---- */
+
+static HINSTANCE g_hInstance_core = NULL;
 
 ASB_API HINSTANCE ui_get_instance(void) { return g_hInstance_core; }
 
@@ -3797,7 +3992,7 @@ ASB_API void asb_set_hinstance(HINSTANCE hInst) { g_hInstance_core = hInst; }
 
 /* ---- Import & Export ---- */
 
-ASB_API int asb_export_vm(const wchar_t *vm_name, const wchar_t *export_path)
+ASB_API HRESULT asb_export_vm(const wchar_t *vm_name, const wchar_t *export_path)
 {
     VmInstance *inst;
     wchar_t vhdx_dir[MAX_PATH];
@@ -3809,8 +4004,8 @@ ASB_API int asb_export_vm(const wchar_t *vm_name, const wchar_t *export_path)
     PROCESS_INFORMATION pi;
 
     inst = asb_vm_instance(asb_vm_find(vm_name));
-    if (!inst) return BACKEND_ERR_NOT_FOUND;
-    if (inst->running) return BACKEND_ERR_ALREADY_RUNNING;
+    if (!inst) return E_INVALIDARG;
+    if (inst->running) return E_FAIL;
 
     wcscpy_s(vhdx_dir, MAX_PATH, inst->vhdx_path);
     last_slash = wcsrchr(vhdx_dir, L'\\');
@@ -3839,7 +4034,7 @@ ASB_API int asb_export_vm(const wchar_t *vm_name, const wchar_t *export_path)
 
     if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         asb_log(L"export: tar launch failed (%lu)", GetLastError());
-        return BACKEND_ERR_FAILED;
+        return E_FAIL;
     }
 
     WaitForSingleObject(pi.hProcess, INFINITE);
@@ -3847,10 +4042,10 @@ ASB_API int asb_export_vm(const wchar_t *vm_name, const wchar_t *export_path)
     CloseHandle(pi.hThread);
 
     DeleteFileW(config_path);
-    return BACKEND_OK;
+    return S_OK;
 }
 
-ASB_API int asb_import_vm(const wchar_t *archive_path)
+ASB_API HRESULT asb_import_vm(const wchar_t *archive_path)
 {
     wchar_t base_dir[MAX_PATH];
     wchar_t target_dir[MAX_PATH];
@@ -3885,14 +4080,14 @@ ASB_API int asb_import_vm(const wchar_t *archive_path)
 
     if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         asb_log(L"import: tar launch failed (%lu)", GetLastError());
-        return BACKEND_ERR_FAILED;
+        return E_FAIL;
     }
 
     WaitForSingleObject(pi.hProcess, INFINITE);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 
-    if (g_vm_count >= ASB_MAX_VMS) return BACKEND_ERR_FAILED;
+    if (g_vm_count >= ASB_MAX_VMS) return E_FAIL;
 
     inst = &g_vms[g_vm_count];
     ZeroMemory(inst, sizeof(VmInstance));
@@ -3932,5 +4127,5 @@ ASB_API int asb_import_vm(const wchar_t *archive_path)
 
     g_vm_count++;
     save_vm_list();
-    return BACKEND_OK;
+    return S_OK;
 }
