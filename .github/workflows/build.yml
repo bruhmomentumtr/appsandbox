@@ -15,10 +15,31 @@ jobs:
     - uses: actions/checkout@v4
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v2
+    - name: Cache WDK
+      uses: actions/cache@v4
+      id: wdk-cache
+      with:
+        path: |
+          C:\Program Files (x86)\Windows Kits
+          C:\wdk_registry_1.reg
+          C:\wdk_registry_2.reg
+        key: wdk-10.0.22621-v2
+
+    - name: Restore WDK Registry
+      if: steps.wdk-cache.outputs.cache-hit == 'true'
+      run: |
+        if (Test-Path C:\wdk_registry_1.reg) { reg import C:\wdk_registry_1.reg }
+        if (Test-Path C:\wdk_registry_2.reg) { reg import C:\wdk_registry_2.reg }
+      shell: powershell
+
     - name: Install WDK
+      if: steps.wdk-cache.outputs.cache-hit != 'true'
       run: |
         curl.exe -sL "https://go.microsoft.com/fwlink/?linkid=2196230" -o wdksetup.exe
         Start-Process -FilePath "wdksetup.exe" -ArgumentList "/q" -Wait -NoNewWindow
+        reg export "HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots" C:\wdk_registry_1.reg /y
+        reg export "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots" C:\wdk_registry_2.reg /y
+        exit 0
       shell: powershell
 
     - name: Build AppSandbox
