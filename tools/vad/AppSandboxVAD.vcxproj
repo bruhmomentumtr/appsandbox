@@ -25,7 +25,7 @@
     <Configuration Condition="'$(Configuration)' == ''">Debug</Configuration>
     <Platform Condition="'$(Platform)' == ''">x64</Platform>
     <AsbEmbedVersion>false</AsbEmbedVersion>
-    <RunApiValidator>false</RunApiValidator>
+    <ApiValidator_Enable>false</ApiValidator_Enable>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
