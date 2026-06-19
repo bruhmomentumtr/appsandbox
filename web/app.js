@@ -776,7 +776,7 @@ function onExportVm(idx) {
     var vm = vms[idx];
     if (!vm || vm.running) return;
     showModal('Export VM', 'Exporting "' + vm.name + '" will create a .asb.zip archive that you can copy to another computer.', 'Export', {
-        input: { label: 'Export Path:', value: 'C:\\AppSandboxExport\\' + vm.name + '.asb.zip' }
+        input: { label: 'Export Path:', value: 'C:\\AppSandboxExport\\' + vm.name + '.asb.zip', allowPath: true }
     }).then(function(result) {
         if (result === false) return;
         sendCmd('exportVm', { name: vm.name, exportPath: result });
@@ -787,7 +787,7 @@ function onMoveVm(idx) {
     var vm = vms[idx];
     if (!vm || vm.running) return;
     showModal('Move VM', 'Moving "' + vm.name + '" will relocate all its files to the specified directory.', 'Move', {
-        input: { label: 'New Target Directory:', value: 'D:\\AppSandboxVMs\\' }
+        input: { label: 'New Target Directory:', value: 'D:\\AppSandboxVMs\\', allowPath: true }
     }).then(function(result) {
         if (result === false) return;
         sendCmd('moveVm', { name: vm.name, newBaseDir: result });
@@ -797,7 +797,7 @@ function onMoveVm(idx) {
 
 function importVmPrompt() {
     showModal('Import VM', 'Enter the full path to the .asb.zip archive to import:', 'Import', {
-        input: { label: 'Archive Path:', value: 'C:\\AppSandboxExport\\MyAppSandbox.asb.zip' }
+        input: { label: 'Archive Path:', value: 'C:\\AppSandboxExport\\MyAppSandbox.asb.zip', allowPath: true }
     }).then(function(result) {
         if (result === false) return;
         sendCmd('importVm', { archivePath: result });
@@ -1439,8 +1439,9 @@ function showModal(title, message, confirmText, opts) {
         if (opts.input.label) document.getElementById('modal-input-label').textContent = opts.input.label;
         inputEl.onkeydown = function(e) { if (e.key === 'Enter') modalResolve(true); };
         inputEl.oninput = function() {
-            /* Strip characters that would break the INI-style .dat file */
-            var clean = inputEl.value.replace(/[\n\r\t\[\]\\]/g, '');
+            /* Strip characters that would break the INI-style .dat file, unless it's a path */
+            var regex = (opts.input && opts.input.allowPath) ? /[\n\r\t\[\]]/g : /[\n\r\t\[\]\\]/g;
+            var clean = inputEl.value.replace(regex, '');
             if (clean !== inputEl.value) inputEl.value = clean;
         };
         inputEl.maxLength = 127;
