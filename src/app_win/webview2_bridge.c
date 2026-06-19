@@ -549,15 +549,22 @@ BOOL json_get_string(const wchar_t *json, const wchar_t *key,
     p++;
     start = p;
 
-    /* Find closing quote, handling escapes */
+    size_t written = 0;
     while (*p && *p != L'"') {
-        if (*p == L'\\' && *(p + 1)) p++;
+        if (*p == L'\\' && *(p + 1)) {
+            p++;
+            /* Simple unescape for common JSON chars */
+            if (*p == L'n') { out[written++] = L'\n'; }
+            else if (*p == L'r') { out[written++] = L'\r'; }
+            else if (*p == L't') { out[written++] = L'\t'; }
+            else { out[written++] = *p; }
+        } else {
+            out[written++] = *p;
+        }
+        if (written >= out_len - 1) return FALSE;
         p++;
     }
-    end = p;
-
-    if ((size_t)(end - start) >= out_len) return FALSE;
-    wcsncpy_s(out, out_len, start, end - start);
+    out[written] = L'\0';
     return TRUE;
 }
 

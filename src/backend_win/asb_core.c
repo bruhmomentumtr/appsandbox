@@ -3831,6 +3831,17 @@ ASB_API HRESULT asb_export_vm(const wchar_t *vm_name, const wchar_t *export_path
         fclose(f);
     }
 
+    /* Ensure export directory exists */
+    {
+        wchar_t export_dir[MAX_PATH];
+        wcscpy_s(export_dir, MAX_PATH, export_path);
+        wchar_t *export_slash = wcsrchr(export_dir, L'\\');
+        if (export_slash) {
+            *export_slash = L'\0';
+            SHCreateDirectoryExW(NULL, export_dir, NULL);
+        }
+    }
+
     swprintf_s(cmdline, 2048, L"tar.exe -a -c -f \"%s\" -C \"%s\" .", export_path, vhdx_dir);
 
     ZeroMemory(&si, sizeof(si));
@@ -3960,7 +3971,18 @@ ASB_API HRESULT asb_move_vm(const wchar_t *vm_name, const wchar_t *new_base_dir)
     last_slash = wcsrchr(old_dir, L'\\');
     if (last_slash) *last_slash = L'\0';
 
-    swprintf_s(new_dir, MAX_PATH, L"%s\\%s", new_base_dir, inst->name);
+    /* Remove trailing slash from new_base_dir */
+    wchar_t clean_base_dir[MAX_PATH];
+    wcscpy_s(clean_base_dir, MAX_PATH, new_base_dir);
+    size_t len = wcslen(clean_base_dir);
+    while (len > 0 && (clean_base_dir[len - 1] == L'\\' || clean_base_dir[len - 1] == L'/')) {
+        clean_base_dir[len - 1] = L'\0';
+        len--;
+    }
+
+    SHCreateDirectoryExW(NULL, clean_base_dir, NULL);
+
+    swprintf_s(new_dir, MAX_PATH, L"%s\\%s", clean_base_dir, inst->name);
 
     ZeroMemory(&fileOp, sizeof(fileOp));
     fileOp.wFunc = FO_MOVE;

@@ -1,0 +1,8 @@
+{
+  "tag_name": "v0.13",
+  "name": "AppSandbox v0.13 - Move VM Feature & Pipeline Fixes",
+  "body": "## What's New\n\n* **Move VM Feature**: You can now move an existing Virtual Machine to a different folder/drive from the UI. The backend handles `tree.dat` snapshot rebasing automatically.\n* **ApiValidator Bypass**: Fixed the `ApiValidator` error (exit code 193) for `AppSandboxVAD.vcxproj`.\n* **PowerShell 7 Pipeline Upgrade**: Switched signing tasks from `powershell` to `pwsh` to fix `FormatXmlUpdateException` failures during GitHub Actions builds.\n* **WDK Caching**: Implemented WDK caching on GitHub Actions, cutting environment setup time significantly.",
+  "draft": false,
+  "prerelease": false,
+  "generate_release_notes": true
+}
