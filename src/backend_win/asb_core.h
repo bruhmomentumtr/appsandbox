@@ -68,6 +68,7 @@ typedef struct {
 /* ---- Export & Import ---- */
 ASB_API HRESULT asb_export_vm(const wchar_t *vm_name, const wchar_t *export_path);
 ASB_API HRESULT asb_import_vm(const wchar_t *archive_path);
+ASB_API HRESULT asb_move_vm(const wchar_t *vm_name, const wchar_t *new_base_dir);
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */
 

@@ -98,4 +98,7 @@ ASB_API BOOL snapshot_get_branch_time(SnapshotTree *tree, int snap_idx, int bran
    snap_idx >= 0 or -2, branch_idx >= 0: rename branch. */
 HRESULT snapshot_rename(SnapshotTree *tree, int snap_idx, int branch_idx, const wchar_t *new_name);
 
+/* Rebase all paths in the snapshot tree to a new directory */
+ASB_API void snapshot_rebase(SnapshotTree *tree, const wchar_t *old_dir, const wchar_t *new_dir);
+
 #endif /* SNAPSHOT_H */

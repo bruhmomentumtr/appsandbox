@@ -767,6 +767,7 @@ function buildRowCells(vm, i, statusTd) {
         makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
         makeIconCell('edit', editModeRow === i ? '\u2714\uFE0F' : '\u270F\uFE0F', !vm.running && !bld, function() { toggleEditMode(i); }, '', 'Edit VM configuration (CPU, RAM, GPU, network) — VM must be stopped'),
         makeIconCell('export', '\uD83D\uDCE4', !vm.running && !bld, function() { onExportVm(i); }, '', 'Export VM to an archive (.asb.zip)'),
+        makeIconCell('move', '\uD83D\uDCE6', !vm.running && !bld, function() { onMoveVm(i); }, '', 'Move VM files to a new directory')
     );
     return cells;
 }
@@ -781,6 +782,18 @@ function onExportVm(idx) {
         sendCmd('exportVm', { name: vm.name, exportPath: result });
     });
 }
+
+function onMoveVm(idx) {
+    var vm = vms[idx];
+    if (!vm || vm.running) return;
+    showModal('Move VM', 'Moving "' + vm.name + '" will relocate all its files to the specified directory.', 'Move', {
+        input: { label: 'New Target Directory:', value: 'D:\\AppSandboxVMs\\' }
+    }).then(function(result) {
+        if (result === false) return;
+        sendCmd('moveVm', { name: vm.name, newBaseDir: result });
+    });
+}
+
 
 function importVmPrompt() {
     showModal('Import VM', 'Enter the full path to the .asb.zip archive to import:', 'Import', {

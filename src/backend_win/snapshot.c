@@ -525,3 +525,37 @@ HRESULT snapshot_rename(SnapshotTree *tree, int snap_idx, int branch_idx, const 
     snapshot_save(tree);
     return S_OK;
 }
+
+static void replace_path_prefix(wchar_t *path, const wchar_t *old_dir, const wchar_t *new_dir)
+{
+    if (!path[0]) return;
+    // We only replace if it starts with old_dir (case-insensitive on Windows)
+    if (_wcsnicmp(path, old_dir, wcslen(old_dir)) == 0) {
+        wchar_t temp[MAX_PATH];
+        swprintf_s(temp, MAX_PATH, L"%s%s", new_dir, path + wcslen(old_dir));
+        wcscpy_s(path, MAX_PATH, temp);
+    }
+}
+
+ASB_API void snapshot_rebase(SnapshotTree *tree, const wchar_t *old_dir, const wchar_t *new_dir)
+{
+    int i, b;
+
+    replace_path_prefix(tree->base_dir, old_dir, new_dir);
+    replace_path_prefix(tree->base_vhdx, old_dir, new_dir);
+
+    for (b = 0; b < tree->base_branch_count; b++) {
+        if (!tree->base_branches[b].valid) continue;
+        replace_path_prefix(tree->base_branches[b].vhdx_path, old_dir, new_dir);
+    }
+
+    for (i = 0; i < tree->count; i++) {
+        if (!tree->nodes[i].valid) continue;
+        replace_path_prefix(tree->nodes[i].snap_vhdx, old_dir, new_dir);
+
+        for (b = 0; b < tree->nodes[i].branch_count; b++) {
+            if (!tree->nodes[i].branches[b].valid) continue;
+            replace_path_prefix(tree->nodes[i].branches[b].vhdx_path, old_dir, new_dir);
+        }
+    }
+}

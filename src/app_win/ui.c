@@ -935,6 +935,14 @@ static void on_webview2_message(const wchar_t *json)
             json_get_string(json, L"exportPath", path_buf, MAX_PATH)) {
             asb_export_vm(name_buf, path_buf);
         }
+    } else if (wcscmp(action, L"moveVm") == 0) {
+        wchar_t name_buf[256] = {0};
+        wchar_t path_buf[MAX_PATH] = {0};
+        if (json_get_string(json, L"name", name_buf, 256) &&
+            json_get_string(json, L"newBaseDir", path_buf, MAX_PATH)) {
+            asb_move_vm(name_buf, path_buf);
+            send_vm_list();
+        }
     } else if (wcscmp(action, L"importVm") == 0) {
         wchar_t path_buf[MAX_PATH] = {0};
         if (json_get_string(json, L"archivePath", path_buf, MAX_PATH)) {

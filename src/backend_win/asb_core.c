@@ -3934,3 +3934,69 @@ ASB_API HRESULT asb_import_vm(const wchar_t *archive_path)
     save_vm_list();
     return S_OK;
 }
+
+ASB_API HRESULT asb_move_vm(const wchar_t *vm_name, const wchar_t *new_base_dir)
+{
+    VmInstance *inst;
+    wchar_t old_dir[MAX_PATH];
+    wchar_t new_dir[MAX_PATH];
+    wchar_t *last_slash;
+    SHFILEOPSTRUCTW fileOp;
+    int res;
+    int idx;
+    SnapshotTree *tree;
+
+    inst = asb_vm_instance(asb_vm_find(vm_name));
+    if (!inst) return E_INVALIDARG;
+
+    if (inst->running) {
+        asb_stop_vm(vm_name);
+        while (inst->running) {
+            Sleep(100);
+        }
+    }
+
+    wcscpy_s(old_dir, MAX_PATH, inst->vhdx_path);
+    last_slash = wcsrchr(old_dir, L'\\');
+    if (last_slash) *last_slash = L'\0';
+
+    swprintf_s(new_dir, MAX_PATH, L"%s\\%s", new_base_dir, inst->name);
+
+    ZeroMemory(&fileOp, sizeof(fileOp));
+    fileOp.wFunc = FO_MOVE;
+
+    /* SHFileOperation requires double-null terminated strings */
+    wchar_t old_dir_op[MAX_PATH + 2] = {0};
+    wchar_t new_dir_op[MAX_PATH + 2] = {0};
+    wcscpy_s(old_dir_op, MAX_PATH, old_dir);
+    wcscpy_s(new_dir_op, MAX_PATH, new_dir);
+    
+    fileOp.pFrom = old_dir_op;
+    fileOp.pTo = new_dir_op;
+    fileOp.fFlags = FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_NOCONFIRMMKDIR;
+
+    res = SHFileOperationW(&fileOp);
+    if (res != 0) {
+        asb_log(L"move: SHFileOperation failed with code %d", res);
+        return E_FAIL;
+    }
+
+    /* Update internal paths */
+    swprintf_s(inst->vhdx_path, MAX_PATH, L"%s\\disk.vhdx", new_dir);
+    if (_wcsnicmp(inst->resources_iso_path, old_dir, wcslen(old_dir)) == 0) {
+        wchar_t temp[MAX_PATH];
+        swprintf_s(temp, MAX_PATH, L"%s%s", new_dir, inst->resources_iso_path + wcslen(old_dir));
+        wcscpy_s(inst->resources_iso_path, MAX_PATH, temp);
+    }
+
+    /* Update in-memory SnapshotTree and re-save tree.dat */
+    idx = asb_vm_index(asb_vm_find(vm_name));
+    if (idx >= 0) {
+        tree = &g_snap_trees[idx];
+        snapshot_rebase(tree, old_dir, new_dir);
+        snapshot_save(tree);
+    }
+
+    save_vm_list();
+    return S_OK;
+}
