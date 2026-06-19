@@ -3950,7 +3950,7 @@ ASB_API HRESULT asb_move_vm(const wchar_t *vm_name, const wchar_t *new_base_dir)
     if (!inst) return E_INVALIDARG;
 
     if (inst->running) {
-        asb_stop_vm(vm_name);
+        asb_vm_stop(asb_vm_find(vm_name));
         while (inst->running) {
             Sleep(100);
         }
