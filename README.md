@@ -14,6 +14,8 @@ Windows features:
 - GPU Hardware Video Decoder/Encoder support
 - SSH via Hyper-V socket proxy (no network required)
 - Snapshots
+- Export and Import VMs (Archiving)
+- Move VMs across different drives/directories
 - Fixed 1080P60 display
 - Host to client hot-key support
 - Provision and boot with / without internet
