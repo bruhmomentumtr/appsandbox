@@ -113,7 +113,7 @@
 copy /Y "$(SolutionDir)ARM64\$(Configuration)\AppSandboxVAD\AppSandboxVAD.sys" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\"
 copy /Y "$(SolutionDir)ARM64\$(Configuration)\AppSandboxVAD\AppSandboxVAD.inf" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\"
 copy /Y "$(SolutionDir)ARM64\$(Configuration)\AppSandboxVAD\appsandboxvad.cat" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\AppSandboxVAD.cat"
-powershell -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)ARM64\$(Configuration)\AppSandboxVAD\appsandboxvad.cat'; if ($sig.SignerCertificate) { [IO.File]::WriteAllBytes('$(SolutionDir)bin\$(Configuration)-ARM64\drivers\AppSandboxVAD.cer', $sig.SignerCertificate.RawData) }"</Command>
+pwsh -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)ARM64\$(Configuration)\AppSandboxVAD\appsandboxvad.cat'; if ($sig.SignerCertificate) { [IO.File]::WriteAllBytes('$(SolutionDir)bin\$(Configuration)-ARM64\drivers\AppSandboxVAD.cer', $sig.SignerCertificate.RawData) }"</Command>
       <Message>Copying VAD driver files to bin\$(Configuration)-ARM64\drivers\...</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
@@ -123,7 +123,7 @@ powershell -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)
 copy /Y "$(SolutionDir)x64\$(Configuration)\AppSandboxVAD\AppSandboxVAD.sys" "$(SolutionDir)bin\$(Configuration)\drivers\"
 copy /Y "$(SolutionDir)x64\$(Configuration)\AppSandboxVAD\AppSandboxVAD.inf" "$(SolutionDir)bin\$(Configuration)\drivers\"
 copy /Y "$(SolutionDir)x64\$(Configuration)\AppSandboxVAD\appsandboxvad.cat" "$(SolutionDir)bin\$(Configuration)\drivers\AppSandboxVAD.cat"
-powershell -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)x64\$(Configuration)\AppSandboxVAD\appsandboxvad.cat'; if ($sig.SignerCertificate) { [IO.File]::WriteAllBytes('$(SolutionDir)bin\$(Configuration)\drivers\AppSandboxVAD.cer', $sig.SignerCertificate.RawData) }"</Command>
+pwsh -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)x64\$(Configuration)\AppSandboxVAD\appsandboxvad.cat'; if ($sig.SignerCertificate) { [IO.File]::WriteAllBytes('$(SolutionDir)bin\$(Configuration)\drivers\AppSandboxVAD.cer', $sig.SignerCertificate.RawData) }"</Command>
       <Message>Copying VAD driver files to bin\$(Configuration)\drivers\...</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
@@ -133,7 +133,7 @@ powershell -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)
 copy /Y "$(SolutionDir)ARM64\$(Configuration)\AppSandboxVAD\AppSandboxVAD.sys" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\"
 copy /Y "$(SolutionDir)ARM64\$(Configuration)\AppSandboxVAD\AppSandboxVAD.inf" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\"
 copy /Y "$(SolutionDir)ARM64\$(Configuration)\AppSandboxVAD\appsandboxvad.cat" "$(SolutionDir)bin\$(Configuration)-ARM64\drivers\AppSandboxVAD.cat"
-powershell -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)ARM64\$(Configuration)\AppSandboxVAD\appsandboxvad.cat'; if ($sig.SignerCertificate) { [IO.File]::WriteAllBytes('$(SolutionDir)bin\$(Configuration)-ARM64\drivers\AppSandboxVAD.cer', $sig.SignerCertificate.RawData) }"</Command>
+pwsh -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)ARM64\$(Configuration)\AppSandboxVAD\appsandboxvad.cat'; if ($sig.SignerCertificate) { [IO.File]::WriteAllBytes('$(SolutionDir)bin\$(Configuration)-ARM64\drivers\AppSandboxVAD.cer', $sig.SignerCertificate.RawData) }"</Command>
       <Message>Copying VAD driver files to bin\$(Configuration)-ARM64\drivers\...</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
@@ -143,7 +143,7 @@ powershell -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)
 copy /Y "$(SolutionDir)x64\$(Configuration)\AppSandboxVAD\AppSandboxVAD.sys" "$(SolutionDir)bin\$(Configuration)\drivers\"
 copy /Y "$(SolutionDir)x64\$(Configuration)\AppSandboxVAD\AppSandboxVAD.inf" "$(SolutionDir)bin\$(Configuration)\drivers\"
 copy /Y "$(SolutionDir)x64\$(Configuration)\AppSandboxVAD\appsandboxvad.cat" "$(SolutionDir)bin\$(Configuration)\drivers\AppSandboxVAD.cat"
-powershell -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)x64\$(Configuration)\AppSandboxVAD\appsandboxvad.cat'; if ($sig.SignerCertificate) { [IO.File]::WriteAllBytes('$(SolutionDir)bin\$(Configuration)\drivers\AppSandboxVAD.cer', $sig.SignerCertificate.RawData) }"</Command>
+pwsh -NoProfile -Command "$sig = Get-AuthenticodeSignature '$(SolutionDir)x64\$(Configuration)\AppSandboxVAD\appsandboxvad.cat'; if ($sig.SignerCertificate) { [IO.File]::WriteAllBytes('$(SolutionDir)bin\$(Configuration)\drivers\AppSandboxVAD.cer', $sig.SignerCertificate.RawData) }"</Command>
       <Message>Copying VAD driver files to bin\$(Configuration)\drivers\...</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>

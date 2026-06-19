@@ -56,7 +56,7 @@
   <Target Name="AppSandboxSignAndPackage" AfterTargets="Build"
           Condition="'$(Configuration)'=='Release' And ('$(Platform)'=='x64' Or '$(Platform)'=='ARM64') And '$(ASB_SKIP_PACKAGE_PROJECT)' != '1'">
     <Message Importance="high" Text="==== AppSandbox: make-release.ps1 -NoBuild -Platform $(Platform) (sign + package) ====" />
-    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(SolutionDir)tools\sign\make-release.ps1&quot; -NoBuild -Platform $(Platform)" />
+    <Exec Command="pwsh.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(SolutionDir)tools\sign\make-release.ps1&quot; -NoBuild -Platform $(Platform)" />
   </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
